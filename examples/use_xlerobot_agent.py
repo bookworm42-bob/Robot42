@@ -6,6 +6,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from multido_xlerobot import XLeRobotInterface
+from multido_xlerobot.bootstrap import DEFAULT_XLEROBOT_FORK_ROOT
 from xlerobot_agent import (
     DelegatedNavigationBackend,
     MockPromptClient,
@@ -24,7 +25,7 @@ from xlerobot_agent.integration import XLeRobotAgentBindings, default_executor_r
 
 def main() -> None:
     # This import surface is safe without bootstrapping `lerobot`; only summary/help is used here.
-    interface = XLeRobotInterface("/Users/alin/xlerobot_forked")
+    interface = XLeRobotInterface(DEFAULT_XLEROBOT_FORK_ROOT)
     print("Using XLeRobot fork:", interface.repo_root)
 
     executor_config = create_executor_config(

@@ -56,6 +56,8 @@ class XLeRobotInterface:
 
     def robot_2wheels_classes(self) -> tuple[type[Any], type[Any]]:
         module = self.bootstrap().robot_2wheels_module
+        if module is None:
+            raise XLeRobotBootstrapError("xlerobot_2wheels module is unavailable in this environment")
         return module.XLerobot2WheelsConfig, module.XLerobot2Wheels
 
     def vr_classes(self) -> tuple[type[Any], type[Any]]:
@@ -71,7 +73,10 @@ class XLeRobotInterface:
         }
 
     def record_module(self) -> ModuleType:
-        return self.bootstrap().record_module
+        module = self.bootstrap().record_module
+        if module is None:
+            raise XLeRobotBootstrapError("record module is unavailable in this environment")
+        return module
 
     def make_robot_config(self, **overrides: Any) -> Any:
         config_cls, _ = self.robot_classes()
@@ -109,10 +114,12 @@ class XLeRobotInterface:
             "xlevr_root": str(result.paths.xlevr_root),
             "record_script": str(result.paths.record_script),
             "robot_module": result.robot_module.__name__,
-            "robot_2wheels_module": result.robot_2wheels_module.__name__,
+            "robot_2wheels_module": result.robot_2wheels_module.__name__
+            if result.robot_2wheels_module is not None
+            else "unavailable",
             "vr_module": result.vr_module.__name__,
             "model_module": result.model_module.__name__,
-            "record_module": result.record_module.__name__,
+            "record_module": result.record_module.__name__ if result.record_module is not None else "unavailable",
         }
 
     @staticmethod

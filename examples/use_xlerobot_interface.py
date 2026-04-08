@@ -6,10 +6,11 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from multido_xlerobot import XLeRobotBootstrapError, XLeRobotInterface
+from multido_xlerobot.bootstrap import DEFAULT_XLEROBOT_FORK_ROOT
 
 
 def main() -> None:
-    api = XLeRobotInterface("/Users/alin/xlerobot_forked")
+    api = XLeRobotInterface(DEFAULT_XLEROBOT_FORK_ROOT)
     try:
         print(api.summary())
 

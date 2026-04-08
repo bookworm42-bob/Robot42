@@ -1,8 +1,50 @@
+from .brain_service import BrainBridge, BrainServiceServer
 from .executors import ExecutorRegistry, StaticSkillExecutor
 from .integration import (
     XLeRobotAgentBindings,
     build_default_navigation_skills,
     create_executor_config,
+)
+from .environment import (
+    PlaygroundEnvironmentAdapter,
+    RealPlaygroundEnvironmentAdapter,
+    SimPlaygroundEnvironmentAdapter,
+    build_environment_adapter,
+    build_playground_skill_registry,
+    load_skill_catalog,
+)
+from .exploration import ExplorationBackend, ExplorationBackendConfig
+from .exploration_ui import (
+    ExplorationReviewServer,
+    LocalExplorationUIController,
+    RemoteExplorationUIController,
+)
+from .llm import (
+    ActionDecision,
+    AgentLLMRouter,
+    AgentModelSuite,
+    CodeGenerationResult,
+    LLMCallTrace,
+    ModelConfig,
+    ReviewDecision,
+)
+from .offload import (
+    BrainRegistration,
+    OffloadClient,
+    OffloadServer,
+    OffloadServerConfig,
+    serialize_execution_result,
+    serialize_goal_context,
+    serialize_skill_contract,
+    serialize_subgoal,
+    serialize_world_state,
+)
+from .perception_service import (
+    PERCEPTION_TOOL_IDS,
+    PerceptionService,
+    PerceptionServiceConfig,
+    execute_perception_tool,
+    extract_scene_from_tool_result,
 )
 from .models import (
     AgentRunRecord,
@@ -22,12 +64,31 @@ from .models import (
     WorldState,
 )
 from .registry import SkillRegistry
+from .playground import (
+    ActionCandidate,
+    PlaygroundAgentController,
+    PlaygroundAgentRuntime,
+    PlaygroundRunRecord,
+)
+from .reporting import AgentEvent, LiveAgentReport
 from .runtime import XLeRobotAgentRuntime
 from .scoring import (
+    LLMPromptClient,
     MockPromptClient,
     PromptPlanner,
     PromptSkillAssessment,
+    build_prompt_planner,
 )
+from .tools import (
+    BoundedCodeExecutor,
+    ToolCallContext,
+    ToolRegistry,
+    ToolResult,
+    ToolSpec,
+    build_default_tool_registry,
+)
+from .ui import PlaygroundUIServer
+from .visual_differencing import VisualDifferencingModule, VisualObservation
 from .voice import (
     MockVoiceCommandApp,
     MockVoiceTranslator,
@@ -39,34 +100,85 @@ from .voice import (
 
 __all__ = [
     "AgentRunRecord",
+    "AgentEvent",
+    "ActionCandidate",
+    "ActionDecision",
+    "AgentLLMRouter",
+    "AgentModelSuite",
+    "BrainBridge",
+    "BrainRegistration",
+    "BrainServiceServer",
+    "BoundedCodeExecutor",
     "CandidateSkillScore",
+    "CodeGenerationResult",
     "DelegatedNavigationBackend",
+    "ExplorationBackend",
+    "ExplorationBackendConfig",
+    "ExplorationReviewServer",
     "ExecutionResult",
     "ExecutionStatus",
     "ExecutorConfig",
     "ExecutorRegistry",
     "GoalContext",
+    "LLMPromptClient",
+    "LLMCallTrace",
+    "LiveAgentReport",
     "MockPromptClient",
     "MockVoiceCommandApp",
     "MockVoiceTranslator",
     "MockWakeWordDetector",
+    "ModelConfig",
+    "LocalExplorationUIController",
     "NavigationSkillExecutionMode",
+    "OffloadClient",
+    "OffloadServer",
+    "OffloadServerConfig",
+    "PERCEPTION_TOOL_IDS",
+    "PerceptionService",
+    "PerceptionServiceConfig",
     "PlaceMemory",
+    "PlaygroundAgentController",
+    "PlaygroundAgentRuntime",
+    "PlaygroundEnvironmentAdapter",
+    "PlaygroundRunRecord",
+    "PlaygroundUIServer",
     "PromptPlanner",
     "PromptSkillAssessment",
+    "RealPlaygroundEnvironmentAdapter",
     "ReadinessState",
+    "RemoteExplorationUIController",
+    "ReviewDecision",
+    "SimPlaygroundEnvironmentAdapter",
     "SkillContract",
     "SkillRegistry",
     "SkillType",
     "StaticSkillExecutor",
     "StepRecord",
     "Subgoal",
+    "ToolCallContext",
+    "ToolRegistry",
+    "ToolResult",
+    "ToolSpec",
     "VoiceCommand",
     "VoiceCommandPipeline",
+    "VisualDifferencingModule",
+    "VisualObservation",
     "WakeWordConfig",
     "WorldState",
     "XLeRobotAgentBindings",
     "XLeRobotAgentRuntime",
+    "build_default_tool_registry",
+    "build_environment_adapter",
     "build_default_navigation_skills",
+    "build_prompt_planner",
+    "build_playground_skill_registry",
     "create_executor_config",
+    "execute_perception_tool",
+    "extract_scene_from_tool_result",
+    "load_skill_catalog",
+    "serialize_execution_result",
+    "serialize_goal_context",
+    "serialize_skill_contract",
+    "serialize_subgoal",
+    "serialize_world_state",
 ]

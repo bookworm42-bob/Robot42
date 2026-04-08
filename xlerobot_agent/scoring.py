@@ -1,11 +1,21 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 
+from .llm import AgentLLMRouter, AgentModelSuite, ModelConfig
 from .models import CandidateSkillScore, GoalContext, PlaceMemory, SkillContract, Subgoal, WorldState
-from .prompts import build_skill_selection_system_prompt, build_skill_selection_user_prompt
+from .prompts import (
+    build_instruction_normalization_system_prompt,
+    build_instruction_normalization_user_prompt,
+    build_place_discovery_system_prompt,
+    build_place_discovery_user_prompt,
+    build_skill_selection_system_prompt,
+    build_skill_selection_user_prompt,
+    build_subgoal_planning_system_prompt,
+    build_subgoal_planning_user_prompt,
+)
 
 
 def _clamp_probability(value: float) -> float:
@@ -158,6 +168,145 @@ class MockPromptClient:
 
 
 @dataclass
+class LLMPromptClient:
+    model_config: ModelConfig
+    fallback: MockPromptClient = field(default_factory=MockPromptClient)
+
+    def __post_init__(self) -> None:
+        self._router = AgentLLMRouter(
+            AgentModelSuite(
+                planner=self.model_config,
+                critic=self.model_config,
+                coder=self.model_config,
+            )
+        )
+
+    def normalize_instruction(self, text: str) -> str:
+        if self.model_config.provider == "mock":
+            return self.fallback.normalize_instruction(text)
+        parsed = self._complete(
+            build_instruction_normalization_system_prompt(),
+            build_instruction_normalization_user_prompt(text),
+        )
+        normalized = str((parsed or {}).get("normalized_instruction", "")).strip()
+        return normalized or self.fallback.normalize_instruction(text)
+
+    def discover_places(self, world_state: WorldState) -> list[PlaceMemory]:
+        fallback_places = self.fallback.discover_places(world_state)
+        if self.model_config.provider == "mock":
+            return fallback_places
+        parsed = self._complete(
+            build_place_discovery_system_prompt(),
+            build_place_discovery_user_prompt(world_state),
+        )
+        payload = (parsed or {}).get("places", [])
+        if not isinstance(payload, list):
+            return fallback_places
+        places: list[PlaceMemory] = []
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name", "")).strip()
+            if not name:
+                continue
+            confidence = _clamp_probability(float(item.get("confidence", 0.5)))
+            evidence = str(item.get("evidence", "llm_place_discovery")).strip() or "llm_place_discovery"
+            places.append(PlaceMemory(name=name, confidence=confidence, evidence=evidence))
+        return _dedupe_place_memories(places or fallback_places)
+
+    def plan_subgoals(
+        self,
+        *,
+        goal: GoalContext,
+        world_state: WorldState,
+        skills: list[SkillContract],
+    ) -> list[Subgoal]:
+        fallback_subgoals = self.fallback.plan_subgoals(goal=goal, world_state=world_state, skills=skills)
+        if self.model_config.provider == "mock":
+            return fallback_subgoals
+        parsed = self._complete(
+            build_subgoal_planning_system_prompt(),
+            build_subgoal_planning_user_prompt(goal, world_state, skills),
+        )
+        payload = (parsed or {}).get("subgoals", [])
+        if not isinstance(payload, list):
+            return fallback_subgoals
+        subgoals: list[Subgoal] = []
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            text = str(item.get("text", "")).strip()
+            if not text:
+                continue
+            subgoals.append(
+                Subgoal(
+                    text=text,
+                    kind=str(item.get("kind", "general")).strip() or "general",
+                    target=(str(item["target"]).strip() if item.get("target") is not None else None) or None,
+                )
+            )
+        return subgoals or fallback_subgoals
+
+    def score_skills(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        subgoal: Subgoal,
+        skills: list[SkillContract],
+        goal: GoalContext,
+        world_state: WorldState,
+    ) -> list[PromptSkillAssessment]:
+        fallback_scores = self.fallback.score_skills(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            subgoal=subgoal,
+            skills=skills,
+            goal=goal,
+            world_state=world_state,
+        )
+        if self.model_config.provider == "mock":
+            return fallback_scores
+        parsed = self._complete(system_prompt, user_prompt)
+        payload = (parsed or {}).get("scores", [])
+        if not isinstance(payload, list):
+            return fallback_scores
+        by_skill_id = {skill.skill_id: skill for skill in skills}
+        assessments: list[PromptSkillAssessment] = []
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            skill_id = str(item.get("skill_id", "")).strip()
+            if skill_id not in by_skill_id:
+                continue
+            usefulness = _clamp_probability(float(item.get("goal_usefulness", 0.0)))
+            success = _clamp_probability(float(item.get("success_likelihood", 0.0)))
+            combined = item.get("combined_score")
+            if combined is None:
+                combined_value = usefulness * success
+            else:
+                combined_value = _clamp_probability(float(combined))
+            assessments.append(
+                PromptSkillAssessment(
+                    skill_id=skill_id,
+                    goal_usefulness=usefulness,
+                    success_likelihood=success,
+                    combined_score=combined_value,
+                    reasoning=str(item.get("reasoning", "")).strip() or "LLM skill assessment",
+                )
+            )
+        return assessments or fallback_scores
+
+    def _complete(self, system_prompt: str, user_prompt: str) -> dict | None:
+        parsed, _trace = self._router.complete_json_prompt(
+            config=self.model_config,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+        )
+        return parsed
+
+
+@dataclass
 class PromptPlanner:
     prompt_client: PromptClient
 
@@ -205,7 +354,7 @@ class PromptPlanner:
         assessments_by_id: dict[str, PromptSkillAssessment] = {}
         if feasible_skills:
             system_prompt = build_skill_selection_system_prompt()
-            user_prompt = build_skill_selection_user_prompt(goal, world_state, feasible_skills)
+            user_prompt = build_skill_selection_user_prompt(goal, subgoal, world_state, feasible_skills)
             assessments_by_id = {
                 item.skill_id: item
                 for item in self.prompt_client.score_skills(
@@ -290,3 +439,18 @@ class PromptPlanner:
         if skill.preconditions and not skill.preconditions.issubset(world_state.satisfied_preconditions):
             reasons.append("preconditions_unsatisfied")
         return reasons
+
+
+def build_prompt_planner(model_config: ModelConfig | None = None) -> PromptPlanner:
+    if model_config is None or model_config.provider == "mock":
+        return PromptPlanner(prompt_client=MockPromptClient())
+    return PromptPlanner(prompt_client=LLMPromptClient(model_config))
+
+
+def _dedupe_place_memories(places: list[PlaceMemory]) -> list[PlaceMemory]:
+    deduped: dict[str, PlaceMemory] = {}
+    for place in places:
+        current = deduped.get(place.name)
+        if current is None or place.confidence > current.confidence:
+            deduped[place.name] = place
+    return list(deduped.values())

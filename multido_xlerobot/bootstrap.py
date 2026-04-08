@@ -11,7 +11,18 @@ from typing import Any
 from .types import XLeRobotPaths
 
 
-DEFAULT_XLEROBOT_FORK_ROOT = Path("/Users/alin/xlerobot_forked")
+def _default_repo_root() -> Path:
+    candidates = [
+        Path.home() / "XLeRobot",
+        Path("/Users/alin/xlerobot_forked"),
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
+
+
+DEFAULT_XLEROBOT_FORK_ROOT = _default_repo_root()
 
 
 class XLeRobotBootstrapError(RuntimeError):
@@ -22,10 +33,10 @@ class XLeRobotBootstrapError(RuntimeError):
 class XLeRobotBootstrapResult:
     paths: XLeRobotPaths
     robot_module: ModuleType
-    robot_2wheels_module: ModuleType
+    robot_2wheels_module: ModuleType | None
     vr_module: ModuleType
     model_module: ModuleType
-    record_module: ModuleType
+    record_module: ModuleType | None
 
 
 def bootstrap_xlerobot(
@@ -36,6 +47,7 @@ def bootstrap_xlerobot(
     paths = XLeRobotPaths.from_repo_root(repo_root)
     _validate_paths(paths)
     _ensure_lerobot_installed()
+    _install_compatibility_aliases()
 
     model_module = _load_module(
         "lerobot.model.SO101Robot",
@@ -47,7 +59,7 @@ def bootstrap_xlerobot(
         paths.robot_pkg_dir,
         force_reload=force_reload,
     )
-    robot_2wheels_module = _load_package(
+    robot_2wheels_module = _load_optional_package(
         "lerobot.robots.xlerobot_2wheels",
         paths.robot_2wheels_pkg_dir,
         force_reload=force_reload,
@@ -57,7 +69,7 @@ def bootstrap_xlerobot(
         paths.vr_pkg_dir,
         force_reload=force_reload,
     )
-    record_module = _load_module(
+    record_module = _load_optional_module(
         "xlerobot_forked.record",
         paths.record_script,
         force_reload=force_reload,
@@ -77,7 +89,6 @@ def _validate_paths(paths: XLeRobotPaths) -> None:
     required = {
         "repo_root": paths.repo_root,
         "software_src": paths.software_src,
-        "xlevr_root": paths.xlevr_root,
         "record_script": paths.record_script,
         "model_file": paths.model_file,
         "robot_pkg_dir": paths.robot_pkg_dir,
@@ -103,11 +114,30 @@ def _ensure_lerobot_installed() -> None:
         ) from exc
 
 
+def _install_compatibility_aliases() -> None:
+    try:
+        modern_module = importlib.import_module("lerobot.robots.so101_follower.config_so101_follower")
+    except ModuleNotFoundError:
+        return
+
+    legacy_pkg_name = "lerobot.robots.so_follower"
+    legacy_module_name = f"{legacy_pkg_name}.config_so_follower"
+    if legacy_module_name in sys.modules:
+        return
+
+    legacy_pkg = ModuleType(legacy_pkg_name)
+    legacy_pkg.__path__ = []
+    setattr(legacy_pkg, "config_so_follower", modern_module)
+    sys.modules[legacy_pkg_name] = legacy_pkg
+    sys.modules[legacy_module_name] = modern_module
+
+
 def _load_package(module_name: str, package_dir: Path, *, force_reload: bool) -> ModuleType:
     init_file = package_dir / "__init__.py"
     if not init_file.exists():
         raise XLeRobotBootstrapError(f"Missing package entrypoint: {init_file}")
 
+    _ensure_parent_packages(module_name)
     if force_reload:
         _purge_modules(module_name)
     elif module_name in sys.modules:
@@ -124,13 +154,27 @@ def _load_package(module_name: str, package_dir: Path, *, force_reload: bool) ->
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
     spec.loader.exec_module(module)
+    _attach_to_parent(module_name, module)
     return module
+
+
+def _load_optional_package(
+    module_name: str,
+    package_dir: Path,
+    *,
+    force_reload: bool,
+) -> ModuleType | None:
+    try:
+        return _load_package(module_name, package_dir, force_reload=force_reload)
+    except Exception:
+        return None
 
 
 def _load_module(module_name: str, file_path: Path, *, force_reload: bool) -> ModuleType:
     if not file_path.exists():
         raise XLeRobotBootstrapError(f"Missing module file: {file_path}")
 
+    _ensure_parent_packages(module_name)
     if force_reload and module_name in sys.modules:
         del sys.modules[module_name]
     elif module_name in sys.modules:
@@ -143,10 +187,49 @@ def _load_module(module_name: str, file_path: Path, *, force_reload: bool) -> Mo
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
     spec.loader.exec_module(module)
+    _attach_to_parent(module_name, module)
     return module
+
+
+def _load_optional_module(
+    module_name: str,
+    file_path: Path,
+    *,
+    force_reload: bool,
+) -> ModuleType | None:
+    try:
+        return _load_module(module_name, file_path, force_reload=force_reload)
+    except Exception:
+        return None
 
 
 def _purge_modules(prefix: str) -> None:
     names = [name for name in sys.modules if name == prefix or name.startswith(f"{prefix}.")]
     for name in names:
         del sys.modules[name]
+
+
+def _ensure_parent_packages(module_name: str) -> None:
+    parts = module_name.split(".")
+    for index in range(1, len(parts)):
+        package_name = ".".join(parts[:index])
+        if package_name in sys.modules:
+            continue
+        try:
+            importlib.import_module(package_name)
+            continue
+        except ModuleNotFoundError:
+            pass
+
+        package = ModuleType(package_name)
+        package.__path__ = []
+        sys.modules[package_name] = package
+
+
+def _attach_to_parent(module_name: str, module: ModuleType) -> None:
+    if "." not in module_name:
+        return
+    parent_name, child_name = module_name.rsplit(".", 1)
+    parent = sys.modules.get(parent_name)
+    if parent is not None:
+        setattr(parent, child_name, module)

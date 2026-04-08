@@ -51,6 +51,7 @@ def bootstrap_xlerobot_maniskill(
         )
 
     _ensure_mani_skill_runtime_installed()
+    _patch_replicacad_scene_builder()
 
     robots_module = importlib.import_module("mani_skill.agents.robots")
     agent_module = _load_module(
@@ -66,6 +67,7 @@ def bootstrap_xlerobot_maniskill(
     # Point the registered agent at the URDF in the fork so no site-packages patching
     # is required.
     xlerobot_cls.urdf_path = str(assets_root / "xlerobot.urdf")
+    _override_registered_agent(xlerobot_cls)
     setattr(robots_module, "Xlerobot", xlerobot_cls)
     if hasattr(robots_module, "__all__") and "Xlerobot" not in robots_module.__all__:
         robots_module.__all__ = list(robots_module.__all__) + ["Xlerobot"]
@@ -75,6 +77,12 @@ def bootstrap_xlerobot_maniskill(
         env_file,
         force_reload=force_reload,
     )
+    scene_manipulation_cls = getattr(env_module, "SceneManipulationEnv", None)
+    if scene_manipulation_cls is None:
+        raise XLeRobotManiSkillError(
+            f"`SceneManipulationEnv` class not found in {env_file}"
+        )
+    _override_registered_env(scene_manipulation_cls)
 
     return XLeRobotManiSkillBootstrapResult(
         repo_root=root,
@@ -98,6 +106,15 @@ def run_keyboard_play_demo(
     sim_backend: str = "auto",
     num_envs: int = 1,
     record_dir: str | None = None,
+    dataset_name: str | None = None,
+    output_dir: str | None = None,
+    num_episodes: int | None = None,
+    episode_length: int | None = None,
+    fps: int | None = None,
+    task_description: str | None = None,
+    use_rerun: bool | None = None,
+    show_cameras: bool | None = None,
+    speed_profile: str | None = None,
     force_reload: bool = False,
 ) -> Any:
     bootstrap_xlerobot_maniskill(repo_root, force_reload=force_reload)
@@ -111,12 +128,31 @@ def run_keyboard_play_demo(
     args.sim_backend = sim_backend
     args.num_envs = num_envs
 
-    if control_mode is not None:
-        args.control_mode = control_mode
+    effective_control_mode = control_mode or _default_control_mode_for_demo(demo, robot_uid)
+    if effective_control_mode is not None:
+        args.control_mode = effective_control_mode
     if obs_mode is not None:
         args.obs_mode = obs_mode
     if record_dir is not None and hasattr(args, "record_dir"):
         args.record_dir = record_dir
+    if dataset_name is not None and hasattr(args, "dataset_name"):
+        args.dataset_name = dataset_name
+    if output_dir is not None and hasattr(args, "output_dir"):
+        args.output_dir = output_dir
+    if num_episodes is not None and hasattr(args, "num_episodes"):
+        args.num_episodes = num_episodes
+    if episode_length is not None and hasattr(args, "episode_length"):
+        args.episode_length = episode_length
+    if fps is not None and hasattr(args, "fps"):
+        args.fps = fps
+    if task_description is not None and hasattr(args, "task_description"):
+        args.task_description = task_description
+    if use_rerun is not None and hasattr(args, "use_rerun"):
+        args.use_rerun = use_rerun
+    if show_cameras is not None and hasattr(args, "show_cameras"):
+        args.show_cameras = show_cameras
+    if speed_profile is not None and hasattr(args, "speed_profile"):
+        args.speed_profile = speed_profile
 
     return demo_module.main(args)
 
@@ -124,7 +160,7 @@ def run_keyboard_play_demo(
 def build_cli_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Launch the XLeRobot keyboard-control play mode in ManiSkill without "
+            "Launch the XLeRobot play or teleop dataset demos in ManiSkill without "
             "manually copying files into site-packages."
         )
     )
@@ -135,7 +171,7 @@ def build_cli_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--demo",
-        choices=("ee_keyboard", "joint_control", "camera_rerun"),
+        choices=("ee_keyboard", "joint_control", "camera_rerun", "vr", "record_dataset"),
         default="ee_keyboard",
         help="Which local XLeRobot ManiSkill demo to run.",
     )
@@ -189,6 +225,57 @@ def build_cli_parser() -> argparse.ArgumentParser:
         help="Optional ManiSkill recording directory.",
     )
     parser.add_argument(
+        "--dataset-name",
+        default=None,
+        help="Dataset name for demos that can write LeRobot episodes.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=None,
+        help="Output directory for demos that can write LeRobot episodes.",
+    )
+    parser.add_argument(
+        "--num-episodes",
+        type=int,
+        default=None,
+        help="Episode count for demos that support dataset recording.",
+    )
+    parser.add_argument(
+        "--episode-length",
+        type=int,
+        default=None,
+        help="Maximum episode length for demos that support dataset recording.",
+    )
+    parser.add_argument(
+        "--fps",
+        type=int,
+        default=None,
+        help="Recording FPS for demos that support dataset recording.",
+    )
+    parser.add_argument(
+        "--task-description",
+        default=None,
+        help="Task label stored in dataset-recording demos.",
+    )
+    parser.add_argument(
+        "--use-rerun",
+        choices=("true", "false"),
+        default=None,
+        help="Override rerun usage for demos that expose it.",
+    )
+    parser.add_argument(
+        "--show-cameras",
+        choices=("true", "false"),
+        default=None,
+        help="Override camera display for demos that expose it.",
+    )
+    parser.add_argument(
+        "--speed-profile",
+        choices=("normal", "fast"),
+        default=None,
+        help="Keyboard teleop speed profile for demos that expose it.",
+    )
+    parser.add_argument(
         "--check",
         action="store_true",
         help="Validate the local setup and exit without launching the demo.",
@@ -239,6 +326,15 @@ def main(argv: list[str] | None = None) -> int:
         sim_backend=args.sim_backend,
         num_envs=args.num_envs,
         record_dir=args.record_dir,
+        dataset_name=args.dataset_name,
+        output_dir=args.output_dir,
+        num_episodes=args.num_episodes,
+        episode_length=args.episode_length,
+        fps=args.fps,
+        task_description=args.task_description,
+        use_rerun=_parse_optional_bool(args.use_rerun),
+        show_cameras=_parse_optional_bool(args.show_cameras),
+        speed_profile=args.speed_profile,
         force_reload=args.force_reload,
     )
     return 0
@@ -264,6 +360,66 @@ def _ensure_mani_skill_runtime_installed() -> None:
         )
 
 
+def _override_registered_agent(agent_cls: type[Any]) -> None:
+    registration_module = importlib.import_module("mani_skill.agents.registration")
+    register_agent = getattr(registration_module, "register_agent")
+    register_agent(asset_download_ids=[], override=True)(agent_cls)
+
+
+def _override_registered_env(env_cls: type[Any]) -> None:
+    registration_module = importlib.import_module("mani_skill.utils.registration")
+    register_env = getattr(registration_module, "register_env")
+    register_env(
+        "SceneManipulation-v1",
+        max_episode_steps=200,
+        override=True,
+        asset_download_ids=[],
+    )(env_cls)
+
+
+def _patch_replicacad_scene_builder() -> None:
+    scene_builder_module = importlib.import_module(
+        "mani_skill.utils.scene_builder.replicacad.scene_builder"
+    )
+    builder_cls = getattr(scene_builder_module, "ReplicaCADSceneBuilder", None)
+    if builder_cls is None:
+        raise XLeRobotManiSkillError(
+            "ReplicaCADSceneBuilder could not be imported from mani_skill"
+        )
+    if getattr(builder_cls, "_xlerobot_patched", False):
+        return
+
+    articulation_cls = getattr(scene_builder_module, "Articulation")
+    sapien_module = getattr(scene_builder_module, "sapien")
+
+    def initialize(self, env_idx):
+        # Mirror ManiSkill's default ReplicaCAD reset flow, but allow xlerobot
+        # to respawn the same way fetch does.
+        self.env.agent.robot.set_pose(sapien_module.Pose([-10, 0, -100]))
+
+        for obj, pose in self._default_object_poses:
+            obj.set_pose(pose)
+            if isinstance(obj, articulation_cls):
+                obj.set_qpos(obj.qpos[0] * 0)
+                obj.set_qvel(obj.qvel[0] * 0)
+
+        if self.scene.gpu_sim_enabled and len(env_idx) == self.env.num_envs:
+            self.scene._gpu_apply_all()
+            self.scene.px.gpu_update_articulation_kinematics()
+            self.scene.px.step()
+            self.scene._gpu_fetch_all()
+
+        if self.env.robot_uids in {"fetch", "xlerobot"}:
+            self.env.agent.reset(self.env.agent.keyframes["rest"].qpos)
+            self.env.agent.robot.set_pose(self.robot_initial_pose)
+            return
+
+        raise NotImplementedError(self.env.robot_uids)
+
+    builder_cls.initialize = initialize
+    builder_cls._xlerobot_patched = True
+
+
 def _load_demo_module(repo_root: Path, demo: str) -> ModuleType:
     mapping = {
         "ee_keyboard": repo_root
@@ -281,6 +437,16 @@ def _load_demo_module(repo_root: Path, demo: str) -> ModuleType:
         / "Maniskill"
         / "examples"
         / "demo_ctrl_action_ee_cam_rerun.py",
+        "vr": repo_root
+        / "simulation"
+        / "Maniskill"
+        / "examples"
+        / "demo_ctrl_action_ee_VR.py",
+        "record_dataset": repo_root
+        / "simulation"
+        / "Maniskill"
+        / "examples"
+        / "demo_ctrl_ee_keyboard_record_dataset.py",
     }
     file_path = mapping[demo]
     return _load_module(
@@ -307,6 +473,20 @@ def _load_module(module_name: str, file_path: Path, *, force_reload: bool) -> Mo
     sys.modules[module_name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def _parse_optional_bool(value: str | None) -> bool | None:
+    if value is None:
+        return None
+    return value == "true"
+
+
+def _default_control_mode_for_demo(demo: str, robot_uid: str) -> str | None:
+    if robot_uid != "xlerobot":
+        return None
+    if demo in {"camera_rerun", "vr", "record_dataset"}:
+        return "pd_joint_delta_pos_dual_arm"
+    return None
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 from .executors import StaticSkillExecutor, make_blocked_result, make_success_result
 from .models import (
@@ -123,16 +124,38 @@ def build_default_navigation_skills(
 def default_executor_registry(
     config: ExecutorConfig,
     bindings: XLeRobotAgentBindings | None = None,
+    offload_client: Any | None = None,
 ):
     from .executors import ExecutorRegistry
 
     bindings = bindings or XLeRobotAgentBindings()
     registry = ExecutorRegistry()
 
+    def remote_handler(skill: SkillContract, goal: GoalContext, world_state: WorldState):
+        if offload_client is None:
+            return None
+        try:
+            return offload_client.execute_skill(skill, goal, world_state)
+        except Exception as exc:
+            return make_blocked_result(
+                skill,
+                world_state,
+                "remote_offload_failed",
+                evidence=f"Remote offload failed for `{skill.skill_id}`: {exc}",
+                replan_hint="remote_offload_failed",
+                readiness_state=world_state.readiness_state,
+            )
+
     def generic_handler(skill: SkillContract, goal: GoalContext, world_state: WorldState):
+        remote_result = remote_handler(skill, goal, world_state)
+        if remote_result is not None:
+            return remote_result
         return make_success_result(skill, world_state, evidence=f"Executed generic skill `{skill.skill_id}`.")
 
     def vla_nav_handler(skill: SkillContract, goal: GoalContext, world_state: WorldState):
+        remote_result = remote_handler(skill, goal, world_state)
+        if remote_result is not None:
+            return remote_result
         readiness = (
             ReadinessState.NAVIGATION_READY_POSE
             if skill.skill_type == SkillType.NAVIGATION
@@ -146,6 +169,9 @@ def default_executor_registry(
         )
 
     def delegated_handler(skill: SkillContract, goal: GoalContext, world_state: WorldState):
+        remote_result = remote_handler(skill, goal, world_state)
+        if remote_result is not None:
+            return remote_result
         if config.delegated_navigation_backend is None:
             return make_blocked_result(
                 skill,

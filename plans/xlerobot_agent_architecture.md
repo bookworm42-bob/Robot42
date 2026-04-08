@@ -21,6 +21,12 @@ Everything is a skill at the planner level.
 The agent does not plan in raw motion.
 It plans in simple subgoals and selects skills from the registered skill set.
 
+The agent may also use a very small set of non-actuation tools when skills alone are not enough:
+
+- navigation / mapping tools
+- perception grounding tools
+- bounded code execution for analysis
+
 The runtime shape is:
 
 `wake word -> speech -> normalized instruction -> place discovery -> subgoal planning -> skill selection -> execution -> verification -> memory update`
@@ -71,6 +77,15 @@ That context should contain:
 - active resource locks
 - recent execution history
 
+The context metadata should also be able to carry perception annotations when available:
+
+- segmented object instances
+- 2D bounding boxes
+- mask ids
+- 3D centroids / anchors
+- overlay text for operator-facing UI
+- waypoint hints derived from depth or point-cloud geometry
+
 ### Place Discovery
 The agent should be able to infer likely places from visual and memory evidence.
 
@@ -86,6 +101,52 @@ It only needs a prompt or heuristic layer that can assign:
 - place name
 - confidence
 - evidence
+
+## Perception Stack
+Do not overload the planner with many perception APIs.
+
+Use one compact perception layer that can:
+
+- refresh a scene understanding snapshot from RGB-D and point-cloud context
+- ground a text target into a segmented object with a 3D anchor
+- derive a waypoint or approach pose from that object anchor
+
+This gives the planner an alternative to:
+
+- relying only on a full precomputed map
+- relying only on predefined named places
+- relying only on end-to-end VLA actuation
+
+### Perception Tool Surface
+Keep the v1 tool surface small:
+
+- `perceive_scene`
+- `ground_object_3d`
+- `set_waypoint_from_object`
+
+These are analysis / world-building tools.
+They do not directly actuate the robot.
+
+Their job is to feed:
+
+- `go_to_pose`
+- navigation skills
+- alignment skills
+- manipulation skills
+
+### Annotation Contract
+Each perception snapshot should be able to emit annotations like:
+
+- `label`
+- `confidence`
+- `bbox_2d`
+- `mask_id`
+- `centroid_3d`
+- `depth_m`
+- `overlay_text`
+- `waypoint_hint`
+
+The UI can use `overlay_text` and the 2D/3D anchor data to render object overlays for the operator.
 
 ## Skills
 The planner may only choose from registered skills.
@@ -193,6 +254,46 @@ The implementation may keep:
 
 but the source of those values is the prompt, not separate hand-written model classes.
 
+## Tool Strategy
+Do not make everything a skill.
+
+Use three categories:
+
+### 1. Actuation Skills
+These move the robot or manipulate the world.
+
+Examples:
+
+- `open_fridge`
+- `grab_bread_from_table`
+- `navigate_to_region`
+- `align_for_skill`
+
+### 2. High-Level Task Tools
+These interact with delegated services such as Nav2 / mapping.
+
+Examples:
+
+- `go_to_pose`
+- `get_map`
+- `explore`
+- `create_map`
+
+### 3. Perception Tools
+These build scene knowledge for the planner and for the operator UI.
+
+Examples:
+
+- `perceive_scene`
+- `ground_object_3d`
+- `set_waypoint_from_object`
+
+This keeps the agent coherent:
+
+- skills act
+- tools observe, structure, or delegate
+- the planner chooses the smallest useful step
+
 ## Deterministic Gate
 Before a skill is scored, reject it if:
 
@@ -218,16 +319,58 @@ The planner may select a skill, but manipulation must only run when readiness is
 1. Wait for wake word if voice mode is active.
 2. Normalize the command.
 3. Build the current world context from images, memory, and robot state.
-4. Discover likely places.
-5. Break the instruction into subgoals.
-6. For each subgoal:
+4. Run the Visual Differencing Module once on the current observations to produce:
+   - a scene summary
+   - task-relevant visual attributes
+   - an initial completion guess
+5. Refresh scene understanding if the current task needs perception grounding.
+6. Discover likely places.
+7. Break the instruction into subgoals.
+8. For each subgoal:
    - gate infeasible skills
+   - expose compact navigation / perception tools
    - prompt-rank feasible skills
    - select the best skill
+   - or select a tool that improves world understanding or delegates navigation
    - execute it
+   - run the Visual Differencing Module again on the previous and current observations
+   - append the visual delta summary into world memory and the operator report
    - verify the result
    - update memory and history
-7. Stop when all subgoals are completed or execution fails.
+9. Stop when all subgoals are completed or execution fails.
+
+Example:
+
+`find the fridge and open it`
+
+- `perceive_scene`
+- `ground_object_3d("fridge")`
+- `set_waypoint_from_object("fridge")`
+- `go_to_pose(...)` or `align_for_skill`
+- `open_fridge`
+
+## Visual Differencing Module
+The Visual Differencing Module is an observation module, not a controller.
+
+It should:
+
+- summarize the initial scene in natural language
+- extract task-relevant visual attributes
+- compare previous and current observations after each action
+- describe what changed and what did not change
+- provide a lightweight completion signal for the critic and operator UI
+
+It should not:
+
+- directly command skills
+- bypass the planner
+- replace segmentation or 3D grounding backends
+
+The intended use is:
+
+- perception tools produce structured scene state
+- the Visual Differencing Module converts that structured state into compact natural-language evidence
+- the critic and planner consume that evidence for retry, replay, cancel, or replan decisions
 
 ## Safety
 Safety must remain outside the prompt and outside learned skills.
@@ -253,4 +396,8 @@ The first tests should prove:
 - delegated mode can swap:
   - `progressive_map`
   - `global_map`
+- perception tools can:
+  - emit object overlays with 2D + 3D anchors
+  - ground a queried target into a segment / anchor
+  - derive a waypoint hint from depth or point-cloud context
 - planner always chooses from registered skills only

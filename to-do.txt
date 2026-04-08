@@ -1,0 +1,4 @@
+XLeRobot / Robot42 TODO
+=======================
+
+- Set up SAM3 in the environment so the perception service can use real language-conditioned segmentation instead of annotation-only fallbacks.
