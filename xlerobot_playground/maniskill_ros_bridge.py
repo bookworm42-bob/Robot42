@@ -42,14 +42,7 @@ HEAD_CAMERA_UID = "fetch_head"
 HEAD_CAMERA_FOV_RAD = 1.6
 HEAD_CAMERA_WIDTH = 256
 HEAD_CAMERA_HEIGHT = 256
-OPTICAL_TO_LASER_ROTATION = np.array(
-    [
-        [0.0, -1.0, 0.0],
-        [0.0, 0.0, -1.0],
-        [1.0, 0.0, 0.0],
-    ],
-    dtype=np.float64,
-)
+IDENTITY_QUATERNION_WXYZ = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
 
 
 @dataclass(frozen=True)
@@ -74,6 +67,8 @@ class BridgeConfig:
     publish_head_camera: bool = True
     publish_rate_hz: float | None = None
     cmd_vel_timeout_s: float = 0.5
+    linear_cmd_gain: float | None = None
+    angular_cmd_gain: float | None = None
     laser_min_range_m: float = 0.05
     laser_max_range_m: float = 10.0
     scan_band_height_px: int = 12
@@ -286,7 +281,9 @@ def synthesize_scan_from_depth(
     band = depth_mm[row_start:row_stop, :].astype(np.float32)
     band[band <= 0.0] = np.nan
 
-    angles = np.linspace(-horizontal_fov_rad / 2.0, horizontal_fov_rad / 2.0, width, dtype=np.float32)
+    # Image columns increase left->right, but positive planar yaw is left of robot-forward.
+    # The leftmost image column must therefore become the most-positive scan angle.
+    angles = np.linspace(horizontal_fov_rad / 2.0, -horizontal_fov_rad / 2.0, width, dtype=np.float32)
     median_depth_m = np.nanmedian(band, axis=0) / 1000.0
     ranges = median_depth_m / np.maximum(np.cos(angles), 1e-3)
     ranges = np.where(np.isnan(ranges), np.inf, ranges)
@@ -328,12 +325,23 @@ class ManiSkillRosBridge(Node):
             height=HEAD_CAMERA_HEIGHT,
             horizontal_fov_rad=HEAD_CAMERA_FOV_RAD,
         )
-        self._head_laser_quaternion = quaternion_from_rotation_matrix(OPTICAL_TO_LASER_ROTATION)
+        # The ManiSkill head camera is mounted with identity pose on `head_camera_link`.
+        # Its frame already behaves like a planar navigation sensor frame for yaw projection,
+        # so publishing an extra optical->laser rotation here introduces a false yaw bias.
+        self._head_laser_quaternion = IDENTITY_QUATERNION_WXYZ.copy()
         yaw_offset = config.ros_base_yaw_offset_rad
         if yaw_offset is None:
             yaw_offset = math.pi if config.robot_uid == "xlerobot" else 0.0
         self._ros_base_yaw_offset_rad = float(yaw_offset)
         self._ros_base_rotation = quaternion_from_yaw_wxyz(self._ros_base_yaw_offset_rad)
+        linear_cmd_gain = config.linear_cmd_gain
+        angular_cmd_gain = config.angular_cmd_gain
+        if linear_cmd_gain is None:
+            linear_cmd_gain = 1.5 if config.robot_uid == "xlerobot" else 1.0
+        if angular_cmd_gain is None:
+            angular_cmd_gain = 0.32 if config.robot_uid == "xlerobot" else 1.0
+        self._linear_cmd_gain = float(linear_cmd_gain)
+        self._angular_cmd_gain = float(angular_cmd_gain)
         self._origin_ros_quaternion: np.ndarray | None = None
 
         bootstrap_xlerobot_maniskill(config.repo_root, force_reload=config.force_reload)
@@ -362,6 +370,8 @@ class ManiSkillRosBridge(Node):
             f"env={config.env_id} "
             f"robot={config.robot_uid} "
             f"ros_base_yaw_offset={self._ros_base_yaw_offset_rad:.3f} "
+            f"linear_cmd_gain={self._linear_cmd_gain:.3f} "
+            f"angular_cmd_gain={self._angular_cmd_gain:.3f} "
             f"control_dt={self.control_dt_s:.3f}"
         )
 
@@ -417,12 +427,16 @@ class ManiSkillRosBridge(Node):
         twist = self._active_twist()
         self.action.fill(0.0)
         linear_command_ros = np.array(
-            [float(twist.linear.x), float(twist.linear.y), 0.0],
+            [
+                float(twist.linear.x) * self._linear_cmd_gain,
+                float(twist.linear.y) * self._linear_cmd_gain,
+                0.0,
+            ],
             dtype=np.float64,
         )
         linear_command_sim = rotate_vector_wxyz(self._ros_base_rotation, linear_command_ros)
         self.action[0] = float(np.clip(linear_command_sim[0], -1.0, 1.0))
-        self.action[1] = float(np.clip(twist.angular.z, -math.pi, math.pi))
+        self.action[1] = float(np.clip(twist.angular.z * self._angular_cmd_gain, -math.pi, math.pi))
 
     def _ros_time(self) -> tuple[int, int]:
         seconds = int(self._sim_time_s)
@@ -678,6 +692,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--head-laser-frame", default="head_laser")
     parser.add_argument("--publish-head-camera", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--cmd-vel-timeout-s", type=float, default=0.5)
+    parser.add_argument("--linear-cmd-gain", type=float, default=None)
+    parser.add_argument("--angular-cmd-gain", type=float, default=None)
     parser.add_argument("--laser-min-range-m", type=float, default=0.05)
     parser.add_argument("--laser-max-range-m", type=float, default=10.0)
     parser.add_argument("--scan-band-height-px", type=int, default=12)
@@ -718,6 +734,8 @@ def main(argv: list[str] | None = None) -> int:
             head_laser_frame=args.head_laser_frame,
             publish_head_camera=args.publish_head_camera,
             cmd_vel_timeout_s=args.cmd_vel_timeout_s,
+            linear_cmd_gain=args.linear_cmd_gain,
+            angular_cmd_gain=args.angular_cmd_gain,
             laser_min_range_m=args.laser_min_range_m,
             laser_max_range_m=args.laser_max_range_m,
             scan_band_height_px=args.scan_band_height_px,

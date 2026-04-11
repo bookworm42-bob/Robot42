@@ -18,6 +18,10 @@ class Nav2BridgeTests(unittest.TestCase):
                 "/robot/cmd_vel",
                 "--scan-topic",
                 "/robot/scan",
+                "--linear-cmd-gain",
+                "1.5",
+                "--angular-cmd-gain",
+                "0.32",
                 "--laser-max-range-m",
                 "8.5",
                 "--max-episode-steps",
@@ -38,6 +42,8 @@ class Nav2BridgeTests(unittest.TestCase):
         self.assertEqual(args.env_id, "ReplicaCAD_SceneManipulation-v1")
         self.assertEqual(args.cmd_vel_topic, "/robot/cmd_vel")
         self.assertEqual(args.scan_topic, "/robot/scan")
+        self.assertEqual(args.linear_cmd_gain, 1.5)
+        self.assertEqual(args.angular_cmd_gain, 0.32)
         self.assertEqual(args.laser_max_range_m, 8.5)
         self.assertEqual(args.max_episode_steps, 1500)
         self.assertEqual(args.build_config_idx, 2)
@@ -59,6 +65,8 @@ class Nav2BridgeTests(unittest.TestCase):
         self.assertEqual(len(ranges), 5)
         self.assertEqual(len(angles), 5)
         self.assertTrue(all(value >= 1.0 for value in ranges[1:4]))
+        self.assertGreater(float(angles[0]), 0.0)
+        self.assertLess(float(angles[-1]), 0.0)
 
     def test_nav2_params_are_patched_to_bridge_topics(self) -> None:
         base = {

@@ -38,6 +38,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--head-laser-frame", default="head_laser")
     parser.add_argument("--publish-head-camera", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--cmd-vel-timeout-s", type=float, default=0.5)
+    parser.add_argument("--linear-cmd-gain", type=float, default=None)
+    parser.add_argument("--angular-cmd-gain", type=float, default=None)
     parser.add_argument("--laser-min-range-m", type=float, default=0.05)
     parser.add_argument("--laser-max-range-m", type=float, default=10.0)
     parser.add_argument("--scan-band-height-px", type=int, default=12)
@@ -114,6 +116,10 @@ def main(argv: list[str] | None = None) -> int:
         backend_args.extend(["--spawn-yaw", str(args.spawn_yaw)])
     if args.ros_base_yaw_offset_rad is not None:
         backend_args.extend(["--ros-base-yaw-offset-rad", str(args.ros_base_yaw_offset_rad)])
+    if args.linear_cmd_gain is not None:
+        backend_args.extend(["--linear-cmd-gain", str(args.linear_cmd_gain)])
+    if args.angular_cmd_gain is not None:
+        backend_args.extend(["--angular-cmd-gain", str(args.angular_cmd_gain)])
     if args.force_reload:
         backend_args.append("--force-reload")
     if args.max_steps is not None:

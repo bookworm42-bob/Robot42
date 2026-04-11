@@ -17,6 +17,17 @@ from xlerobot_agent.prompts import (
     build_exploration_policy_system_prompt,
     build_exploration_policy_user_prompt,
 )
+from xlerobot_playground.ros_nav2_runtime import (
+    GoalStatus,
+    RosExplorationRuntime,
+    RosOccupancyMap,
+    RosRuntimeConfig,
+    path_length_m,
+    require_runtime_dependencies as require_ros_nav2_runtime_dependencies,
+    ros_goal_status_label,
+    rclpy,
+    seconds_since,
+)
 
 
 @dataclass
@@ -62,6 +73,20 @@ class SimExplorationConfig:
     nav2_controller_id: str = "FollowPath"
     nav2_behavior_tree: str = "navigate_to_pose_w_replanning_and_recovery.xml"
     nav2_recovery_enabled: bool = True
+    nav2_mode: str = "simulated"
+    ros_map_topic: str = "/map"
+    ros_scan_topic: str = "/scan"
+    ros_rgb_topic: str = "/camera/head/image_raw"
+    ros_cmd_vel_topic: str = "/cmd_vel"
+    ros_map_frame: str = "map"
+    ros_base_frame: str = "base_link"
+    ros_server_timeout_s: float = 10.0
+    ros_ready_timeout_s: float = 20.0
+    ros_turn_scan_timeout_s: float = 45.0
+    ros_turn_scan_settle_s: float = 1.0
+    ros_manual_spin_angular_speed_rad_s: float = 0.55
+    ros_manual_spin_publish_hz: float = 10.0
+    ros_allow_multiple_action_servers: bool = False
 
 
 @dataclass(frozen=True, order=True)
@@ -206,6 +231,9 @@ class FrontierRecord:
     sensor_range_edge: bool
     room_hint: str | None
     evidence: list[str] = field(default_factory=list)
+    llm_memory_label: str | None = None
+    llm_memory_priority: float | None = None
+    llm_memory_notes: list[str] = field(default_factory=list)
     attempt_count: int = 0
     visit_count: int = 0
     path_cost_m: float | None = None
@@ -215,7 +243,9 @@ class FrontierRecord:
         return {
             "frontier_id": self.frontier_id,
             "nav_pose": self.nav_pose.to_dict(),
+            "approach_pose": self.nav_pose.to_dict(),
             "centroid_pose": self.centroid_pose.to_dict(),
+            "frontier_boundary_pose": self.centroid_pose.to_dict(),
             "status": self.status,
             "discovered_step": self.discovered_step,
             "last_seen_step": self.last_seen_step,
@@ -223,6 +253,9 @@ class FrontierRecord:
             "sensor_range_edge": self.sensor_range_edge,
             "room_hint": self.room_hint,
             "evidence": list(self.evidence),
+            "llm_memory_label": self.llm_memory_label,
+            "llm_memory_priority": self.llm_memory_priority,
+            "llm_memory_notes": list(self.llm_memory_notes),
             "attempt_count": self.attempt_count,
             "visit_count": self.visit_count,
             "path_cost_m": None if self.path_cost_m is None else round(self.path_cost_m, 3),
@@ -239,6 +272,7 @@ class ExplorationDecision:
     exploration_complete: bool
     reasoning_summary: str
     semantic_updates: list[dict[str, Any]]
+    memory_updates: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -249,6 +283,7 @@ class ExplorationDecision:
             "exploration_complete": self.exploration_complete,
             "reasoning_summary": self.reasoning_summary,
             "semantic_updates": json.loads(json.dumps(self.semantic_updates)),
+            "memory_updates": json.loads(json.dumps(self.memory_updates)),
         }
 
 
@@ -550,6 +585,212 @@ class SimulatedNav2NavigationModule(Nav2NavigationModule):
             "recoveries": list(self._recovery_history),
         }
 
+
+class RosNav2NavigationModule(Nav2NavigationModule):
+    def __init__(
+        self,
+        config: SimExplorationConfig,
+        runtime: RosExplorationRuntime,
+        *,
+        current_map: Callable[[], RosOccupancyMap | None],
+    ) -> None:
+        self.config = config
+        self.runtime = runtime
+        self._current_map = current_map
+        self._goal_history: list[dict[str, Any]] = []
+        self._plan_history: list[dict[str, Any]] = []
+        self._recovery_history: list[dict[str, Any]] = []
+
+    def validate_goal(self, goal: Nav2GoalRequest) -> Nav2GoalValidation:
+        occupancy_map = self._current_map()
+        if occupancy_map is None:
+            return Nav2GoalValidation(
+                accepted=False,
+                goal=goal,
+                normalized_pose=None,
+                goal_cell=None,
+                reason="ROS occupancy map is not available yet",
+            )
+        goal_cell = occupancy_map.world_to_cell(goal.target_pose.x, goal.target_pose.y)
+        normalized_cell = self._normalize_goal_cell(occupancy_map, goal_cell)
+        if normalized_cell is None:
+            return Nav2GoalValidation(
+                accepted=False,
+                goal=goal,
+                normalized_pose=None,
+                goal_cell=None,
+                reason="goal does not land on mapped free space or a nearby reachable free cell",
+            )
+        normalized_pose = occupancy_map.cell_to_pose(normalized_cell.x, normalized_cell.y, yaw=goal.target_pose.yaw)
+        reason = "goal accepted by ROS/Nav2 goal checker"
+        if normalized_cell != goal_cell:
+            reason = "goal normalized onto the nearest mapped free cell before Nav2 planning"
+        return Nav2GoalValidation(
+            accepted=True,
+            goal=goal,
+            normalized_pose=normalized_pose,
+            goal_cell=normalized_cell,
+            reason=reason,
+        )
+
+    def compute_path(self, goal: Nav2GoalRequest, *, record: bool = True) -> Nav2PlanResult:
+        validation = self.validate_goal(goal)
+        if not validation.accepted:
+            result = Nav2PlanResult(
+                status="rejected",
+                goal=goal,
+                planner_id=goal.planner_id,
+                reason=validation.reason,
+                goal_cell=validation.goal_cell,
+            )
+            if record:
+                self._plan_history.append(result.to_dict())
+            return result
+        try:
+            status, path_poses, _raw_result = self.runtime.compute_path(
+                goal_pose=validation.normalized_pose or goal.target_pose,
+                planner_id=goal.planner_id,
+            )
+        except Exception as exc:
+            result = Nav2PlanResult(
+                status="failed",
+                goal=goal,
+                planner_id=goal.planner_id,
+                reason=f"ROS Nav2 planner call failed: {exc}",
+                goal_cell=validation.goal_cell,
+            )
+            if record:
+                self._plan_history.append(result.to_dict())
+            return result
+        occupancy_map = self._current_map()
+        path_cells = tuple(
+            GridCell(*occupancy_map.world_to_cell(item.x, item.y))
+            for item in path_poses
+        ) if occupancy_map is not None else tuple()
+        result = Nav2PlanResult(
+            status="succeeded" if status == GoalStatus.STATUS_SUCCEEDED and path_poses else "failed",
+            goal=goal,
+            planner_id=goal.planner_id,
+            reason=(
+                "Nav2 planner returned a valid path on the live occupancy map"
+                if status == GoalStatus.STATUS_SUCCEEDED and path_poses
+                else f"Nav2 planner returned status `{ros_goal_status_label(status)}` with {len(path_poses)} path poses"
+            ),
+            goal_cell=validation.goal_cell,
+            path_cells=path_cells,
+            path_length_m=path_length_m(path_poses),
+        )
+        if record:
+            self._plan_history.append(result.to_dict())
+        return result
+
+    def navigate_to_pose(self, goal: Nav2GoalRequest) -> Nav2NavigateResult:
+        self._goal_history.append(goal.to_dict())
+        plan = self.compute_path(goal, record=True)
+        if plan.status != "succeeded":
+            recovery_events: list[dict[str, Any]] = []
+            if self.config.nav2_recovery_enabled:
+                recovery_events.append(self.recover(goal, reason=plan.reason))
+            return Nav2NavigateResult(
+                status="failed",
+                goal=goal,
+                plan=plan,
+                reached_pose=self.runtime.current_pose(),
+                travelled_distance_m=0.0,
+                reason=plan.reason,
+                recovery_events=tuple(recovery_events),
+            )
+        validation = self.validate_goal(goal)
+        try:
+            outcome, feedback_samples = self.runtime.navigate_to_pose(
+                goal_pose=validation.normalized_pose or goal.target_pose,
+                behavior_tree=goal.behavior_tree,
+            )
+        except Exception as exc:
+            reason = f"ROS Nav2 navigate_to_pose call failed: {exc}"
+            recovery_events: list[dict[str, Any]] = []
+            if self.config.nav2_recovery_enabled:
+                recovery_events.append(self.recover(goal, reason=reason))
+            return Nav2NavigateResult(
+                status="failed",
+                goal=goal,
+                plan=plan,
+                reached_pose=self.runtime.current_pose(),
+                travelled_distance_m=0.0,
+                reason=reason,
+                recovery_events=tuple(recovery_events),
+            )
+        status = int(getattr(outcome, "status", GoalStatus.STATUS_UNKNOWN))
+        if status == GoalStatus.STATUS_SUCCEEDED:
+            return Nav2NavigateResult(
+                status="succeeded",
+                goal=goal,
+                plan=plan,
+                reached_pose=self.runtime.current_pose(),
+                travelled_distance_m=plan.path_length_m,
+                reason="Nav2 reached the requested goal pose on the live map",
+                feedback_samples=tuple(feedback_samples),
+            )
+        reason = f"Nav2 returned status `{ros_goal_status_label(status)}`"
+        recovery_events = []
+        if self.config.nav2_recovery_enabled:
+            recovery_events.append(self.recover(goal, reason=reason))
+        return Nav2NavigateResult(
+            status="failed",
+            goal=goal,
+            plan=plan,
+            reached_pose=self.runtime.current_pose(),
+            travelled_distance_m=plan.path_length_m,
+            reason=reason,
+            feedback_samples=tuple(feedback_samples),
+            recovery_events=tuple(recovery_events),
+        )
+
+    def recover(self, goal: Nav2GoalRequest, *, reason: str) -> dict[str, Any]:
+        event = {
+            "goal_id": goal.goal_id,
+            "behavior_tree": goal.behavior_tree,
+            "recovery_action": "nav2_spin_turnaround_scan",
+            "reason": reason,
+            "timestamp": time.time(),
+        }
+        self._recovery_history.append(event)
+        return event
+
+    def snapshot(self) -> dict[str, Any]:
+        snapshot = self.runtime.snapshot()
+        snapshot.update(
+            {
+                "planner_id": self.config.nav2_planner_id,
+                "controller_id": self.config.nav2_controller_id,
+                "behavior_tree": self.config.nav2_behavior_tree,
+                "goals": list(self._goal_history),
+                "plans": list(self._plan_history),
+                "recoveries": list(self._recovery_history),
+            }
+        )
+        return snapshot
+
+    def _normalize_goal_cell(self, occupancy_map: RosOccupancyMap, goal_cell: GridCell) -> GridCell | None:
+        if occupancy_map.is_free(goal_cell.x, goal_cell.y):
+            return goal_cell
+        for radius in range(1, 5):
+            candidates: list[GridCell] = []
+            for offset_x in range(-radius, radius + 1):
+                for offset_y in range(-radius, radius + 1):
+                    cell = GridCell(goal_cell.x + offset_x, goal_cell.y + offset_y)
+                    if not occupancy_map.in_bounds(cell.x, cell.y):
+                        continue
+                    if not occupancy_map.is_free(cell.x, cell.y):
+                        continue
+                    candidates.append(cell)
+            if candidates:
+                return min(
+                    candidates,
+                    key=lambda item: _grid_distance_cells(item, goal_cell),
+                )
+        return None
+
 class FrontierMemory:
     def __init__(self, resolution: float) -> None:
         self.resolution = resolution
@@ -564,7 +805,7 @@ class FrontierMemory:
             match_id, distance_m = self._find_match_id(candidate)
             if match_id is not None:
                 record = self.records[match_id]
-                if record.status in {"completed", "failed"} and distance_m <= self._dedupe_tolerance_m():
+                if record.status in {"completed", "failed", "suppressed"} and distance_m <= self._dedupe_tolerance_m():
                     if (
                         distance_m <= self.resolution * 2.0
                         and candidate.unknown_gain <= record.unknown_gain + 1
@@ -599,7 +840,7 @@ class FrontierMemory:
                 record.room_hint = candidate.room_hint or record.room_hint
                 record.currently_visible = True
                 record.evidence = _dedupe_text(record.evidence + candidate.evidence)
-                if record.status not in {"active", "failed", "completed"}:
+                if record.status not in {"active", "failed", "completed", "suppressed"}:
                     record.status = "stored"
             visible_ids.add(record.frontier_id)
 
@@ -612,8 +853,62 @@ class FrontierMemory:
         return [
             record
             for record in self.records.values()
-            if record.status not in {"completed", "failed"}
+            if record.status not in {"completed", "failed", "suppressed"}
         ]
+
+    def apply_model_memory_updates(
+        self,
+        updates: list[dict[str, Any]],
+        *,
+        selected_frontier_id: str | None,
+    ) -> list[dict[str, Any]]:
+        applied: list[dict[str, Any]] = []
+        for update in updates:
+            frontier_id = str(update.get("frontier_id", "")).strip()
+            record = self.records.get(frontier_id)
+            if record is None:
+                continue
+            action = str(update.get("action", "keep")).strip().lower()
+            if action not in {"keep", "store", "prioritize", "suppress", "revalidate"}:
+                action = "keep"
+            if frontier_id == selected_frontier_id and action == "suppress":
+                action = "prioritize"
+            priority = _clamp_float(update.get("priority"), default=record.llm_memory_priority or 0.5, low=0.0, high=1.0)
+            label = str(update.get("label", "")).strip()
+            notes = str(update.get("notes", "")).strip()
+            evidence = [
+                str(item).strip()
+                for item in update.get("evidence", [])
+                if str(item).strip()
+            ] if isinstance(update.get("evidence", []), list) else []
+            if label:
+                record.llm_memory_label = label
+            record.llm_memory_priority = priority
+            if notes:
+                record.llm_memory_notes = _dedupe_text(record.llm_memory_notes + [notes])
+            if evidence:
+                record.evidence = _dedupe_text(record.evidence + evidence[:4])
+            if action in {"store", "keep"} and record.status not in {"active", "completed", "failed"}:
+                record.status = "stored"
+            elif action == "prioritize" and record.status not in {"active", "completed", "failed"}:
+                record.status = "stored"
+                record.llm_memory_priority = max(priority, 0.8)
+            elif action == "suppress" and record.status not in {"active", "completed", "failed"}:
+                record.status = "suppressed"
+            elif action == "revalidate" and record.status in {"suppressed", "failed"}:
+                record.status = "stored"
+                record.llm_memory_priority = max(priority, 0.65)
+            applied.append(
+                {
+                    "frontier_id": frontier_id,
+                    "action": action,
+                    "status": record.status,
+                    "priority": record.llm_memory_priority,
+                    "label": record.llm_memory_label,
+                    "notes": notes,
+                }
+            )
+        return applied
 
     def activate(self, frontier_id: str) -> FrontierRecord | None:
         record = self.records.get(frontier_id)
@@ -671,12 +966,14 @@ class FrontierMemory:
         active = None if self.active_frontier_id is None else self.records[self.active_frontier_id].to_dict()
         visited = [record.to_dict() for record in self.records.values() if record.visit_count > 0]
         failed = [record.to_dict() for record in self.records.values() if record.status == "failed"]
+        suppressed = [record.to_dict() for record in self.records.values() if record.status == "suppressed"]
         completed = [record.to_dict() for record in self.records.values() if record.status == "completed"]
         return {
             "active_frontier": active,
             "stored_frontiers": stored,
             "visited_frontiers": visited,
             "failed_frontiers": failed,
+            "suppressed_frontiers": suppressed,
             "completed_frontiers": completed,
             "return_waypoints": list(self.return_waypoints.values()),
         }
@@ -754,7 +1051,12 @@ class ExplorationLLMPolicy:
                     {"type": "text", "text": user_prompt},
                     *[
                         {"type": "image_url", "image_url": {"url": item["thumbnail_data_url"]}}
-                        for item in prompt_payload.get("recent_views", [])[-2:]
+                        for item in prompt_payload.get("navigation_map_views", [])[-2:]
+                        if item.get("thumbnail_data_url")
+                    ],
+                    *[
+                        {"type": "image_url", "image_url": {"url": item["thumbnail_data_url"]}}
+                        for item in prompt_payload.get("recent_views", [])[-4:]
                         if item.get("thumbnail_data_url")
                     ],
                 ],
@@ -809,7 +1111,16 @@ class ExplorationLLMPolicy:
             range_bonus = 1.8 if record.sensor_range_edge else 0.0
             revisit_penalty = min(record.attempt_count * 0.8, 2.4)
             room_bonus = 0.9 if record.room_hint and record.room_hint != current_room_id else 0.0
-            return record.unknown_gain * 1.4 + novelty_bonus + range_bonus + room_bonus - distance_penalty * 0.16 - revisit_penalty
+            memory_priority_bonus = (record.llm_memory_priority or 0.5) * 2.0
+            return (
+                record.unknown_gain * 1.4
+                + novelty_bonus
+                + range_bonus
+                + room_bonus
+                + memory_priority_bonus
+                - distance_penalty * 0.55
+                - revisit_penalty
+            )
 
         ranked = sorted(reachable, key=score, reverse=True)
         best = ranked[0]
@@ -835,7 +1146,7 @@ class ExplorationLLMPolicy:
                     "evidence": best.evidence[:3],
                 }
             )
-        return ExplorationDecision(
+        decision = ExplorationDecision(
             decision_type="revisit_frontier" if not best.currently_visible else "explore_frontier",
             selected_frontier_id=best.frontier_id,
             selected_return_waypoint_id=selected_return_waypoint_id,
@@ -847,6 +1158,39 @@ class ExplorationLLMPolicy:
             ),
             semantic_updates=semantic_updates,
         )
+        decision.memory_updates = self._heuristic_memory_updates(decision, frontiers)
+        return decision
+
+    def _heuristic_memory_updates(
+        self,
+        decision: ExplorationDecision,
+        frontiers: list[FrontierRecord],
+    ) -> list[dict[str, Any]]:
+        updates: list[dict[str, Any]] = []
+        for record in frontiers:
+            if record.frontier_id == decision.selected_frontier_id:
+                action = "prioritize"
+                priority = 1.0
+                notes = "Selected as the next active exploration target."
+            elif record.frontier_id in decision.frontier_ids_to_store:
+                action = "store"
+                priority = 0.65
+                notes = "Keep as a useful later exploration memory point."
+            else:
+                action = "keep"
+                priority = 0.5
+                notes = "Keep unless later visual/map evidence shows this is not useful."
+            updates.append(
+                {
+                    "frontier_id": record.frontier_id,
+                    "action": action,
+                    "priority": priority,
+                    "label": record.room_hint or "frontier_boundary",
+                    "notes": notes,
+                    "evidence": record.evidence[:3],
+                }
+            )
+        return updates
 
     def _parse_model_decision(
         self,
@@ -877,7 +1221,7 @@ class ExplorationLLMPolicy:
             for item in payload.get("semantic_updates", [])
             if isinstance(item, dict)
         ][:6]
-        return ExplorationDecision(
+        decision = ExplorationDecision(
             decision_type=decision_type,
             selected_frontier_id=selected_frontier_id,
             selected_return_waypoint_id=selected_return_waypoint_id,
@@ -885,7 +1229,50 @@ class ExplorationLLMPolicy:
             exploration_complete=bool(payload.get("exploration_complete", decision_type == "finish")),
             reasoning_summary=str(payload.get("reasoning_summary", "")).strip() or "Model selected the next exploration action.",
             semantic_updates=json.loads(json.dumps(semantic_updates)),
+            memory_updates=self._parse_memory_updates(payload, frontiers, selected_frontier_id),
         )
+        if not decision.memory_updates:
+            decision.memory_updates = self._heuristic_memory_updates(decision, frontiers)
+        return decision
+
+    def _parse_memory_updates(
+        self,
+        payload: dict[str, Any],
+        frontiers: list[FrontierRecord],
+        selected_frontier_id: str | None,
+    ) -> list[dict[str, Any]]:
+        valid_frontier_ids = {record.frontier_id for record in frontiers}
+        parsed_updates: list[dict[str, Any]] = []
+        raw_updates = payload.get("memory_updates", [])
+        if not isinstance(raw_updates, list):
+            return []
+        for item in raw_updates:
+            if not isinstance(item, dict):
+                continue
+            frontier_id = str(item.get("frontier_id", "")).strip()
+            if frontier_id not in valid_frontier_ids:
+                continue
+            action = str(item.get("action", "keep")).strip().lower()
+            if action not in {"keep", "store", "prioritize", "suppress", "revalidate"}:
+                action = "keep"
+            if frontier_id == selected_frontier_id and action == "suppress":
+                action = "prioritize"
+            evidence = item.get("evidence", [])
+            parsed_updates.append(
+                {
+                    "frontier_id": frontier_id,
+                    "action": action,
+                    "priority": _clamp_float(item.get("priority"), default=0.5, low=0.0, high=1.0),
+                    "label": str(item.get("label", "")).strip()[:80],
+                    "notes": str(item.get("notes", "")).strip()[:400],
+                    "evidence": [
+                        str(token).strip()[:240]
+                        for token in evidence
+                        if str(token).strip()
+                    ][:6] if isinstance(evidence, list) else [],
+                }
+            )
+        return parsed_updates
 
 
 class _ApartmentExplorationSession:
@@ -962,6 +1349,11 @@ class _ApartmentExplorationSession:
                 current_room_id=self.scenario.room_for_cell(self.current_cell),
             )
             decision = self._apply_finish_guardrail(decision, candidate_records)
+            applied_memory_updates = self.frontier_memory.apply_model_memory_updates(
+                decision.memory_updates,
+                selected_frontier_id=decision.selected_frontier_id,
+            )
+            trace["applied_memory_updates"] = applied_memory_updates
             self.semantic_updates.extend(decision.semantic_updates)
             self._log_policy_step(prompt_payload, decision, trace)
             if decision.decision_type == "finish" or decision.exploration_complete and not candidate_records:
@@ -1089,7 +1481,7 @@ class _ApartmentExplorationSession:
                 for neighbor in _neighbors4(cell)
                 if self.scenario.in_bounds(neighbor) and neighbor not in self.known_cells
             }
-            if len(unknown_neighbors) >= 2 or (cell in self.range_edge_cells and unknown_neighbors):
+            if unknown_neighbors:
                 frontier_cells.add(cell)
                 unknown_neighbors_by_frontier[cell] = unknown_neighbors
 
@@ -1113,8 +1505,9 @@ class _ApartmentExplorationSession:
         candidates: list[FrontierCandidate] = []
         for cluster in clusters:
             cluster_unknown = set().union(*(unknown_neighbors_by_frontier.get(cell, set()) for cell in cluster))
-            if len(cluster_unknown) < 2:
+            if not cluster_unknown:
                 continue
+            max_unknown_neighbor_count = max(len(unknown_neighbors_by_frontier.get(cell, set())) for cell in cluster)
             nav_cell = min(
                 cluster,
                 key=lambda cell: _grid_distance_cells(cell, self.current_cell),
@@ -1125,6 +1518,12 @@ class _ApartmentExplorationSession:
                 f"{len(cluster_unknown)} unknown neighbor cells",
                 f"cluster size {len(cluster)}",
             ]
+            if max_unknown_neighbor_count >= 2:
+                evidence.append("frontier signal is stronger: multiple unknown-facing neighbors support likely expansion")
+            else:
+                evidence.append(
+                    "frontier signal is weaker: a single unknown-facing edge can still be useful, but it should be vetoed if view/map context shows no meaningful navigable opening"
+                )
             if any(cell in self.range_edge_cells for cell in cluster):
                 evidence.append("visible frontier reaches sensor range limit")
             candidates.append(
@@ -1194,14 +1593,19 @@ class _ApartmentExplorationSession:
                 "sensor_range_m": self.config.sensor_range_m,
             },
             "frontier_memory": frontier_memory_snapshot,
+            "frontier_information": [record.to_dict() for record in candidate_records],
             "candidate_frontiers": [record.to_dict() for record in candidate_records],
             "explored_areas": explored_areas,
             "recent_views": recent_views,
+            "frontier_selection_guidance": _frontier_selection_guidance(),
             "guardrails": {
                 "finish_requires_frontier_exhaustion": True,
                 "finish_coverage_threshold": self.config.finish_coverage_threshold,
                 "navigation_must_use_nav2_goal_validation": True,
                 "frontier_ids_must_come_from_prompt": True,
+                "frontier_information_is_boundary_evidence_not_a_command": True,
+                "select_regions_that_expand_robot_navigable_space": True,
+                "avoid_furniture_shadow_boundaries_without_clear_open_space": True,
             },
             "ascii_map": self._ascii_map(candidate_records),
         }
@@ -1270,7 +1674,10 @@ class _ApartmentExplorationSession:
                 "coverage": round(self._coverage(), 3),
                 "decision": decision.to_dict(),
                 "trace": trace,
-                "candidate_frontier_ids": [item.get("frontier_id") for item in prompt_payload.get("candidate_frontiers", [])],
+                "frontier_information_ids": [
+                    item.get("frontier_id")
+                    for item in prompt_payload.get("frontier_information", prompt_payload.get("candidate_frontiers", []))
+                ],
             }
         )
 
@@ -1450,6 +1857,642 @@ class _ApartmentExplorationSession:
         self.known_cells[cell] = "occupied"
 
 
+class RosExplorationSession:
+    def __init__(self, config: SimExplorationConfig, backend: ExplorationBackend, task_id: str) -> None:
+        require_ros_nav2_runtime_dependencies()
+        self.config = config
+        self.backend = backend
+        self.task_id = task_id
+        self.policy = ExplorationLLMPolicy(config)
+        self.frontier_memory = FrontierMemory(config.occupancy_resolution)
+        self.keyframes: list[dict[str, Any]] = []
+        self.trajectory: list[dict[str, Any]] = []
+        self.decision_log: list[dict[str, Any]] = []
+        self.guardrail_events: list[dict[str, Any]] = []
+        self.semantic_updates: list[dict[str, Any]] = []
+        self.total_distance_m = 0.0
+        self.control_steps = 0
+        self.decision_index = 0
+        self.nav2_goal_counter = 0
+        self._last_pose: Pose2D | None = None
+        self._owns_rclpy = False
+        if not rclpy.ok():
+            rclpy.init(args=None)
+            self._owns_rclpy = True
+        self.runtime = RosExplorationRuntime(
+            RosRuntimeConfig(
+                map_topic=config.ros_map_topic,
+                scan_topic=config.ros_scan_topic,
+                rgb_topic=config.ros_rgb_topic,
+                cmd_vel_topic=config.ros_cmd_vel_topic,
+                map_frame=config.ros_map_frame,
+                base_frame=config.ros_base_frame,
+                server_timeout_s=config.ros_server_timeout_s,
+                ready_timeout_s=config.ros_ready_timeout_s,
+                turn_scan_radians=math.tau,
+                turn_scan_timeout_s=config.ros_turn_scan_timeout_s,
+                turn_scan_settle_s=config.ros_turn_scan_settle_s,
+                manual_spin_angular_speed_rad_s=config.ros_manual_spin_angular_speed_rad_s,
+                manual_spin_publish_hz=config.ros_manual_spin_publish_hz,
+                allow_multiple_action_servers=config.ros_allow_multiple_action_servers,
+            )
+        )
+        self.nav2 = RosNav2NavigationModule(
+            config,
+            self.runtime,
+            current_map=self._current_map,
+        )
+
+    def close(self) -> None:
+        try:
+            self.runtime.close()
+        finally:
+            if self._owns_rclpy and rclpy.ok():
+                rclpy.shutdown()
+
+    def run(self) -> dict[str, Any]:
+        self.runtime.spin_until_ready(timeout_s=self.config.ros_ready_timeout_s)
+        initial_pose = self._require_pose()
+        self._update_pose_history(initial_pose)
+        self.frontier_memory.remember_return_waypoint(
+            room_id=None,
+            pose=initial_pose,
+            step_index=0,
+            reason="initial_pose",
+        )
+        self._perform_turnaround_scan(reason="initial_turnaround_scan")
+
+        while self.decision_index < self.config.max_decisions:
+            self.runtime.spin_for(0.15)
+            if self._budget_exhausted():
+                self.guardrail_events.append(
+                    {
+                        "type": "budget_exhausted",
+                        "decision_index": self.decision_index,
+                    }
+                )
+                break
+
+            self.decision_index += 1
+            occupancy_map = self._require_map()
+            pose = self._require_pose()
+            self._update_pose_history(pose)
+            visible_candidates = self._detect_frontier_candidates(occupancy_map, pose)
+            self.frontier_memory.upsert_candidates(visible_candidates, step_index=self.decision_index)
+            candidate_records = self._refresh_candidate_paths()
+            prompt_payload = self._build_prompt_payload(occupancy_map, pose, candidate_records)
+            coverage = self._coverage(occupancy_map)
+            decision, trace = self.policy.decide(
+                prompt_payload=prompt_payload,
+                frontiers=candidate_records,
+                return_waypoints=list(self.frontier_memory.return_waypoints.values()),
+                coverage=coverage,
+                current_room_id=None,
+            )
+            decision = self._apply_finish_guardrail(decision, candidate_records)
+            applied_memory_updates = self.frontier_memory.apply_model_memory_updates(
+                decision.memory_updates,
+                selected_frontier_id=decision.selected_frontier_id,
+            )
+            trace["applied_memory_updates"] = applied_memory_updates
+            self.semantic_updates.extend(decision.semantic_updates)
+            self._log_policy_step(prompt_payload, decision, trace)
+            if decision.decision_type == "finish" or (decision.exploration_complete and not candidate_records):
+                break
+
+            if decision.selected_return_waypoint_id:
+                waypoint = self.frontier_memory.get_return_waypoint(decision.selected_return_waypoint_id)
+                if waypoint is not None:
+                    target_pose = waypoint["pose"]
+                    return_goal = self._make_nav2_goal(
+                        Pose2D(
+                            float(target_pose["x"]),
+                            float(target_pose["y"]),
+                            float(target_pose.get("yaw", 0.0)),
+                        ),
+                        goal_type="return_waypoint",
+                        reason=f"return_waypoint::{waypoint['waypoint_id']}",
+                    )
+                    return_result = self.nav2.navigate_to_pose(return_goal)
+                    self._consume_nav_result(return_result)
+                    if return_result.status != "succeeded":
+                        self.guardrail_events.append(
+                            {
+                                "type": "return_waypoint_failed",
+                                "waypoint_id": waypoint["waypoint_id"],
+                                "nav2_result": return_result.to_dict(),
+                            }
+                        )
+
+            if not decision.selected_frontier_id:
+                break
+
+            record = self.frontier_memory.activate(decision.selected_frontier_id)
+            if record is None:
+                self.guardrail_events.append(
+                    {
+                        "type": "missing_frontier",
+                        "frontier_id": decision.selected_frontier_id,
+                    }
+                )
+                continue
+
+            frontier_goal = self._make_nav2_goal(
+                record.nav_pose,
+                goal_type="frontier",
+                reason=f"frontier::{record.frontier_id}",
+            )
+            nav_result = self.nav2.navigate_to_pose(frontier_goal)
+            self._consume_nav_result(nav_result)
+            if nav_result.status != "succeeded":
+                self.frontier_memory.fail(record.frontier_id, nav_result.reason)
+                self._push_progress_update(
+                    message=f"Failed to reach {record.frontier_id}: {nav_result.reason}",
+                    frontier_id=record.frontier_id,
+                )
+                continue
+
+            self._perform_turnaround_scan(reason=f"arrive_frontier::{record.frontier_id}")
+            self.frontier_memory.complete(record.frontier_id)
+            current_pose = self._require_pose()
+            self.frontier_memory.remember_return_waypoint(
+                room_id=None,
+                pose=current_pose,
+                step_index=self.decision_index,
+                reason=f"completed_frontier::{record.frontier_id}",
+            )
+            self._push_progress_update(
+                message=f"Explored {record.frontier_id} from live ROS/Nav2 state.",
+                frontier_id=record.frontier_id,
+            )
+
+        return self._build_map_payload()
+
+    def _current_map(self) -> RosOccupancyMap | None:
+        return self.runtime.latest_map
+
+    def _require_map(self) -> RosOccupancyMap:
+        occupancy_map = self._current_map()
+        if occupancy_map is None:
+            raise RuntimeError("ROS occupancy map is not available")
+        return occupancy_map
+
+    def _require_pose(self) -> Pose2D:
+        pose = self.runtime.current_pose()
+        if pose is None:
+            raise RuntimeError(
+                f"Robot pose in `{self.config.ros_map_frame}` is not available from TF yet"
+            )
+        return pose
+
+    def _budget_exhausted(self) -> bool:
+        if self.config.max_control_steps is not None and self.control_steps >= self.config.max_control_steps:
+            return True
+        if self.config.max_episode_steps is not None and self.decision_index >= self.config.max_episode_steps:
+            return True
+        return False
+
+    def _perform_turnaround_scan(self, *, reason: str) -> None:
+        event = self.runtime.perform_turnaround_scan(reason=reason)
+        self.guardrail_events.append({"type": "turnaround_scan", "event": event})
+        self.runtime.spin_for(0.25)
+        self._capture_keyframe(reason=reason)
+        pose = self.runtime.current_pose()
+        if pose is not None:
+            self._update_pose_history(pose)
+
+    def _capture_keyframe(self, *, reason: str) -> None:
+        pose = self.runtime.current_pose()
+        if pose is None:
+            return
+        scan = self.runtime.latest_scan
+        frame_id = f"kf_{len(self.keyframes) + 1:03d}"
+        frame = {
+            "frame_id": frame_id,
+            "pose": pose.to_dict(),
+            "region_id": "unknown",
+            "visible_objects": [],
+            "point_count": len(getattr(scan, "ranges", []) or []),
+            "depth_min_m": float(getattr(scan, "range_min", 0.0) or 0.0),
+            "depth_max_m": float(getattr(scan, "range_max", self.config.sensor_range_m) or self.config.sensor_range_m),
+            "description": (
+                f"Live head-camera observation captured after `{reason}` at "
+                f"map pose ({pose.x:.2f}, {pose.y:.2f}, yaw={pose.yaw:.2f})."
+            ),
+            "thumbnail_data_url": self.runtime.latest_image_data_url or "",
+        }
+        self.keyframes.append(frame)
+
+    def _update_pose_history(self, pose: Pose2D) -> None:
+        if self._last_pose is not None:
+            delta = _pose_distance_m(self._last_pose, pose)
+            if delta > 1e-3:
+                self.control_steps += 1
+        if self._last_pose is None or _pose_distance_m(self._last_pose, pose) > 0.02:
+            self.trajectory.append(pose.to_dict())
+            self._last_pose = pose
+
+    def _detect_frontier_candidates(
+        self,
+        occupancy_map: RosOccupancyMap,
+        pose: Pose2D,
+    ) -> list[FrontierCandidate]:
+        frontier_cells: set[GridCell] = set()
+        unknown_neighbors_by_frontier: dict[GridCell, set[GridCell]] = {}
+        range_edge_cells = self._range_edge_cells(occupancy_map, pose)
+        for y in range(occupancy_map.height):
+            for x in range(occupancy_map.width):
+                if not occupancy_map.is_free(x, y):
+                    continue
+                cell = GridCell(x, y)
+                unknown_neighbors = {
+                    neighbor
+                    for neighbor in _neighbors4(cell)
+                    if occupancy_map.in_bounds(neighbor.x, neighbor.y) and occupancy_map.is_unknown(neighbor.x, neighbor.y)
+                }
+                if unknown_neighbors and (len(unknown_neighbors) >= 1 or cell in range_edge_cells):
+                    frontier_cells.add(cell)
+                    unknown_neighbors_by_frontier[cell] = unknown_neighbors
+
+        clusters: list[list[GridCell]] = []
+        visited: set[GridCell] = set()
+        for cell in frontier_cells:
+            if cell in visited:
+                continue
+            cluster: list[GridCell] = []
+            queue = deque([cell])
+            visited.add(cell)
+            while queue:
+                current = queue.popleft()
+                cluster.append(current)
+                for neighbor in _neighbors8(current):
+                    if neighbor in frontier_cells and neighbor not in visited:
+                        visited.add(neighbor)
+                        queue.append(neighbor)
+            clusters.append(cluster)
+
+        robot_cell = GridCell(*occupancy_map.world_to_cell(pose.x, pose.y))
+        candidates: list[FrontierCandidate] = []
+        for cluster in clusters:
+            cluster_unknown = set().union(*(unknown_neighbors_by_frontier.get(cell, set()) for cell in cluster))
+            if not cluster_unknown:
+                continue
+            nav_cell = min(cluster, key=lambda cell: _grid_distance_cells(cell, robot_cell))
+            centroid_cell = _centroid_cell(cluster)
+            nav_pose = occupancy_map.cell_to_pose(nav_cell.x, nav_cell.y)
+            centroid_pose = occupancy_map.cell_to_pose(centroid_cell.x, centroid_cell.y)
+            evidence = [
+                f"{len(cluster_unknown)} unknown neighbor cells on the live occupancy map",
+                f"cluster size {len(cluster)}",
+            ]
+            if any(cell in range_edge_cells for cell in cluster):
+                evidence.append("frontier also aligns with the depth-derived sensor range limit")
+            candidates.append(
+                FrontierCandidate(
+                    frontier_id=None,
+                    member_cells=tuple(sorted(cluster)),
+                    nav_cell=nav_cell,
+                    centroid_cell=centroid_cell,
+                    nav_pose=nav_pose,
+                    centroid_pose=centroid_pose,
+                    unknown_gain=len(cluster_unknown),
+                    sensor_range_edge=any(cell in range_edge_cells for cell in cluster),
+                    room_hint=None,
+                    evidence=evidence,
+                    currently_visible=_pose_distance_m(nav_pose, pose) <= self.config.sensor_range_m + 0.5,
+                )
+            )
+        return candidates
+
+    def _range_edge_cells(self, occupancy_map: RosOccupancyMap, pose: Pose2D) -> set[GridCell]:
+        scan = self.runtime.latest_scan
+        if scan is None or not getattr(scan, "ranges", None):
+            return set()
+        result: set[GridCell] = set()
+        beam_stride = max(len(scan.ranges) // 96, 1)
+        step_m = max(occupancy_map.resolution * 0.5, 0.05)
+        for index in range(0, len(scan.ranges), beam_stride):
+            beam_range = float(scan.ranges[index])
+            if math.isfinite(beam_range) and beam_range < float(scan.range_max) * 0.98:
+                continue
+            angle = pose.yaw + float(scan.angle_min) + index * float(scan.angle_increment)
+            last_free: GridCell | None = None
+            samples = int(max(float(scan.range_max) / step_m, 1))
+            for sample_idx in range(1, samples + 1):
+                distance = min(sample_idx * step_m, float(scan.range_max))
+                world_x = pose.x + distance * math.cos(angle)
+                world_y = pose.y + distance * math.sin(angle)
+                cell_x, cell_y = occupancy_map.world_to_cell(world_x, world_y)
+                if not occupancy_map.in_bounds(cell_x, cell_y):
+                    break
+                if occupancy_map.is_occupied(cell_x, cell_y):
+                    break
+                if occupancy_map.is_unknown(cell_x, cell_y):
+                    if last_free is not None:
+                        result.add(last_free)
+                    break
+                last_free = GridCell(cell_x, cell_y)
+        return result
+
+    def _refresh_candidate_paths(self) -> list[FrontierRecord]:
+        updated: list[FrontierRecord] = []
+        for record in self.frontier_memory.candidate_records():
+            preview_goal = Nav2GoalRequest(
+                goal_id=f"preview_{self.decision_index:03d}_{record.frontier_id}",
+                goal_type="frontier_preview",
+                target_pose=record.nav_pose,
+                planner_id=self.config.nav2_planner_id,
+                controller_id=self.config.nav2_controller_id,
+                behavior_tree=self.config.nav2_behavior_tree,
+                metadata={"frontier_id": record.frontier_id},
+            )
+            plan = self.nav2.compute_path(preview_goal, record=False)
+            record.path_cost_m = plan.path_length_m if plan.status == "succeeded" else None
+            updated.append(record)
+        updated.sort(
+            key=lambda record: (
+                record.path_cost_m is None,
+                record.path_cost_m if record.path_cost_m is not None else 1e9,
+                -record.unknown_gain,
+            )
+        )
+        return updated
+
+    def _build_prompt_payload(
+        self,
+        occupancy_map: RosOccupancyMap,
+        pose: Pose2D,
+        candidate_records: list[FrontierRecord],
+    ) -> dict[str, Any]:
+        known_free = 0
+        occupied = 0
+        unknown = 0
+        for item in occupancy_map.data:
+            if item < 0:
+                unknown += 1
+            elif item == 0:
+                known_free += 1
+            else:
+                occupied += 1
+        return {
+            "mission": (
+                "Explore the live ManiSkill apartment through the ROS/Nav2 stack, keep frontier memory stable, "
+                "and prefer fast global coverage over redundant local scans."
+            ),
+            "robot": {
+                "pose": pose.to_dict(),
+                "room_id": None,
+                "coverage": round(self._coverage(occupancy_map), 3),
+                "trajectory_points": len(self.trajectory),
+                "sensor_range_m": self.config.sensor_range_m,
+            },
+            "frontier_memory": self.frontier_memory.snapshot(),
+            "frontier_information": [record.to_dict() for record in candidate_records],
+            "candidate_frontiers": [record.to_dict() for record in candidate_records],
+            "explored_areas": [
+                {
+                    "region_id": "mapped_space",
+                    "label": "mapped_space",
+                    "observed_fraction": round(self._coverage(occupancy_map), 3),
+                    "objects_seen": [],
+                    "representative_frames": [item["frame_id"] for item in self.keyframes[-3:]],
+                }
+            ],
+            "recent_views": self.keyframes[-3:],
+            "frontier_selection_guidance": _frontier_selection_guidance(),
+            "map_stats": {
+                "known_free_cells": known_free,
+                "occupied_cells": occupied,
+                "unknown_cells": unknown,
+                "map_bounds": occupancy_map.bounds(),
+                "map_age_s": round(seconds_since(self.runtime.latest_map_stamp_s), 3),
+            },
+            "guardrails": {
+                "finish_requires_frontier_exhaustion": True,
+                "navigation_must_use_nav2_goal_validation": True,
+                "frontier_ids_must_come_from_prompt": True,
+                "frontier_information_is_boundary_evidence_not_a_command": True,
+                "select_regions_that_expand_robot_navigable_space": True,
+                "avoid_furniture_shadow_boundaries_without_clear_open_space": True,
+            },
+            "ascii_map": self._ascii_map(occupancy_map, pose, candidate_records),
+        }
+
+    def _ascii_map(
+        self,
+        occupancy_map: RosOccupancyMap,
+        pose: Pose2D,
+        candidate_records: list[FrontierRecord],
+    ) -> str:
+        robot_cell = GridCell(*occupancy_map.world_to_cell(pose.x, pose.y))
+        frontier_cells = {
+            occupancy_map.world_to_cell(record.nav_pose.x, record.nav_pose.y): record.status
+            for record in candidate_records
+        }
+        interesting_x = [robot_cell.x]
+        interesting_y = [robot_cell.y]
+        for (cell_x, cell_y) in frontier_cells:
+            interesting_x.append(cell_x)
+            interesting_y.append(cell_y)
+        for y in range(occupancy_map.height):
+            for x in range(occupancy_map.width):
+                value = occupancy_map.value(x, y)
+                if value >= 0:
+                    interesting_x.append(x)
+                    interesting_y.append(y)
+        if not interesting_x or not interesting_y:
+            return "map unavailable"
+        min_x = max(min(interesting_x) - 2, 0)
+        max_x = min(max(interesting_x) + 2, occupancy_map.width - 1)
+        min_y = max(min(interesting_y) - 2, 0)
+        max_y = min(max(interesting_y) + 2, occupancy_map.height - 1)
+        max_width = 72
+        max_height = 48
+        if max_x - min_x + 1 > max_width:
+            half = max_width // 2
+            min_x = max(robot_cell.x - half, 0)
+            max_x = min(min_x + max_width - 1, occupancy_map.width - 1)
+        if max_y - min_y + 1 > max_height:
+            half = max_height // 2
+            min_y = max(robot_cell.y - half, 0)
+            max_y = min(min_y + max_height - 1, occupancy_map.height - 1)
+
+        lines: list[str] = []
+        for y in reversed(range(min_y, max_y + 1)):
+            row: list[str] = []
+            for x in range(min_x, max_x + 1):
+                if x == robot_cell.x and y == robot_cell.y:
+                    row.append("R")
+                    continue
+                if (x, y) in frontier_cells:
+                    row.append("V" if frontier_cells[(x, y)] in {"completed", "failed"} else "F")
+                    continue
+                value = occupancy_map.value(x, y)
+                if value < 0:
+                    row.append("?")
+                elif value == 0:
+                    row.append(".")
+                else:
+                    row.append("#")
+            lines.append("".join(row))
+        return "\n".join(lines)
+
+    def _apply_finish_guardrail(
+        self,
+        decision: ExplorationDecision,
+        candidate_records: list[FrontierRecord],
+    ) -> ExplorationDecision:
+        reachable = [record for record in candidate_records if record.path_cost_m is not None]
+        if decision.decision_type != "finish":
+            return decision
+        if not reachable:
+            return decision
+        fallback = self.policy._heuristic_decision(  # intentional guardrail fallback
+            candidate_records,
+            list(self.frontier_memory.return_waypoints.values()),
+            0.0,
+            None,
+        )
+        self.guardrail_events.append(
+            {
+                "type": "finish_override",
+                "requested": decision.to_dict(),
+                "fallback": fallback.to_dict(),
+            }
+        )
+        return fallback
+
+    def _log_policy_step(self, prompt_payload: dict[str, Any], decision: ExplorationDecision, trace: dict[str, Any]) -> None:
+        if self.config.trace_policy_stdout:
+            print(
+                f"[exploration-policy] step={self.decision_index} coverage={self._coverage(self._require_map()):.3f} "
+                f"decision={decision.decision_type} frontier={decision.selected_frontier_id}"
+            )
+        if self.config.trace_llm_stdout:
+            print("[exploration-llm] prompt")
+            print(trace.get("prompt", ""))
+            print("[exploration-llm] response")
+            print(json.dumps(trace.get("response", {}), indent=2, sort_keys=True))
+            if trace.get("llm_trace", {}).get("error"):
+                print(f"[exploration-llm] error={trace['llm_trace']['error']}")
+        self.decision_log.append(
+            {
+                "step_index": self.decision_index,
+                "coverage": round(self._coverage(self._require_map()), 3),
+                "decision": decision.to_dict(),
+                "trace": trace,
+                "frontier_information_ids": [
+                    item.get("frontier_id")
+                    for item in prompt_payload.get("frontier_information", prompt_payload.get("candidate_frontiers", []))
+                ],
+            }
+        )
+
+    def _push_progress_update(self, *, message: str, frontier_id: str | None) -> None:
+        coverage = self._coverage(self._require_map())
+        result = {
+            "coverage": round(coverage, 3),
+            "trajectory": self.trajectory[-12:],
+            "keyframes": self.keyframes[-4:],
+            "frontier_memory": self.frontier_memory.snapshot(),
+            "active_frontier_id": frontier_id,
+        }
+        self.backend.update_external_task(
+            self.task_id,
+            progress=min(coverage, 0.98),
+            message=message,
+            result=result,
+        )
+
+    def _consume_nav_result(self, result: Nav2NavigateResult) -> None:
+        if result.reached_pose is not None:
+            self._update_pose_history(result.reached_pose)
+        self.total_distance_m += max(result.travelled_distance_m, 0.0)
+        self.runtime.spin_for(0.2)
+
+    def _coverage(self, occupancy_map: RosOccupancyMap) -> float:
+        known = sum(1 for item in occupancy_map.data if item >= 0)
+        return round(known / max(len(occupancy_map.data), 1), 6)
+
+    def _build_map_payload(self) -> dict[str, Any]:
+        occupancy_map = self._require_map()
+        occupancy_cells = []
+        for y in range(occupancy_map.height):
+            for x in range(occupancy_map.width):
+                value = occupancy_map.value(x, y)
+                if value < 0:
+                    continue
+                pose = occupancy_map.cell_to_pose(x, y)
+                occupancy_cells.append(
+                    {
+                        "x": round(pose.x - occupancy_map.resolution / 2.0, 3),
+                        "y": round(pose.y - occupancy_map.resolution / 2.0, 3),
+                        "state": "free" if value == 0 else "occupied",
+                    }
+                )
+        semantic_area_candidates = _aggregate_semantic_updates(self.semantic_updates)
+        summary = (
+            f"ROS/Nav2 exploration completed with coverage {self._coverage(occupancy_map):.3f}, "
+            f"{len(self.frontier_memory.records)} tracked frontiers, and {len(self.decision_log)} decisions."
+        )
+        return {
+            "map_id": self.config.session,
+            "frame": self.config.ros_map_frame,
+            "resolution": float(occupancy_map.resolution),
+            "coverage": round(self._coverage(occupancy_map), 3),
+            "summary": summary,
+            "approved": False,
+            "created_at": time.time(),
+            "source": self.config.source,
+            "mode": "ros_nav2_agentic",
+            "trajectory": self.trajectory,
+            "keyframes": self.keyframes,
+            "regions": [],
+            "named_places": [],
+            "occupancy": {
+                "resolution": float(occupancy_map.resolution),
+                "bounds": occupancy_map.bounds(),
+                "cells": occupancy_cells,
+            },
+            "frontiers": [record.to_dict() for record in self.frontier_memory.records.values()],
+            "semantic_area_candidates": semantic_area_candidates,
+            "artifacts": {
+                "decision_log": self.decision_log,
+                "frontier_memory": self.frontier_memory.snapshot(),
+                "guardrail_events": self.guardrail_events,
+                "navigation": {
+                    "control_steps": self.control_steps,
+                    "total_distance_m": round(self.total_distance_m, 3),
+                },
+                "nav2": self.nav2.snapshot(),
+                "ros_runtime": {
+                    "map_topic": self.config.ros_map_topic,
+                    "scan_topic": self.config.ros_scan_topic,
+                    "rgb_topic": self.config.ros_rgb_topic,
+                    "base_frame": self.config.ros_base_frame,
+                    "map_frame": self.config.ros_map_frame,
+                },
+                "llm_policy": {
+                    "explorer_policy": self.config.explorer_policy,
+                    "provider": self.config.llm_provider,
+                    "model": self.config.llm_model,
+                },
+            },
+        }
+
+    def _make_nav2_goal(self, pose: Pose2D, *, goal_type: str, reason: str) -> Nav2GoalRequest:
+        self.nav2_goal_counter += 1
+        return Nav2GoalRequest(
+            goal_id=f"nav2_goal_{self.nav2_goal_counter:03d}",
+            goal_type=goal_type,
+            target_pose=pose,
+            planner_id=self.config.nav2_planner_id,
+            controller_id=self.config.nav2_controller_id,
+            behavior_tree=self.config.nav2_behavior_tree,
+            metadata={"reason": reason},
+        )
+
+
 class ManiSkillExplorationRunner:
     def __init__(self, config: SimExplorationConfig, backend: ExplorationBackend) -> None:
         self.config = config
@@ -1463,7 +2506,11 @@ class ManiSkillExplorationRunner:
             source=self.config.source,
             message="Starting agentic apartment exploration run.",
         )
-        session = _ApartmentExplorationSession(self.config, self.backend, str(task["task_id"]))
+        session: _ApartmentExplorationSession | RosExplorationSession
+        if self.config.nav2_mode == "ros":
+            session = RosExplorationSession(self.config, self.backend, str(task["task_id"]))
+        else:
+            session = _ApartmentExplorationSession(self.config, self.backend, str(task["task_id"]))
         try:
             map_payload = session.run()
         except Exception as exc:
@@ -1473,6 +2520,10 @@ class ManiSkillExplorationRunner:
                 result={"error": str(exc)},
             )
             raise
+        finally:
+            close = getattr(session, "close", None)
+            if callable(close):
+                close()
 
         self.backend.complete_external_task(
             str(task["task_id"]),
@@ -1534,10 +2585,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sensor-range-m", type=float, default=10.0)
     parser.add_argument("--finish-coverage-threshold", type=float, default=0.96)
     parser.add_argument("--max-decisions", type=int, default=32)
+    parser.add_argument("--nav2-mode", choices=("simulated", "ros"), default="simulated")
     parser.add_argument("--nav2-planner-id", default="GridBased")
     parser.add_argument("--nav2-controller-id", default="FollowPath")
     parser.add_argument("--nav2-behavior-tree", default="navigate_to_pose_w_replanning_and_recovery.xml")
     parser.add_argument("--nav2-recovery-enabled", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--ros-map-topic", default="/map")
+    parser.add_argument("--ros-scan-topic", default="/scan")
+    parser.add_argument("--ros-rgb-topic", default="/camera/head/image_raw")
+    parser.add_argument("--ros-cmd-vel-topic", default="/cmd_vel")
+    parser.add_argument("--ros-map-frame", default="map")
+    parser.add_argument("--ros-base-frame", default="base_link")
+    parser.add_argument("--ros-server-timeout-s", type=float, default=10.0)
+    parser.add_argument("--ros-ready-timeout-s", type=float, default=20.0)
+    parser.add_argument("--ros-turn-scan-timeout-s", type=float, default=45.0)
+    parser.add_argument("--ros-turn-scan-settle-s", type=float, default=1.0)
+    parser.add_argument("--ros-manual-spin-angular-speed-rad-s", type=float, default=0.55)
+    parser.add_argument("--ros-manual-spin-publish-hz", type=float, default=10.0)
+    parser.add_argument("--ros-allow-multiple-action-servers", action=argparse.BooleanOptionalAction, default=False)
     return parser
 
 
@@ -1588,10 +2653,24 @@ def main(argv: list[str] | None = None) -> int:
             sensor_range_m=args.sensor_range_m,
             finish_coverage_threshold=args.finish_coverage_threshold,
             max_decisions=args.max_decisions,
+            nav2_mode=args.nav2_mode,
             nav2_planner_id=args.nav2_planner_id,
             nav2_controller_id=args.nav2_controller_id,
             nav2_behavior_tree=args.nav2_behavior_tree,
             nav2_recovery_enabled=args.nav2_recovery_enabled,
+            ros_map_topic=args.ros_map_topic,
+            ros_scan_topic=args.ros_scan_topic,
+            ros_rgb_topic=args.ros_rgb_topic,
+            ros_cmd_vel_topic=args.ros_cmd_vel_topic,
+            ros_map_frame=args.ros_map_frame,
+            ros_base_frame=args.ros_base_frame,
+            ros_server_timeout_s=args.ros_server_timeout_s,
+            ros_ready_timeout_s=args.ros_ready_timeout_s,
+            ros_turn_scan_timeout_s=args.ros_turn_scan_timeout_s,
+            ros_turn_scan_settle_s=args.ros_turn_scan_settle_s,
+            ros_manual_spin_angular_speed_rad_s=args.ros_manual_spin_angular_speed_rad_s,
+            ros_manual_spin_publish_hz=args.ros_manual_spin_publish_hz,
+            ros_allow_multiple_action_servers=args.ros_allow_multiple_action_servers,
         ),
         backend,
     )
@@ -1977,6 +3056,14 @@ def _pose_distance_m(a: Pose2D, b: Pose2D) -> float:
     return math.hypot(a.x - b.x, a.y - b.y)
 
 
+def _clamp_float(value: Any, *, default: float, low: float, high: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return min(max(parsed, low), high)
+
+
 def _thumbnail_data_url(*, title: str, subtitle: str) -> str:
     import base64
 
@@ -1998,6 +3085,20 @@ def _thumbnail_data_url(*, title: str, subtitle: str) -> str:
 """.strip()
     encoded = base64.b64encode(svg.encode("utf-8")).decode("utf-8")
     return f"data:image/svg+xml;base64,{encoded}"
+
+
+def _frontier_selection_guidance() -> list[str]:
+    return [
+        "Treat frontier coordinates as partial RGB-D-derived boundary information from what the camera has scanned, not as complete apartment knowledge or a command to visit every boundary.",
+        "Select frontiers that likely expand robot-navigable floor space: doors, room entrances, hallway continuations, open areas, or meaningful sensor-range-limit expansions.",
+        "This is robot exploration, not a sightseeing tour: for similarly useful candidates, prefer lower path_cost_m and clear nearby openings before crossing the map to a far frontier.",
+        "Deterministic frontier candidates are proposals, not truth. A single-edge unknown boundary can be worth checking when robot-sized free space exists nearby, but you should veto it if the navigation-map image and RGB views suggest already-mapped empty space, a wall sliver, or clutter.",
+        "Use recent RGB views to interpret ambiguous frontier information, especially when geometry alone could be a doorway, furniture edge, or clutter shadow.",
+        "Deprioritize frontiers that look like furniture-shadow boundaries behind or under couches, tables, cabinets, shelves, or clutter unless evidence suggests a real traversable opening.",
+        "If a listed frontier looks wrong after overlaying the navigation map, frontier label, and camera images, do not select it; use memory_updates with `suppress` or `keep` to veto it explicitly.",
+        "Use path_cost_m, unknown_gain, currently_visible, recent views, navigation-map image, and frontier memory together; choose a far frontier only when it clearly offers better navigable expansion than nearby alternatives.",
+        "If remaining frontiers are reachable but likely not useful for robot navigation, explain that in reasoning_summary before finishing or choosing a better stored frontier.",
+    ]
 
 
 def _dedupe_text(items: list[str]) -> list[str]:

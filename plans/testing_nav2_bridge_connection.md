@@ -17,6 +17,8 @@ python examples/xlerobot_nav2_bridge_playground.py \
   --env-id SceneManipulation-v1 \
   --build-config-idx 0 \
   --realtime-factor 0 \
+  --linear-cmd-gain 1.5 \
+  --angular-cmd-gain 0.32 \
   --no-publish-head-camera \
   --max-episode-steps 1000
 ```
@@ -123,4 +125,55 @@ The current generated defaults are:
   `GoalAlign.scale = 12.0`
   `PathAlign.scale = 16.0`
 
+The bridge also applies XLeRobot simulator calibration by default:
+
+- `linear_cmd_gain = 1.5`
+- `angular_cmd_gain = 0.32`
+
+These gains compensate for the ManiSkill base under-responding to linear commands and over-responding to angular commands.
+
 If you change these defaults in code, rerender the Nav2 params and restart Terminal 3.
+
+## Live Agentic Exploration With Real Nav2
+
+Once Terminal 1, 2, and 3 are healthy, you can run the exploration backend against the live ROS/Nav2 stack.
+
+### Mock policy
+
+```bash
+cd /home/alin/Robot42
+conda deactivate || true
+source /opt/ros/humble/setup.bash
+source /home/alin/Robot42/.venv-maniskill/bin/activate
+
+python -m xlerobot_playground.sim_exploration_backend \
+  --persist-path /tmp/xlerobot_live_nav2_map.json \
+  --session live_nav2_mock \
+  --realtime-sleep-s 0 \
+  --explorer-policy llm \
+  --llm-provider mock \
+  --llm-model mock \
+  --nav2-mode ros
+```
+
+### Local Ollama policy
+
+```bash
+cd /home/alin/Robot42
+conda deactivate || true
+source /opt/ros/humble/setup.bash
+source /home/alin/Robot42/.venv-maniskill/bin/activate
+
+python -m xlerobot_playground.sim_exploration_backend \
+  --persist-path /tmp/xlerobot_live_nav2_ollama_map.json \
+  --session live_nav2_ollama \
+  --realtime-sleep-s 0 \
+  --explorer-policy llm \
+  --llm-provider ollama \
+  --llm-model gemma4:26b \
+  --llm-base-url http://localhost:11434 \
+  --nav2-mode ros \
+  --trace-policy-stdout
+```
+
+The only model switch you need is `--llm-provider ollama` plus the local model name. The backend uses Ollama's `/api/generate` endpoint directly and forwards the most recent head-camera frames as images when they are available on `/camera/head/image_raw`.

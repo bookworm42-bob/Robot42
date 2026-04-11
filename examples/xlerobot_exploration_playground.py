@@ -55,10 +55,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sensor-range-m", type=float, default=10.0)
     parser.add_argument("--finish-coverage-threshold", type=float, default=0.96)
     parser.add_argument("--max-decisions", type=int, default=32)
+    parser.add_argument("--nav2-mode", choices=("simulated", "ros"), default="simulated")
     parser.add_argument("--nav2-planner-id", default="GridBased")
     parser.add_argument("--nav2-controller-id", default="FollowPath")
     parser.add_argument("--nav2-behavior-tree", default="navigate_to_pose_w_replanning_and_recovery.xml")
     parser.add_argument("--nav2-recovery-enabled", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--ros-map-topic", default="/map")
+    parser.add_argument("--ros-scan-topic", default="/scan")
+    parser.add_argument("--ros-rgb-topic", default="/camera/head/image_raw")
+    parser.add_argument("--ros-cmd-vel-topic", default="/cmd_vel")
+    parser.add_argument("--ros-map-frame", default="map")
+    parser.add_argument("--ros-base-frame", default="base_link")
+    parser.add_argument("--ros-server-timeout-s", type=float, default=10.0)
+    parser.add_argument("--ros-ready-timeout-s", type=float, default=20.0)
+    parser.add_argument("--ros-turn-scan-timeout-s", type=float, default=45.0)
+    parser.add_argument("--ros-turn-scan-settle-s", type=float, default=1.0)
+    parser.add_argument("--ros-manual-spin-angular-speed-rad-s", type=float, default=0.55)
+    parser.add_argument("--ros-manual-spin-publish-hz", type=float, default=10.0)
+    parser.add_argument("--ros-allow-multiple-action-servers", action=argparse.BooleanOptionalAction, default=False)
     return parser
 
 
@@ -129,6 +143,8 @@ def main(argv: list[str] | None = None) -> int:
         str(args.finish_coverage_threshold),
         "--max-decisions",
         str(args.max_decisions),
+        "--nav2-mode",
+        args.nav2_mode,
         "--nav2-planner-id",
         args.nav2_planner_id,
         "--nav2-controller-id",
@@ -139,8 +155,35 @@ def main(argv: list[str] | None = None) -> int:
         args.review_host,
         "--review-port",
         str(args.review_port),
+        "--ros-map-topic",
+        args.ros_map_topic,
+        "--ros-scan-topic",
+        args.ros_scan_topic,
+        "--ros-rgb-topic",
+        args.ros_rgb_topic,
+        "--ros-cmd-vel-topic",
+        args.ros_cmd_vel_topic,
+        "--ros-map-frame",
+        args.ros_map_frame,
+        "--ros-base-frame",
+        args.ros_base_frame,
+        "--ros-server-timeout-s",
+        str(args.ros_server_timeout_s),
+        "--ros-ready-timeout-s",
+        str(args.ros_ready_timeout_s),
+        "--ros-turn-scan-timeout-s",
+        str(args.ros_turn_scan_timeout_s),
+        "--ros-turn-scan-settle-s",
+        str(args.ros_turn_scan_settle_s),
+        "--ros-manual-spin-angular-speed-rad-s",
+        str(args.ros_manual_spin_angular_speed_rad_s),
+        "--ros-manual-spin-publish-hz",
+        str(args.ros_manual_spin_publish_hz),
     ])
     backend_args.append(f"--{'nav2-recovery-enabled' if args.nav2_recovery_enabled else 'no-nav2-recovery-enabled'}")
+    backend_args.append(
+        f"--{'ros-allow-multiple-action-servers' if args.ros_allow_multiple_action_servers else 'no-ros-allow-multiple-action-servers'}"
+    )
     if args.llm_base_url:
         backend_args.extend(["--llm-base-url", args.llm_base_url])
     if args.llm_api_key:

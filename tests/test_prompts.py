@@ -28,9 +28,17 @@ class PromptExamplesTests(unittest.TestCase):
 
     def test_exploration_policy_prompt_mentions_frontier_memory_and_sensor_range(self) -> None:
         prompt = build_exploration_policy_system_prompt()
-        self.assertIn("validated map-level frontier candidates", prompt)
+        self.assertIn("frontier information", prompt)
+        self.assertIn("partial RGB-D-derived evidence", prompt)
+        self.assertIn("recent RGB visual input", prompt)
+        self.assertIn("coordinates at boundaries", prompt)
+        self.assertIn("robot-navigable floor space", prompt)
+        self.assertIn("couches", prompt)
         self.assertIn("sensor-range edge frontiers", prompt)
         self.assertIn("frontier_ids_to_store", prompt)
+        self.assertIn("memory_updates", prompt)
+        self.assertIn("same response", prompt)
+        self.assertIn("veto", prompt)
 
     def test_exploration_policy_user_prompt_includes_ascii_map_and_guardrails(self) -> None:
         prompt = build_exploration_policy_user_prompt(
@@ -38,7 +46,14 @@ class PromptExamplesTests(unittest.TestCase):
                 "mission": "Explore the apartment.",
                 "robot": {"coverage": 0.4},
                 "frontier_memory": {"stored_frontiers": []},
-                "candidate_frontiers": [{"frontier_id": "frontier_001"}],
+                "frontier_information": [{"frontier_id": "frontier_001"}],
+                "frontier_selection_guidance": ["Select likely navigable openings."],
+                "navigation_map_views": [
+                    {
+                        "frame_id": "nav_map_001",
+                        "thumbnail_data_url": "data:image/png;base64," + "b" * 128,
+                    }
+                ],
                 "explored_areas": [{"region_id": "region_hallway"}],
                 "recent_views": [{"frame_id": "kf_001"}],
                 "guardrails": {"finish_requires_frontier_exhaustion": True},
@@ -46,8 +61,66 @@ class PromptExamplesTests(unittest.TestCase):
             }
         )
         self.assertIn("ASCII Occupancy Map:", prompt)
+        self.assertIn("Frontier Information:", prompt)
+        self.assertIn("Frontier Memory Status:", prompt)
+        self.assertIn("currently scanned RGB-D evidence", prompt)
+        self.assertIn("Navigation Map View:", prompt)
+        self.assertIn("nav_map_001", prompt)
+        self.assertIn("recent RGB visual input", prompt)
+        self.assertIn("Memory Update Instructions:", prompt)
+        self.assertIn("Select likely navigable openings.", prompt)
         self.assertIn("finish_requires_frontier_exhaustion", prompt)
         self.assertIn("RF", prompt)
+        self.assertIn("veto", prompt)
+
+    def test_exploration_policy_user_prompt_compacts_frontier_memory_details(self) -> None:
+        prompt = build_exploration_policy_user_prompt(
+            {
+                "frontier_memory": {
+                    "stored_frontiers": [
+                        {
+                            "frontier_id": "frontier_999",
+                            "status": "stored",
+                            "discovered_step": 2,
+                            "last_seen_step": 2,
+                            "approach_pose": {"x": 9.0, "y": 9.0, "yaw": 0.0},
+                            "evidence": ["memory duplicate evidence should not be repeated"],
+                        }
+                    ],
+                    "return_waypoints": [],
+                },
+                "frontier_information": [
+                    {
+                        "frontier_id": "frontier_001",
+                        "status": "stored",
+                        "currently_visible": True,
+                        "approach_pose": {"x": 1.0, "y": 1.0, "yaw": 0.0},
+                        "frontier_boundary_pose": {"x": 1.2, "y": 1.1, "yaw": 0.0},
+                        "evidence": ["canonical frontier evidence"],
+                    }
+                ],
+            }
+        )
+
+        self.assertIn("frontier_999", prompt)
+        self.assertIn("canonical frontier evidence", prompt)
+        self.assertNotIn("memory duplicate evidence should not be repeated", prompt)
+        self.assertNotIn('"x": 9.0', prompt)
+
+    def test_exploration_policy_user_prompt_redacts_data_urls(self) -> None:
+        prompt = build_exploration_policy_user_prompt(
+            {
+                "recent_views": [
+                    {
+                        "frame_id": "kf_001",
+                        "thumbnail_data_url": "data:image/png;base64," + "a" * 128,
+                    }
+                ]
+            }
+        )
+        self.assertIn("attached_as_multimodal_image", prompt)
+        self.assertIn("base64_bytes", prompt)
+        self.assertNotIn("a" * 64, prompt)
 
 
 if __name__ == "__main__":

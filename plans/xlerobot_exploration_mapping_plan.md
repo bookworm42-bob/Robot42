@@ -34,11 +34,15 @@ The LLM is responsible for:
 - maintaining a set of goals on what to explore and updating those goals properly
 - starting from a given point after a complete turnaround scan happens (360 degrees)
 - receiving the current 2D map composed so far, rendered images of the space, the robot position in that map, and the information needed to understand what is currently visible and what is still unexplored
-- using the images, the 2D map, and the robot map position to come up with frontier exploration points on the map
-- making sure the frontier exploration points are unique, not repeated, and not already visited
-- comparing newly proposed frontier exploration points against frontier points already stored in memory before choosing
-- selecting one frontier exploration point to actively explore while the remaining frontier exploration points stay in memory
-- keeping frontier memory so the robot can return later to previously discovered but not yet explored frontiers
+- receiving deterministic frontier information, meaning map coordinates at the boundary between explored free space and unknown space
+- understanding that frontier information is generated from the currently scanned RGB-D evidence and is not complete information about the whole apartment
+- treating frontier information as boundary evidence, not as a command that every boundary should be explored
+- using RGB visual input, the 2D map, robot map position, frontier information, and frontier memory to select specific useful regions to explore
+- prioritizing frontier regions that likely expand robot-navigable floor space, such as room entrances, doors, corridors, open areas, and meaningful sensor-range-limit expansions
+- deprioritizing boundaries that appear to be caused by furniture or clutter, such as the back or underside of a couch, table, cabinet, or shelf, unless there is evidence of traversable space beyond it
+- selecting one frontier id to actively explore while the remaining useful frontier information stays in memory
+- creating and updating frontier memory points in the same structured response as the frontier decision, including which points should be stored, prioritized, suppressed, or revalidated
+- keeping frontier memory so the robot can return later to previously discovered but not yet explored useful frontiers
 - choosing a waypoint to go back to if one area has finished exploring and there are still stored frontier points in memory that should be revisited
 - exploring frontier points at the edge of what the RGB-D map can currently see, including when mapped observations reach the sensor limit of 10m and expansion beyond that boundary is still possible
 - deciding when exploration is over by using a flag in its response
@@ -50,18 +54,20 @@ The LLM is given:
 - rendered image views of the space
 - the robot position in the 2D map
 - RGB-D-derived information that helps explain what the mapper currently sees
+- frontier information, including boundary coordinates, evidence, reachability, and path cost
 - frontier points currently in memory
 - visited frontier points
 - already explored areas
 
-The LLM should operate on map-level frontier exploration points, not raw RGB-D point targets.
+The LLM should operate on map-level frontier information and selected frontier ids, not raw RGB-D point targets. It should choose useful navigable-space exploration regions, not blindly select every boundary.
 
 The deterministic path is responsible for:
 
 - building and updating the 2D occupancy map
 - updating the map after scans and after waypoint travel
 - maintaining memory for active, stored, visited, failed, and completed frontier exploration points
-- comparing new frontier exploration points against memory to remove duplicates and avoid revisiting already explored or failed points
+- producing frontier information from occupancy-map boundaries
+- preserving stable frontier ids and enforcing safety/validity on any LLM memory updates
 - executing a full turnaround scan when needed and updating the map from that scan
 - converting selected map-level frontier exploration points into valid navigation waypoints for Nav2
 - using Nav2 to navigate the place safely
@@ -80,12 +86,13 @@ That memory should include:
 - completed frontier exploration points
 - return waypoints that let the robot go back and continue exploring another remembered frontier
 
-When the LLM proposes new frontier exploration points:
+When the LLM creates or updates frontier memory points:
 
 - they must be checked against memory
 - duplicates must be rejected
 - already visited points must not be reintroduced as new frontiers
 - already failed points must not be reintroduced as new frontiers unless explicitly revalidated by deterministic logic
+- suppressed furniture/clutter boundary points should stay suppressed unless new visual or map evidence suggests traversable space
 
 ### Frontier Expansion At Sensor Range Limits
 

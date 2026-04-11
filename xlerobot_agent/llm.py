@@ -3,8 +3,10 @@ from __future__ import annotations
 import base64
 from dataclasses import dataclass, field
 import json
+from pathlib import Path
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any
 
@@ -254,6 +256,8 @@ class AgentLLMRouter:
         try:
             if config.provider == "litellm":
                 response_text, raw_response = self._complete_via_litellm_messages(config, messages)
+            elif config.provider == "ollama":
+                response_text, raw_response = self._complete_via_ollama_messages(config, messages)
             else:
                 response_text, raw_response = self._complete_via_openai_compatible_messages(config, messages)
             parsed = _extract_json_object(response_text)
@@ -369,6 +373,57 @@ class AgentLLMRouter:
         else:
             choice = raw_response.choices[0].message.content
         return _flatten_message_content(choice), raw_response
+
+    def _complete_via_ollama_messages(
+        self,
+        config: ModelConfig,
+        messages: list[dict[str, Any]],
+    ) -> tuple[str, Any]:
+        endpoint = _ollama_generate_endpoint(config.base_url)
+        options: dict[str, Any] = {
+            "temperature": float(config.temperature),
+            "num_predict": int(config.max_tokens),
+        }
+        payload: dict[str, Any] = {
+            "model": config.model,
+            "prompt": _messages_to_prompt_text(messages),
+            "stream": False,
+            "format": "json",
+            "options": options,
+        }
+        images = _collect_ollama_images(messages)
+        if images:
+            payload["images"] = images
+        if config.extra_body:
+            extra_body = json.loads(json.dumps(config.extra_body))
+            extra_options = extra_body.pop("options", None)
+            if isinstance(extra_options, dict):
+                payload["options"].update(extra_options)
+            payload.update(extra_body)
+
+        headers = {"Content-Type": "application/json", **config.extra_headers}
+        if config.api_key:
+            headers["Authorization"] = f"Bearer {config.api_key}"
+        request = urllib.request.Request(
+            endpoint,
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=180) as response:
+                body = response.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"HTTP {exc.code}: {detail}") from exc
+
+        parsed = json.loads(body)
+        if parsed.get("error"):
+            raise RuntimeError(str(parsed["error"]))
+        response_text = str(parsed.get("response", "")).strip()
+        if not response_text:
+            raise RuntimeError("Ollama returned an empty response body")
+        return response_text, parsed
 
     def _mock_select_action(
         self,
@@ -511,6 +566,54 @@ def _extract_json_object(text: str) -> dict[str, Any] | None:
         return json.loads(cleaned[start : end + 1])
     except json.JSONDecodeError:
         return None
+
+
+def _ollama_generate_endpoint(base_url: str | None) -> str:
+    candidate = (base_url or "http://localhost:11434").rstrip("/")
+    if candidate.endswith("/api/generate"):
+        return candidate
+    return f"{candidate}/api/generate"
+
+
+def _collect_ollama_images(messages: list[dict[str, Any]]) -> list[str]:
+    encoded_images: list[str] = []
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for item in content:
+            if not isinstance(item, dict) or item.get("type") != "image_url":
+                continue
+            image_url = item.get("image_url", {})
+            if isinstance(image_url, dict):
+                url = str(image_url.get("url", "")).strip()
+            else:
+                url = str(image_url).strip()
+            if not url:
+                continue
+            encoded_images.append(_image_url_to_ollama_base64(url))
+    return encoded_images
+
+
+def _image_url_to_ollama_base64(url: str) -> str:
+    if url.startswith("data:"):
+        _, _, encoded = url.partition(",")
+        if not encoded:
+            raise ValueError("image data URL did not contain base64 data")
+        return encoded
+
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme in {"http", "https"}:
+        with urllib.request.urlopen(url, timeout=30) as response:
+            data = response.read()
+        return base64.b64encode(data).decode("utf-8")
+
+    if parsed.scheme == "file":
+        path = Path(urllib.request.url2pathname(parsed.path))
+    else:
+        path = Path(url)
+    data = path.read_bytes()
+    return base64.b64encode(data).decode("utf-8")
 
 
 def _messages_to_prompt_text(messages: list[dict[str, Any]]) -> str:
