@@ -6,7 +6,7 @@ from io import BytesIO
 import math
 import subprocess
 import time
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -297,6 +297,7 @@ class RosExplorationRuntime(Node):
         *,
         goal_pose: Pose2D,
         behavior_tree: str = "",
+        should_cancel: Callable[[], bool] | None = None,
     ) -> Any:
         if not self._navigate_to_pose_client.wait_for_server(timeout_sec=self.config.server_timeout_s):
             raise RuntimeError("`navigate_to_pose` action server did not appear in time.")
@@ -328,11 +329,22 @@ class RosExplorationRuntime(Node):
         if goal_handle is None or not goal_handle.accepted:
             raise RuntimeError("Nav2 rejected the NavigateToPose goal.")
         result_future = goal_handle.get_result_async()
-        rclpy.spin_until_future_complete(self, result_future)
+        cancel_requested = False
+        while not result_future.done():
+            rclpy.spin_once(self, timeout_sec=0.1)
+            if should_cancel is not None and should_cancel() and not cancel_requested:
+                cancel_requested = True
+                cancel_future = goal_handle.cancel_goal_async()
+                rclpy.spin_until_future_complete(self, cancel_future)
         outcome = result_future.result()
         return outcome, feedback_samples
 
-    def perform_turnaround_scan(self, *, reason: str) -> dict[str, Any]:
+    def perform_turnaround_scan(
+        self,
+        *,
+        reason: str,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> dict[str, Any]:
         event = {
             "reason": reason,
             "mode": "nav2_spin",
@@ -351,13 +363,19 @@ class RosExplorationRuntime(Node):
             if goal_handle is None or not goal_handle.accepted:
                 raise RuntimeError("Nav2 rejected the spin goal")
             result_future = goal_handle.get_result_async()
-            rclpy.spin_until_future_complete(self, result_future)
+            cancel_requested = False
+            while not result_future.done():
+                rclpy.spin_once(self, timeout_sec=0.1)
+                if should_cancel is not None and should_cancel() and not cancel_requested:
+                    cancel_requested = True
+                    cancel_future = goal_handle.cancel_goal_async()
+                    rclpy.spin_until_future_complete(self, cancel_future)
             outcome = result_future.result()
             event["status"] = ros_goal_status_label(getattr(outcome, "status", GoalStatus.STATUS_UNKNOWN))
         except Exception as exc:
             event["mode"] = "manual_cmd_vel_spin"
             event["fallback_reason"] = str(exc)
-            self._manual_spin()
+            self._manual_spin(should_cancel=should_cancel)
             event["status"] = "succeeded"
         self.spin_for(self.config.turn_scan_settle_s)
         self._nav_scan_history.append(event)
@@ -383,13 +401,15 @@ class RosExplorationRuntime(Node):
     def close(self) -> None:
         self.destroy_node()
 
-    def _manual_spin(self) -> None:
+    def _manual_spin(self, *, should_cancel: Callable[[], bool] | None = None) -> None:
         twist = Twist()
         twist.angular.z = float(self.config.manual_spin_angular_speed_rad_s)
         duration_s = abs(self.config.turn_scan_radians) / max(abs(twist.angular.z), 1e-6)
         step_s = 1.0 / max(self.config.manual_spin_publish_hz, 1e-6)
         deadline = time.time() + duration_s
         while time.time() < deadline:
+            if should_cancel is not None and should_cancel():
+                break
             self._cmd_vel_pub.publish(twist)
             rclpy.spin_once(self, timeout_sec=0.0)
             time.sleep(step_s)

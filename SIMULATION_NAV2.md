@@ -128,5 +128,5 @@ In RViz, the important displays are:
 ## Important Limits
 
 - The bridge uses a synthetic 2D scan from the head depth camera. That is good enough for Nav2 and `slam_toolbox`, but it is still a depth-derived scan, not a physical lidar model.
-- The bridge does not change the exploration backend yet. The next integration step is swapping the exploration runner from the current surrogate navigation module to the real `Nav2GoalClient`.
+- The exploration launcher now supports a live ROS/Nav2-backed runtime through `python examples/xlerobot_exploration_playground.py --movement-mode ros`. Manual wall edits currently affect the exploration-state map and frontier logic, but they are not yet injected into Nav2 as a live custom costmap layer.
 - `SceneManipulation-v1` is not itself an apartment map. For apartment-style exploration, use a traversable ManiSkill scene such as your local ReplicaCAD scene registration or another room-scale environment in the same bridge.

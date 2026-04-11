@@ -9,6 +9,7 @@ import math
 from pathlib import Path
 import time
 from typing import Any, Callable, Iterable
+import webbrowser
 
 from xlerobot_agent.exploration import ExplorationBackend, ExplorationBackendConfig, Pose2D
 from xlerobot_agent.exploration_ui import ExplorationReviewServer, LocalExplorationUIController
@@ -28,6 +29,18 @@ from xlerobot_playground.ros_nav2_runtime import (
     rclpy,
     seconds_since,
 )
+from xlerobot_playground.frontier_runtime import refresh_frontier_records
+from xlerobot_playground.map_editing import (
+    EditableOccupancyMap,
+    edits_from_payload,
+    merge_occupancy_observation,
+    overlay_known_cells,
+    overlay_occupancy_payload,
+)
+
+
+STORED_FRONTIER_REVALIDATION_RADIUS_M = 1.0
+STORED_FRONTIER_REVISIT_APPROACH_RADIUS_M = 1.25
 
 
 @dataclass
@@ -65,8 +78,11 @@ class SimExplorationConfig:
     review_host: str = "127.0.0.1"
     review_port: int = 8770
     serve_review_ui: bool = False
+    review_ui_flavor: str = "user"
     sensor_range_m: float = 10.0
     robot_radius_m: float = 0.22
+    frontier_min_opening_m: float | None = None
+    visited_frontier_filter_radius_m: float | None = None
     finish_coverage_threshold: float = 0.96
     max_decisions: int = 32
     nav2_planner_id: str = "GridBased"
@@ -206,6 +222,7 @@ class FrontierCandidate:
     path_cost_m: float | None = None
 
     def to_prompt_dict(self) -> dict[str, Any]:
+        path_distance_m = None if self.path_cost_m is None else round(self.path_cost_m, 3)
         return {
             "frontier_id": self.frontier_id,
             "nav_pose": self.nav_pose.to_dict(),
@@ -214,7 +231,8 @@ class FrontierCandidate:
             "sensor_range_edge": self.sensor_range_edge,
             "room_hint": self.room_hint,
             "currently_visible": self.currently_visible,
-            "path_cost_m": None if self.path_cost_m is None else round(self.path_cost_m, 3),
+            "path_cost_m": path_distance_m,
+            "free_space_path_distance_m": path_distance_m,
             "evidence": list(self.evidence),
         }
 
@@ -240,6 +258,7 @@ class FrontierRecord:
     currently_visible: bool = False
 
     def to_dict(self) -> dict[str, Any]:
+        path_distance_m = None if self.path_cost_m is None else round(self.path_cost_m, 3)
         return {
             "frontier_id": self.frontier_id,
             "nav_pose": self.nav_pose.to_dict(),
@@ -258,7 +277,8 @@ class FrontierRecord:
             "llm_memory_notes": list(self.llm_memory_notes),
             "attempt_count": self.attempt_count,
             "visit_count": self.visit_count,
-            "path_cost_m": None if self.path_cost_m is None else round(self.path_cost_m, 3),
+            "path_cost_m": path_distance_m,
+            "free_space_path_distance_m": path_distance_m,
             "currently_visible": self.currently_visible,
         }
 
@@ -405,7 +425,9 @@ class SimulatedNav2NavigationModule(Nav2NavigationModule):
         known_free_cells: Callable[[], set[GridCell]],
         on_motion_step: Callable[[GridCell, GridCell, Nav2GoalRequest, int, int], None],
         on_runtime_obstacle: Callable[[GridCell], None],
+        is_runtime_blocked: Callable[[GridCell], bool],
         budget_exhausted: Callable[[], bool],
+        should_stop_execution: Callable[[], bool],
     ) -> None:
         self.config = config
         self.scenario = scenario
@@ -414,7 +436,9 @@ class SimulatedNav2NavigationModule(Nav2NavigationModule):
         self._known_free_cells = known_free_cells
         self._on_motion_step = on_motion_step
         self._on_runtime_obstacle = on_runtime_obstacle
+        self._is_runtime_blocked = is_runtime_blocked
         self._budget_exhausted = budget_exhausted
+        self._should_stop_execution = should_stop_execution
         self._goal_history: list[dict[str, Any]] = []
         self._plan_history: list[dict[str, Any]] = []
         self._recovery_history: list[dict[str, Any]] = []
@@ -524,7 +548,19 @@ class SimulatedNav2NavigationModule(Nav2NavigationModule):
                     feedback_samples=tuple(feedback_samples),
                     recovery_events=tuple(recovery_events),
                 )
-            if self.scenario.is_occupied(nxt):
+            if self._should_stop_execution():
+                reason = "Nav2 execution stopped because the task was canceled"
+                return Nav2NavigateResult(
+                    status="failed",
+                    goal=goal,
+                    plan=plan,
+                    reached_pose=previous.center_pose(self.scenario.resolution, yaw=self._get_current_yaw()),
+                    travelled_distance_m=travelled_distance_m,
+                    reason=reason,
+                    feedback_samples=tuple(feedback_samples),
+                    recovery_events=tuple(recovery_events),
+                )
+            if self._is_runtime_blocked(nxt):
                 self._on_runtime_obstacle(nxt)
                 reason = "Nav2 execution encountered a runtime obstacle on the current path"
                 if self.config.nav2_recovery_enabled:
@@ -592,11 +628,13 @@ class RosNav2NavigationModule(Nav2NavigationModule):
         config: SimExplorationConfig,
         runtime: RosExplorationRuntime,
         *,
-        current_map: Callable[[], RosOccupancyMap | None],
+        current_map: Callable[[], RosOccupancyMap | EditableOccupancyMap | None],
+        should_cancel: Callable[[], bool] | None = None,
     ) -> None:
         self.config = config
         self.runtime = runtime
         self._current_map = current_map
+        self._should_cancel = should_cancel
         self._goal_history: list[dict[str, Any]] = []
         self._plan_history: list[dict[str, Any]] = []
         self._recovery_history: list[dict[str, Any]] = []
@@ -705,6 +743,7 @@ class RosNav2NavigationModule(Nav2NavigationModule):
             outcome, feedback_samples = self.runtime.navigate_to_pose(
                 goal_pose=validation.normalized_pose or goal.target_pose,
                 behavior_tree=goal.behavior_tree,
+                should_cancel=self._should_cancel,
             )
         except Exception as exc:
             reason = f"ROS Nav2 navigate_to_pose call failed: {exc}"
@@ -985,13 +1024,25 @@ class FrontierMemory:
         best_id = None
         best_distance = 1e9
         for record in self.records.values():
-            distance = _pose_distance_m(record.nav_pose, candidate.nav_pose)
+            distance = _pose_distance_m(record.centroid_pose, candidate.centroid_pose)
             if distance < best_distance:
                 best_distance = distance
                 best_id = record.frontier_id
         if best_id is None or best_distance > self._dedupe_tolerance_m():
             return None, best_distance
         return best_id, best_distance
+
+
+def _mark_frontier_unreachable_as_visited(
+    frontier_memory: FrontierMemory,
+    frontier_id: str,
+    reason: str,
+) -> FrontierRecord | None:
+    frontier_memory.fail(
+        frontier_id,
+        f"{reason}; marked visited because low-level navigation could not reach a safe approach pose",
+    )
+    return frontier_memory.complete(frontier_id)
 
 
 class ExplorationLLMPolicy:
@@ -1107,18 +1158,21 @@ class ExplorationLLMPolicy:
 
         def score(record: FrontierRecord) -> float:
             distance_penalty = record.path_cost_m or 0.0
-            novelty_bonus = 1.2 if record.currently_visible else 0.4
-            range_bonus = 1.8 if record.sensor_range_edge else 0.0
-            revisit_penalty = min(record.attempt_count * 0.8, 2.4)
-            room_bonus = 0.9 if record.room_hint and record.room_hint != current_room_id else 0.0
-            memory_priority_bonus = (record.llm_memory_priority or 0.5) * 2.0
+            novelty_bonus = 0.25 if record.currently_visible else 0.05
+            range_bonus = 0.45 if record.sensor_range_edge else 0.0
+            revisit_penalty = min(record.attempt_count * 0.5, 1.5)
+            room_bonus = 0.25 if record.room_hint and record.room_hint != current_room_id else 0.0
+            memory_priority_bonus = (record.llm_memory_priority or 0.5) * 0.2
+            # Distance is deliberately dominant. Extra gain can break local ties, but should not
+            # make the robot zig-zag across the apartment for a modestly larger frontier.
+            gain_bonus = min(record.unknown_gain, 25) * 0.07
             return (
-                record.unknown_gain * 1.4
+                gain_bonus
                 + novelty_bonus
                 + range_bonus
                 + room_bonus
                 + memory_priority_bonus
-                - distance_penalty * 0.55
+                - distance_penalty
                 - revisit_penalty
             )
 
@@ -1153,8 +1207,8 @@ class ExplorationLLMPolicy:
             frontier_ids_to_store=[record.frontier_id for record in ranked[1:] if record.frontier_id],
             exploration_complete=coverage >= self.config.finish_coverage_threshold and len(reachable) <= 1,
             reasoning_summary=(
-                f"Select {best.frontier_id} because it offers the best balance of unknown gain, "
-                f"room novelty, and travel cost."
+                f"Select {best.frontier_id} because it is the nearest useful reachable frontier after "
+                f"weighing known-free route distance, expected navigable-space gain, and visual/map novelty."
             ),
             semantic_updates=semantic_updates,
         )
@@ -1286,6 +1340,8 @@ class _ApartmentExplorationSession:
         self.current_cell = self.scenario.start_cell
         self.current_yaw = 0.0
         self.known_cells: dict[GridCell, str] = {}
+        self.occupancy_evidence: dict[GridCell, float] = {}
+        self.manual_occupancy_edits = edits_from_payload({}, cell_type=GridCell)
         self.range_edge_cells: set[GridCell] = set()
         self.trajectory: list[dict[str, Any]] = [self.current_cell.center_pose(self.scenario.resolution).to_dict()]
         self.keyframes: list[dict[str, Any]] = []
@@ -1307,7 +1363,9 @@ class _ApartmentExplorationSession:
             known_free_cells=self._known_free_cells,
             on_motion_step=self._on_nav2_motion_step,
             on_runtime_obstacle=self._on_nav2_runtime_obstacle,
+            is_runtime_blocked=self._is_runtime_blocked,
             budget_exhausted=self._budget_exhausted,
+            should_stop_execution=self._should_stop_execution,
         )
 
     def run(self) -> dict[str, Any]:
@@ -1323,8 +1381,11 @@ class _ApartmentExplorationSession:
             capture_frame=True,
             reason="initial_turnaround_scan",
         )
+        self._publish_live_map("Initial scan complete.")
 
         while self.decision_index < self.config.max_decisions:
+            if not self._wait_until_task_active():
+                break
             if self._budget_exhausted():
                 self.guardrail_events.append(
                     {
@@ -1336,11 +1397,14 @@ class _ApartmentExplorationSession:
                 break
 
             self.decision_index += 1
+            self._sync_manual_occupancy_edits()
             visible_candidates = self._detect_frontier_candidates()
             self.frontier_memory.upsert_candidates(visible_candidates, step_index=self.decision_index)
             candidate_records = self._refresh_candidate_paths()
             prompt_payload = self._build_prompt_payload(candidate_records)
             coverage = self._coverage()
+            if not self._wait_until_task_active():
+                break
             decision, trace = self.policy.decide(
                 prompt_payload=prompt_payload,
                 frontiers=candidate_records,
@@ -1398,9 +1462,16 @@ class _ApartmentExplorationSession:
             )
             nav_result = self.nav2.navigate_to_pose(frontier_goal)
             if nav_result.status != "succeeded":
-                self.frontier_memory.fail(record.frontier_id, nav_result.reason)
+                _mark_frontier_unreachable_as_visited(self.frontier_memory, record.frontier_id, nav_result.reason)
+                self.guardrail_events.append(
+                    {
+                        "type": "nav2_frontier_marked_visited_after_failure",
+                        "frontier_id": record.frontier_id,
+                        "nav2_result": nav_result.to_dict(),
+                    }
+                )
                 self._push_progress_update(
-                    message=f"Failed to reach {record.frontier_id}: {nav_result.reason}",
+                    message=f"Marked {record.frontier_id} visited after Nav2 failed to reach it: {nav_result.reason}",
                     frontier_id=record.frontier_id,
                 )
                 continue
@@ -1424,6 +1495,54 @@ class _ApartmentExplorationSession:
 
         return self._build_map_payload()
 
+    def _wait_until_task_active(self) -> bool:
+        while True:
+            task = self.backend.get_task(self.task_id)
+            if task is None:
+                return False
+            if task.get("state") == "aborted":
+                return False
+            if not bool(task.get("paused", False)):
+                self._sync_manual_occupancy_edits()
+                return True
+            time.sleep(0.1)
+
+    def _sync_manual_occupancy_edits(self) -> None:
+        self.manual_occupancy_edits = edits_from_payload(
+            self.backend.occupancy_edit_snapshot(self.task_id),
+            cell_type=GridCell,
+        )
+
+    def _cell_state(self, cell: GridCell) -> str | None:
+        return self.manual_occupancy_edits.state_for_cell(self.known_cells.get(cell), cell)
+
+    def _effective_known_cells(self) -> dict[GridCell, str]:
+        return overlay_known_cells(self.known_cells, self.manual_occupancy_edits)
+
+    def _is_runtime_blocked(self, cell: GridCell) -> bool:
+        return self._cell_state(cell) == "occupied" or self.scenario.is_occupied(cell)
+
+    def _publish_live_map(self, message: str) -> None:
+        self.backend.update_external_task(
+            self.task_id,
+            progress=min(self._coverage(), 0.98),
+            message=message,
+            result={
+                "coverage": round(self._coverage(), 3),
+                "trajectory": self.trajectory[-12:],
+                "keyframes": self.keyframes[-4:],
+                "frontier_memory": self.frontier_memory.snapshot(),
+                "active_frontier_id": self.frontier_memory.active_frontier_id,
+            },
+            map_payload=self._build_map_payload(),
+        )
+
+    def _should_stop_execution(self) -> bool:
+        task = self.backend.get_task(self.task_id)
+        if task is None:
+            return True
+        return bool(task.get("state") == "aborted" or task.get("canceled", False))
+
     def _budget_exhausted(self) -> bool:
         if self.config.max_control_steps is not None and self.control_steps >= self.config.max_control_steps:
             return True
@@ -1440,9 +1559,19 @@ class _ApartmentExplorationSession:
             full_turnaround=full_turnaround,
         )
         for cell in scan.observed_free:
-            self.known_cells[cell] = "free"
+            merge_occupancy_observation(
+                self.known_cells,
+                cell,
+                "free",
+                evidence_scores=self.occupancy_evidence,
+            )
         for cell in scan.observed_occupied:
-            self.known_cells[cell] = "occupied"
+            merge_occupancy_observation(
+                self.known_cells,
+                cell,
+                "occupied",
+                evidence_scores=self.occupancy_evidence,
+            )
         self.range_edge_cells |= scan.range_edge_frontiers
         current_room_id = self.scenario.room_for_cell(self.current_cell)
         for label in scan.visible_objects:
@@ -1469,17 +1598,197 @@ class _ApartmentExplorationSession:
         self._sleep()
 
     def _known_free_cells(self) -> set[GridCell]:
-        return {cell for cell, state in self.known_cells.items() if state == "free"}
+        effective = self._effective_known_cells()
+        return {cell for cell, state in effective.items() if state == "free"}
+
+    def _global_frontier_anchor_cell_near_record(
+        self,
+        record: FrontierRecord,
+    ) -> tuple[GridCell | None, str | None]:
+        effective_known = self._effective_known_cells()
+        reachable_free_cells = self._reachable_known_free_cells(self.current_cell)
+        boundary_cell = self.scenario.world_to_cell(record.centroid_pose.x, record.centroid_pose.y)
+        search_radius_cells = max(1, int(math.ceil(STORED_FRONTIER_REVALIDATION_RADIUS_M / self.scenario.resolution)))
+        strong_candidates: list[tuple[int, int, GridCell]] = []
+        relaxed_candidates: list[tuple[int, int, GridCell]] = []
+        unreachable_boundary_candidates = 0
+        for dx in range(-search_radius_cells, search_radius_cells + 1):
+            for dy in range(-search_radius_cells, search_radius_cells + 1):
+                cell = GridCell(boundary_cell.x + dx, boundary_cell.y + dy)
+                if not self.scenario.in_bounds(cell):
+                    continue
+                distance_cells = _grid_distance_cells(cell, boundary_cell)
+                if distance_cells > search_radius_cells:
+                    continue
+                if effective_known.get(cell) != "free":
+                    continue
+                unknown_neighbors = {
+                    neighbor
+                    for neighbor in _neighbors4(cell)
+                    if self.scenario.in_bounds(neighbor) and neighbor not in effective_known
+                }
+                if not unknown_neighbors:
+                    continue
+                if cell not in reachable_free_cells:
+                    unreachable_boundary_candidates += 1
+                    continue
+                if len(unknown_neighbors) >= 2 or (cell in self.range_edge_cells and unknown_neighbors):
+                    strong_candidates.append((distance_cells, -len(unknown_neighbors), cell))
+                else:
+                    relaxed_candidates.append((distance_cells, -len(unknown_neighbors), cell))
+        if strong_candidates:
+            return min(strong_candidates, key=lambda item: (item[0], item[1]))[2], "strong"
+        if relaxed_candidates:
+            return min(relaxed_candidates, key=lambda item: (item[0], item[1]))[2], "relaxed"
+        if unreachable_boundary_candidates:
+            self.guardrail_events.append(
+                {
+                    "type": "stored_frontier_boundary_unreachable_through_known_free",
+                    "frontier_id": record.frontier_id,
+                    "frontier_boundary_pose": record.centroid_pose.to_dict(),
+                    "unreachable_candidate_count": unreachable_boundary_candidates,
+                }
+            )
+        return None, None
+
+    def _revalidate_stored_frontier_boundary(
+        self,
+        record: FrontierRecord,
+        anchor_cell: GridCell,
+        anchor_mode: str | None,
+    ) -> None:
+        anchor_pose = anchor_cell.center_pose(self.scenario.resolution)
+        if _pose_distance_m(record.centroid_pose, anchor_pose) <= self.scenario.resolution * 0.5 and anchor_mode != "relaxed":
+            return
+        previous_pose = record.centroid_pose
+        record.centroid_pose = anchor_pose
+        notes = [
+            (
+                "stored frontier boundary was revalidated against the current global occupancy map "
+                f"near the original memory point ({previous_pose.x:.2f}, {previous_pose.y:.2f})"
+            )
+        ]
+        if anchor_mode == "relaxed":
+            notes.append(
+                "stored frontier memory was kept using relaxed revalidation because nearby free space still borders unknown map area"
+            )
+        record.evidence = _dedupe_text(record.evidence + notes)
+
+    def _resnap_stored_frontier_revisit_pose(
+        self,
+        record: FrontierRecord,
+        current_pose: Pose2D,
+        anchor_cell: GridCell,
+    ) -> Pose2D | None:
+        reachable_safe_cells = self._known_free_cells()
+        resolution = self.scenario.resolution
+        anchor_pose = anchor_cell.center_pose(resolution)
+        max_radius_cells = max(1, int(math.ceil(STORED_FRONTIER_REVISIT_APPROACH_RADIUS_M / resolution)))
+        scored_cells: list[tuple[float, GridCell]] = []
+        for cell in reachable_safe_cells:
+            distance_cells = _grid_distance_cells(cell, anchor_cell)
+            if distance_cells > max_radius_cells:
+                continue
+            cell_pose = cell.center_pose(resolution)
+            score = (
+                abs(distance_cells * resolution - (self.config.robot_radius_m + 0.25))
+                + 0.03 * _pose_distance_m(cell_pose, current_pose)
+                + 0.02 * _pose_distance_m(cell_pose, record.nav_pose)
+            )
+            scored_cells.append((score, cell))
+        if not scored_cells:
+            return None
+        best = min(scored_cells, key=lambda item: item[0])[1]
+        best_pose = best.center_pose(
+            resolution,
+            yaw=math.atan2(anchor_pose.y - best.center_pose(resolution).y, anchor_pose.x - best.center_pose(resolution).x),
+        )
+        return best_pose
+
+    def _apply_stored_frontier_resnap(
+        self,
+        record: FrontierRecord,
+        target_pose: Pose2D,
+        previous_pose: Pose2D,
+    ) -> None:
+        if _pose_distance_m(target_pose, previous_pose) <= self.scenario.resolution * 0.5:
+            return
+        record.nav_pose = target_pose
+        record.evidence = _dedupe_text(
+            record.evidence
+            + [
+                "stored frontier revisit approach pose was re-snapped to nearby robot-connected free space before LLM selection"
+            ]
+        )
+        self.guardrail_events.append(
+            {
+                "type": "stored_frontier_revisit_pose_resnapped",
+                "frontier_id": record.frontier_id,
+                "previous_nav_pose": previous_pose.to_dict(),
+                "resnapped_nav_pose": target_pose.to_dict(),
+            }
+        )
+
+    def _is_frontier_at_current_pose(self, record: FrontierRecord, current_pose_filter_m: float) -> bool:
+        current_pose = self.current_cell.center_pose(self.scenario.resolution, yaw=self.current_yaw)
+        boundary_cell = self.scenario.world_to_cell(record.centroid_pose.x, record.centroid_pose.y)
+        return boundary_cell == self.current_cell or _pose_distance_m(record.centroid_pose, current_pose) <= current_pose_filter_m
+
+    def _visited_frontier_filter_radius_m(self) -> float:
+        configured = self.config.visited_frontier_filter_radius_m
+        if configured is not None and configured > 0.0:
+            return max(float(configured), self.scenario.resolution)
+        return max(self.config.robot_radius_m + 0.35, self.scenario.resolution * 2.0)
+
+    def _previous_trajectory_poses(self) -> list[Pose2D]:
+        trajectory = getattr(self, "trajectory", [])
+        return [
+            pose
+            for pose in (_pose_from_mapping(item) for item in trajectory[:-1])
+            if pose is not None
+        ]
+
+    def _is_pose_near_previous_visit(self, pose: Pose2D, radius_m: float) -> bool:
+        return any(_pose_distance_m(pose, visited_pose) <= radius_m for visited_pose in self._previous_trajectory_poses())
+
+    def _is_frontier_near_visited_pose(self, record: FrontierRecord, radius_m: float) -> bool:
+        return self._is_pose_near_previous_visit(record.centroid_pose, radius_m)
+
+    def _reachable_known_free_cells(self, start_cell: GridCell) -> set[GridCell]:
+        effective_known = self._effective_known_cells()
+        if effective_known.get(start_cell) != "free":
+            return set()
+        reachable: set[GridCell] = set()
+        queue = deque([start_cell])
+        while queue:
+            current = queue.popleft()
+            if current in reachable:
+                continue
+            if not self.scenario.in_bounds(current) or effective_known.get(current) != "free":
+                continue
+            reachable.add(current)
+            for neighbor in _neighbors4(current):
+                if neighbor not in reachable and self.scenario.in_bounds(neighbor) and effective_known.get(neighbor) == "free":
+                    queue.append(neighbor)
+        return reachable
+
+    def _min_frontier_opening_width_m(self) -> float:
+        configured = self.config.frontier_min_opening_m
+        if configured is not None and configured > 0.0:
+            return max(float(configured), self.scenario.resolution)
+        return max(self.config.robot_radius_m * 2.0 + 0.10, self.scenario.resolution * 2.0)
 
     def _detect_frontier_candidates(self) -> list[FrontierCandidate]:
         frontier_cells: set[GridCell] = set()
         unknown_neighbors_by_frontier: dict[GridCell, set[GridCell]] = {}
         known_free = self._known_free_cells()
+        effective_known = self._effective_known_cells()
+        reachable_free_cells = self._reachable_known_free_cells(self.current_cell)
         for cell in known_free:
             unknown_neighbors = {
                 neighbor
                 for neighbor in _neighbors4(cell)
-                if self.scenario.in_bounds(neighbor) and neighbor not in self.known_cells
+                if self.scenario.in_bounds(neighbor) and neighbor not in effective_known
             }
             if unknown_neighbors:
                 frontier_cells.add(cell)
@@ -1503,9 +1812,45 @@ class _ApartmentExplorationSession:
             clusters.append(cluster)
 
         candidates: list[FrontierCandidate] = []
+        required_opening_m = self._min_frontier_opening_width_m()
         for cluster in clusters:
             cluster_unknown = set().union(*(unknown_neighbors_by_frontier.get(cell, set()) for cell in cluster))
             if not cluster_unknown:
+                continue
+            if not any(cell in reachable_free_cells for cell in cluster):
+                self.guardrail_events.append(
+                    {
+                        "type": "frontier_boundary_unreachable_through_known_free",
+                        "cluster_size": len(cluster),
+                        "unknown_gain": len(cluster_unknown),
+                        "frontier_boundary_pose": _cell_mean_pose(cluster, self.scenario.resolution).to_dict(),
+                    }
+                )
+                continue
+            opening_width_m = _frontier_opening_width_m(cluster, self.scenario.resolution)
+            if opening_width_m < required_opening_m:
+                self.guardrail_events.append(
+                    {
+                        "type": "frontier_opening_too_narrow",
+                        "cluster_size": len(cluster),
+                        "opening_width_m": round(opening_width_m, 3),
+                        "required_width_m": round(required_opening_m, 3),
+                        "frontier_boundary_pose": _cell_mean_pose(cluster, self.scenario.resolution).to_dict(),
+                    }
+                )
+                continue
+            boundary_pose = _cell_mean_pose(cluster, self.scenario.resolution)
+            visited_filter_radius_m = self._visited_frontier_filter_radius_m()
+            if self._is_pose_near_previous_visit(boundary_pose, visited_filter_radius_m):
+                self.guardrail_events.append(
+                    {
+                        "type": "frontier_near_visited_pose_filtered",
+                        "cluster_size": len(cluster),
+                        "unknown_gain": len(cluster_unknown),
+                        "filter_radius_m": round(visited_filter_radius_m, 3),
+                        "frontier_boundary_pose": boundary_pose.to_dict(),
+                    }
+                )
                 continue
             max_unknown_neighbor_count = max(len(unknown_neighbors_by_frontier.get(cell, set())) for cell in cluster)
             nav_cell = min(
@@ -1517,6 +1862,7 @@ class _ApartmentExplorationSession:
             evidence = [
                 f"{len(cluster_unknown)} unknown neighbor cells",
                 f"cluster size {len(cluster)}",
+                f"frontier opening width is {opening_width_m:.2f} m, above robot-sized threshold {required_opening_m:.2f} m",
             ]
             if max_unknown_neighbor_count >= 2:
                 evidence.append("frontier signal is stronger: multiple unknown-facing neighbors support likely expansion")
@@ -1543,8 +1889,10 @@ class _ApartmentExplorationSession:
         return candidates
 
     def _refresh_candidate_paths(self) -> list[FrontierRecord]:
-        updated: list[FrontierRecord] = []
-        for record in self.frontier_memory.candidate_records():
+        current_pose = self.current_cell.center_pose(self.scenario.resolution, yaw=self.current_yaw)
+        current_pose_filter_m = max(self.config.occupancy_resolution * 1.5, self.config.robot_radius_m)
+
+        def _path_cost(record: FrontierRecord) -> float | None:
             preview_goal = Nav2GoalRequest(
                 goal_id=f"preview_{self.decision_index:03d}_{record.frontier_id}",
                 goal_type="frontier_preview",
@@ -1555,16 +1903,23 @@ class _ApartmentExplorationSession:
                 metadata={"frontier_id": record.frontier_id},
             )
             plan = self.nav2.compute_path(preview_goal, record=False)
-            record.path_cost_m = plan.path_length_m if plan.status == "succeeded" else None
-            updated.append(record)
-        updated.sort(
-            key=lambda record: (
-                record.path_cost_m is None,
-                record.path_cost_m if record.path_cost_m is not None else 1e9,
-                -record.unknown_gain,
-            )
+            return plan.path_length_m if plan.status == "succeeded" else None
+
+        return refresh_frontier_records(
+            candidate_records=self.frontier_memory.candidate_records(),
+            active_frontier_id=self.frontier_memory.active_frontier_id,
+            current_pose=current_pose,
+            current_pose_filter_m=current_pose_filter_m,
+            path_cost_for_record=_path_cost,
+            guardrail_events=self.guardrail_events,
+            is_frontier_at_current_pose=self._is_frontier_at_current_pose,
+            is_frontier_near_visited_pose=self._is_frontier_near_visited_pose,
+            visited_pose_filter_m=self._visited_frontier_filter_radius_m(),
+            global_anchor_for_stored_record=self._global_frontier_anchor_cell_near_record,
+            revalidate_stored_boundary=self._revalidate_stored_frontier_boundary,
+            resnap_stored_nav_pose=self._resnap_stored_frontier_revisit_pose,
+            apply_stored_resnap=self._apply_stored_frontier_resnap,
         )
-        return updated
 
     def _build_prompt_payload(self, candidate_records: list[FrontierRecord]) -> dict[str, Any]:
         recent_views = self.keyframes[-3:]
@@ -1615,6 +1970,7 @@ class _ApartmentExplorationSession:
             self.scenario.world_to_cell(record.nav_pose.x, record.nav_pose.y): record.status
             for record in candidate_records
         }
+        effective_known = self._effective_known_cells()
         lines: list[str] = []
         for y in reversed(range(self.scenario.height_cells)):
             row: list[str] = []
@@ -1626,7 +1982,7 @@ class _ApartmentExplorationSession:
                 if cell in frontier_cells:
                     row.append("V" if frontier_cells[cell] in {"completed", "failed"} else "F")
                     continue
-                state = self.known_cells.get(cell)
+                state = effective_known.get(cell)
                 if state == "free":
                     row.append(".")
                 elif state == "occupied":
@@ -1695,29 +2051,35 @@ class _ApartmentExplorationSession:
             progress=min(coverage, 0.98),
             message=message,
             result=result,
+            map_payload=self._build_map_payload(),
         )
 
     def _coverage(self) -> float:
-        discovered_free = sum(1 for cell in self.scenario.free_cells if self.known_cells.get(cell) == "free")
+        effective = self._effective_known_cells()
+        discovered_free = sum(1 for cell in self.scenario.free_cells if effective.get(cell) == "free")
         return round(discovered_free / max(self.scenario.total_free_cells(), 1), 6)
 
     def _room_coverage(self, room_id: str) -> float:
         room_cells = [cell for cell, observed_room in self.scenario.room_by_cell.items() if observed_room == room_id]
         if not room_cells:
             return 0.0
-        known = sum(1 for cell in room_cells if self.known_cells.get(cell) == "free")
+        effective = self._effective_known_cells()
+        known = sum(1 for cell in room_cells if effective.get(cell) == "free")
         return known / len(room_cells)
 
     def _build_map_payload(self) -> dict[str, Any]:
         occupancy_cells = []
-        for cell, state in sorted(self.known_cells.items()):
-            occupancy_cells.append(
-                {
-                    "x": round(cell.x * self.scenario.resolution, 3),
-                    "y": round(cell.y * self.scenario.resolution, 3),
-                    "state": state,
-                }
-            )
+        for cell, state in sorted(self._effective_known_cells().items()):
+            item = {
+                "x": round(cell.x * self.scenario.resolution, 3),
+                "y": round(cell.y * self.scenario.resolution, 3),
+                "state": state,
+            }
+            if cell in self.manual_occupancy_edits.blocked_cells:
+                item["manual_override"] = "blocked"
+            elif cell in self.manual_occupancy_edits.cleared_cells:
+                item["manual_override"] = "cleared"
+            occupancy_cells.append(item)
 
         regions = []
         semantic_area_candidates: list[dict[str, Any]] = []
@@ -1797,6 +2159,9 @@ class _ApartmentExplorationSession:
                 "decision_log": self.decision_log,
                 "frontier_memory": self.frontier_memory.snapshot(),
                 "guardrail_events": self.guardrail_events,
+                "manual_occupancy_edits": self.manual_occupancy_edits.to_dict(
+                    resolution=self.scenario.resolution,
+                ),
                 "navigation": {
                     "control_steps": self.control_steps,
                     "total_distance_m": round(self.total_distance_m, 3),
@@ -1834,6 +2199,8 @@ class _ApartmentExplorationSession:
         step_index: int,
         total_waypoints: int,
     ) -> None:
+        if not self._wait_until_task_active():
+            return
         self.current_yaw = math.atan2(nxt.y - previous.y, nxt.x - previous.x)
         self.current_cell = nxt
         self.control_steps += 1
@@ -1854,7 +2221,13 @@ class _ApartmentExplorationSession:
         )
 
     def _on_nav2_runtime_obstacle(self, cell: GridCell) -> None:
-        self.known_cells[cell] = "occupied"
+        merge_occupancy_observation(
+            self.known_cells,
+            cell,
+            "occupied",
+            evidence_scores=self.occupancy_evidence,
+        )
+        self._publish_live_map(f"Runtime obstacle observed at cell ({cell.x}, {cell.y}).")
 
 
 class RosExplorationSession:
@@ -1865,6 +2238,7 @@ class RosExplorationSession:
         self.task_id = task_id
         self.policy = ExplorationLLMPolicy(config)
         self.frontier_memory = FrontierMemory(config.occupancy_resolution)
+        self.manual_occupancy_edits = edits_from_payload({}, cell_type=GridCell)
         self.keyframes: list[dict[str, Any]] = []
         self.trajectory: list[dict[str, Any]] = []
         self.decision_log: list[dict[str, Any]] = []
@@ -1900,7 +2274,8 @@ class RosExplorationSession:
         self.nav2 = RosNav2NavigationModule(
             config,
             self.runtime,
-            current_map=self._current_map,
+            current_map=self._current_effective_map,
+            should_cancel=self._pause_requested_or_canceled,
         )
 
     def close(self) -> None:
@@ -1921,8 +2296,11 @@ class RosExplorationSession:
             reason="initial_pose",
         )
         self._perform_turnaround_scan(reason="initial_turnaround_scan")
+        self._publish_live_map("Initial ROS/Nav2 scan complete.")
 
         while self.decision_index < self.config.max_decisions:
+            if not self._wait_until_task_active():
+                break
             self.runtime.spin_for(0.15)
             if self._budget_exhausted():
                 self.guardrail_events.append(
@@ -1934,7 +2312,8 @@ class RosExplorationSession:
                 break
 
             self.decision_index += 1
-            occupancy_map = self._require_map()
+            self._sync_manual_occupancy_edits()
+            occupancy_map = self._require_effective_map()
             pose = self._require_pose()
             self._update_pose_history(pose)
             visible_candidates = self._detect_frontier_candidates(occupancy_map, pose)
@@ -1942,6 +2321,8 @@ class RosExplorationSession:
             candidate_records = self._refresh_candidate_paths()
             prompt_payload = self._build_prompt_payload(occupancy_map, pose, candidate_records)
             coverage = self._coverage(occupancy_map)
+            if not self._wait_until_task_active():
+                break
             decision, trace = self.policy.decide(
                 prompt_payload=prompt_payload,
                 frontiers=candidate_records,
@@ -2005,9 +2386,16 @@ class RosExplorationSession:
             nav_result = self.nav2.navigate_to_pose(frontier_goal)
             self._consume_nav_result(nav_result)
             if nav_result.status != "succeeded":
-                self.frontier_memory.fail(record.frontier_id, nav_result.reason)
+                _mark_frontier_unreachable_as_visited(self.frontier_memory, record.frontier_id, nav_result.reason)
+                self.guardrail_events.append(
+                    {
+                        "type": "nav2_frontier_marked_visited_after_failure",
+                        "frontier_id": record.frontier_id,
+                        "nav2_result": nav_result.to_dict(),
+                    }
+                )
                 self._push_progress_update(
-                    message=f"Failed to reach {record.frontier_id}: {nav_result.reason}",
+                    message=f"Marked {record.frontier_id} visited after Nav2 failed to reach it: {nav_result.reason}",
                     frontier_id=record.frontier_id,
                 )
                 continue
@@ -2031,6 +2419,39 @@ class RosExplorationSession:
     def _current_map(self) -> RosOccupancyMap | None:
         return self.runtime.latest_map
 
+    def _current_effective_map(self) -> EditableOccupancyMap | None:
+        raw = self._current_map()
+        if raw is None:
+            return None
+        return EditableOccupancyMap(raw, self.manual_occupancy_edits)
+
+    def _sync_manual_occupancy_edits(self) -> None:
+        self.manual_occupancy_edits = edits_from_payload(
+            self.backend.occupancy_edit_snapshot(self.task_id),
+            cell_type=GridCell,
+        )
+
+    def _require_effective_map(self) -> EditableOccupancyMap:
+        return EditableOccupancyMap(self._require_map(), self.manual_occupancy_edits)
+
+    def _wait_until_task_active(self) -> bool:
+        while True:
+            task = self.backend.get_task(self.task_id)
+            if task is None:
+                return False
+            if task.get("state") == "aborted":
+                return False
+            if not bool(task.get("paused", False)):
+                self._sync_manual_occupancy_edits()
+                return True
+            time.sleep(0.1)
+
+    def _pause_requested_or_canceled(self) -> bool:
+        task = self.backend.get_task(self.task_id)
+        if task is None:
+            return True
+        return bool(task.get("paused", False) or task.get("state") == "aborted")
+
     def _require_map(self) -> RosOccupancyMap:
         occupancy_map = self._current_map()
         if occupancy_map is None:
@@ -2053,7 +2474,10 @@ class RosExplorationSession:
         return False
 
     def _perform_turnaround_scan(self, *, reason: str) -> None:
-        event = self.runtime.perform_turnaround_scan(reason=reason)
+        event = self.runtime.perform_turnaround_scan(
+            reason=reason,
+            should_cancel=self._pause_requested_or_canceled,
+        )
         self.guardrail_events.append({"type": "turnaround_scan", "event": event})
         self.runtime.spin_for(0.25)
         self._capture_keyframe(reason=reason)
@@ -2132,10 +2556,57 @@ class RosExplorationSession:
             clusters.append(cluster)
 
         robot_cell = GridCell(*occupancy_map.world_to_cell(pose.x, pose.y))
+        reachable_free_cells = self._reachable_free_cells(occupancy_map, pose)
         candidates: list[FrontierCandidate] = []
+        configured_opening_m = self.config.frontier_min_opening_m
+        required_opening_m = (
+            max(float(configured_opening_m), occupancy_map.resolution)
+            if configured_opening_m is not None and configured_opening_m > 0.0
+            else max(self.config.robot_radius_m * 2.0 + 0.10, occupancy_map.resolution * 2.0)
+        )
         for cluster in clusters:
             cluster_unknown = set().union(*(unknown_neighbors_by_frontier.get(cell, set()) for cell in cluster))
             if not cluster_unknown:
+                continue
+            if not any(cell in reachable_free_cells for cell in cluster):
+                self.guardrail_events.append(
+                    {
+                        "type": "frontier_boundary_unreachable_through_known_free",
+                        "cluster_size": len(cluster),
+                        "unknown_gain": len(cluster_unknown),
+                        "frontier_boundary_pose": _cell_mean_pose(cluster, occupancy_map.resolution).to_dict(),
+                    }
+                )
+                continue
+            opening_width_m = _frontier_opening_width_m(cluster, occupancy_map.resolution)
+            if opening_width_m < required_opening_m:
+                self.guardrail_events.append(
+                    {
+                        "type": "frontier_opening_too_narrow",
+                        "cluster_size": len(cluster),
+                        "opening_width_m": round(opening_width_m, 3),
+                        "required_width_m": round(required_opening_m, 3),
+                        "frontier_boundary_pose": _cell_mean_pose(cluster, occupancy_map.resolution).to_dict(),
+                    }
+                )
+                continue
+            boundary_pose = _cell_mean_pose(cluster, occupancy_map.resolution)
+            boundary_pose = Pose2D(
+                boundary_pose.x + occupancy_map.origin_x,
+                boundary_pose.y + occupancy_map.origin_y,
+                boundary_pose.yaw,
+            )
+            visited_filter_radius_m = self._visited_frontier_filter_radius_m()
+            if self._is_pose_near_previous_visit(boundary_pose, visited_filter_radius_m):
+                self.guardrail_events.append(
+                    {
+                        "type": "frontier_near_visited_pose_filtered",
+                        "cluster_size": len(cluster),
+                        "unknown_gain": len(cluster_unknown),
+                        "filter_radius_m": round(visited_filter_radius_m, 3),
+                        "frontier_boundary_pose": boundary_pose.to_dict(),
+                    }
+                )
                 continue
             nav_cell = min(cluster, key=lambda cell: _grid_distance_cells(cell, robot_cell))
             centroid_cell = _centroid_cell(cluster)
@@ -2144,6 +2615,7 @@ class RosExplorationSession:
             evidence = [
                 f"{len(cluster_unknown)} unknown neighbor cells on the live occupancy map",
                 f"cluster size {len(cluster)}",
+                f"frontier opening width is {opening_width_m:.2f} m, above robot-sized threshold {required_opening_m:.2f} m",
             ]
             if any(cell in range_edge_cells for cell in cluster):
                 evidence.append("frontier also aligns with the depth-derived sensor range limit")
@@ -2194,9 +2666,194 @@ class RosExplorationSession:
                 last_free = GridCell(cell_x, cell_y)
         return result
 
+    def _reachable_free_cells(
+        self,
+        occupancy_map: EditableOccupancyMap,
+        pose: Pose2D,
+    ) -> set[GridCell]:
+        origin_cell = GridCell(*occupancy_map.world_to_cell(pose.x, pose.y))
+        if not occupancy_map.in_bounds(origin_cell.x, origin_cell.y) or not occupancy_map.is_free(origin_cell.x, origin_cell.y):
+            return set()
+        reachable: set[GridCell] = set()
+        queue = deque([origin_cell])
+        while queue:
+            current = queue.popleft()
+            if current in reachable:
+                continue
+            reachable.add(current)
+            for neighbor in _neighbors4(current):
+                if neighbor in reachable:
+                    continue
+                if not occupancy_map.in_bounds(neighbor.x, neighbor.y):
+                    continue
+                if not occupancy_map.is_free(neighbor.x, neighbor.y):
+                    continue
+                queue.append(neighbor)
+        return reachable
+
+    def _global_frontier_anchor_cell_near_record(
+        self,
+        record: FrontierRecord,
+    ) -> tuple[GridCell | None, str | None]:
+        occupancy_map = self._require_effective_map()
+        pose = self._require_pose()
+        reachable_free_cells = self._reachable_free_cells(occupancy_map, pose)
+        range_edge_cells = self._range_edge_cells(occupancy_map, pose)
+        boundary_cell = GridCell(*occupancy_map.world_to_cell(record.centroid_pose.x, record.centroid_pose.y))
+        search_radius_cells = max(1, int(math.ceil(STORED_FRONTIER_REVALIDATION_RADIUS_M / occupancy_map.resolution)))
+        strong_candidates: list[tuple[int, int, GridCell]] = []
+        relaxed_candidates: list[tuple[int, int, GridCell]] = []
+        unreachable_boundary_candidates = 0
+        for dx in range(-search_radius_cells, search_radius_cells + 1):
+            for dy in range(-search_radius_cells, search_radius_cells + 1):
+                cell = GridCell(boundary_cell.x + dx, boundary_cell.y + dy)
+                if not occupancy_map.in_bounds(cell.x, cell.y):
+                    continue
+                distance_cells = _grid_distance_cells(cell, boundary_cell)
+                if distance_cells > search_radius_cells or not occupancy_map.is_free(cell.x, cell.y):
+                    continue
+                unknown_neighbors = {
+                    neighbor
+                    for neighbor in _neighbors4(cell)
+                    if occupancy_map.in_bounds(neighbor.x, neighbor.y) and occupancy_map.is_unknown(neighbor.x, neighbor.y)
+                }
+                if not unknown_neighbors:
+                    continue
+                if cell not in reachable_free_cells:
+                    unreachable_boundary_candidates += 1
+                    continue
+                if len(unknown_neighbors) >= 2 or (cell in range_edge_cells and unknown_neighbors):
+                    strong_candidates.append((distance_cells, -len(unknown_neighbors), cell))
+                else:
+                    relaxed_candidates.append((distance_cells, -len(unknown_neighbors), cell))
+        if strong_candidates:
+            return min(strong_candidates, key=lambda item: (item[0], item[1]))[2], "strong"
+        if relaxed_candidates:
+            return min(relaxed_candidates, key=lambda item: (item[0], item[1]))[2], "relaxed"
+        if unreachable_boundary_candidates:
+            self.guardrail_events.append(
+                {
+                    "type": "stored_frontier_boundary_unreachable_through_known_free",
+                    "frontier_id": record.frontier_id,
+                    "frontier_boundary_pose": record.centroid_pose.to_dict(),
+                    "unreachable_candidate_count": unreachable_boundary_candidates,
+                }
+            )
+        return None, None
+
+    def _revalidate_stored_frontier_boundary(
+        self,
+        record: FrontierRecord,
+        anchor_cell: GridCell,
+        anchor_mode: str | None,
+    ) -> None:
+        occupancy_map = self._require_effective_map()
+        anchor_pose = occupancy_map.cell_to_pose(anchor_cell.x, anchor_cell.y)
+        if _pose_distance_m(record.centroid_pose, anchor_pose) <= occupancy_map.resolution * 0.5 and anchor_mode != "relaxed":
+            return
+        previous_pose = record.centroid_pose
+        record.centroid_pose = anchor_pose
+        notes = [
+            (
+                "stored frontier boundary was revalidated against the current global occupancy map "
+                f"near the original memory point ({previous_pose.x:.2f}, {previous_pose.y:.2f})"
+            )
+        ]
+        if anchor_mode == "relaxed":
+            notes.append(
+                "stored frontier memory was kept using relaxed revalidation because nearby free space still borders unknown map area"
+            )
+        record.evidence = _dedupe_text(record.evidence + notes)
+
+    def _resnap_stored_frontier_revisit_pose(
+        self,
+        record: FrontierRecord,
+        current_pose: Pose2D,
+        anchor_cell: GridCell,
+    ) -> Pose2D | None:
+        occupancy_map = self._require_effective_map()
+        reachable_safe_cells = self._reachable_free_cells(occupancy_map, current_pose)
+        resolution = occupancy_map.resolution
+        anchor_pose = occupancy_map.cell_to_pose(anchor_cell.x, anchor_cell.y)
+        max_radius_cells = max(1, int(math.ceil(STORED_FRONTIER_REVISIT_APPROACH_RADIUS_M / resolution)))
+        scored_cells: list[tuple[float, GridCell]] = []
+        for cell in reachable_safe_cells:
+            distance_cells = _grid_distance_cells(cell, anchor_cell)
+            if distance_cells > max_radius_cells:
+                continue
+            cell_pose = occupancy_map.cell_to_pose(cell.x, cell.y)
+            score = (
+                abs(distance_cells * resolution - (self.config.robot_radius_m + 0.25))
+                + 0.03 * _pose_distance_m(cell_pose, current_pose)
+                + 0.02 * _pose_distance_m(cell_pose, record.nav_pose)
+            )
+            scored_cells.append((score, cell))
+        if not scored_cells:
+            return None
+        best = min(scored_cells, key=lambda item: item[0])[1]
+        best_pose = occupancy_map.cell_to_pose(best.x, best.y)
+        return Pose2D(
+            best_pose.x,
+            best_pose.y,
+            math.atan2(anchor_pose.y - best_pose.y, anchor_pose.x - best_pose.x),
+        )
+
+    def _apply_stored_frontier_resnap(
+        self,
+        record: FrontierRecord,
+        target_pose: Pose2D,
+        previous_pose: Pose2D,
+    ) -> None:
+        if _pose_distance_m(target_pose, previous_pose) <= self.config.occupancy_resolution * 0.5:
+            return
+        record.nav_pose = target_pose
+        record.evidence = _dedupe_text(
+            record.evidence
+            + [
+                "stored frontier revisit approach pose was re-snapped to nearby mapped free space before LLM selection"
+            ]
+        )
+        self.guardrail_events.append(
+            {
+                "type": "stored_frontier_revisit_pose_resnapped",
+                "frontier_id": record.frontier_id,
+                "previous_nav_pose": previous_pose.to_dict(),
+                "resnapped_nav_pose": target_pose.to_dict(),
+            }
+        )
+
+    def _is_frontier_at_current_pose(self, record: FrontierRecord, current_pose_filter_m: float) -> bool:
+        occupancy_map = self._require_effective_map()
+        current_pose = self._require_pose()
+        target_cell = GridCell(*occupancy_map.world_to_cell(record.centroid_pose.x, record.centroid_pose.y))
+        current_cell = GridCell(*occupancy_map.world_to_cell(current_pose.x, current_pose.y))
+        return target_cell == current_cell or _pose_distance_m(record.centroid_pose, current_pose) <= current_pose_filter_m
+
+    def _visited_frontier_filter_radius_m(self) -> float:
+        configured = self.config.visited_frontier_filter_radius_m
+        if configured is not None and configured > 0.0:
+            return max(float(configured), self.config.occupancy_resolution)
+        return max(self.config.robot_radius_m + 0.35, self.config.occupancy_resolution * 2.0)
+
+    def _previous_trajectory_poses(self) -> list[Pose2D]:
+        trajectory = getattr(self, "trajectory", [])
+        return [
+            pose
+            for pose in (_pose_from_mapping(item) for item in trajectory[:-1])
+            if pose is not None
+        ]
+
+    def _is_pose_near_previous_visit(self, pose: Pose2D, radius_m: float) -> bool:
+        return any(_pose_distance_m(pose, visited_pose) <= radius_m for visited_pose in self._previous_trajectory_poses())
+
+    def _is_frontier_near_visited_pose(self, record: FrontierRecord, radius_m: float) -> bool:
+        return self._is_pose_near_previous_visit(record.centroid_pose, radius_m)
+
     def _refresh_candidate_paths(self) -> list[FrontierRecord]:
-        updated: list[FrontierRecord] = []
-        for record in self.frontier_memory.candidate_records():
+        pose = self._require_pose()
+        current_pose_filter_m = max(self.config.occupancy_resolution * 1.5, self.config.robot_radius_m)
+
+        def _path_cost(record: FrontierRecord) -> float | None:
             preview_goal = Nav2GoalRequest(
                 goal_id=f"preview_{self.decision_index:03d}_{record.frontier_id}",
                 goal_type="frontier_preview",
@@ -2207,16 +2864,23 @@ class RosExplorationSession:
                 metadata={"frontier_id": record.frontier_id},
             )
             plan = self.nav2.compute_path(preview_goal, record=False)
-            record.path_cost_m = plan.path_length_m if plan.status == "succeeded" else None
-            updated.append(record)
-        updated.sort(
-            key=lambda record: (
-                record.path_cost_m is None,
-                record.path_cost_m if record.path_cost_m is not None else 1e9,
-                -record.unknown_gain,
-            )
+            return plan.path_length_m if plan.status == "succeeded" else None
+
+        return refresh_frontier_records(
+            candidate_records=self.frontier_memory.candidate_records(),
+            active_frontier_id=self.frontier_memory.active_frontier_id,
+            current_pose=pose,
+            current_pose_filter_m=current_pose_filter_m,
+            path_cost_for_record=_path_cost,
+            guardrail_events=self.guardrail_events,
+            is_frontier_at_current_pose=self._is_frontier_at_current_pose,
+            is_frontier_near_visited_pose=self._is_frontier_near_visited_pose,
+            visited_pose_filter_m=self._visited_frontier_filter_radius_m(),
+            global_anchor_for_stored_record=self._global_frontier_anchor_cell_near_record,
+            revalidate_stored_boundary=self._revalidate_stored_frontier_boundary,
+            resnap_stored_nav_pose=self._resnap_stored_frontier_revisit_pose,
+            apply_stored_resnap=self._apply_stored_frontier_resnap,
         )
-        return updated
 
     def _build_prompt_payload(
         self,
@@ -2389,7 +3053,7 @@ class RosExplorationSession:
         )
 
     def _push_progress_update(self, *, message: str, frontier_id: str | None) -> None:
-        coverage = self._coverage(self._require_map())
+        coverage = self._coverage(self._require_effective_map())
         result = {
             "coverage": round(coverage, 3),
             "trajectory": self.trajectory[-12:],
@@ -2402,7 +3066,11 @@ class RosExplorationSession:
             progress=min(coverage, 0.98),
             message=message,
             result=result,
+            map_payload=self._build_map_payload(),
         )
+
+    def _publish_live_map(self, message: str) -> None:
+        self._push_progress_update(message=message, frontier_id=self.frontier_memory.active_frontier_id)
 
     def _consume_nav_result(self, result: Nav2NavigateResult) -> None:
         if result.reached_pose is not None:
@@ -2415,7 +3083,7 @@ class RosExplorationSession:
         return round(known / max(len(occupancy_map.data), 1), 6)
 
     def _build_map_payload(self) -> dict[str, Any]:
-        occupancy_map = self._require_map()
+        occupancy_map = self._require_effective_map()
         occupancy_cells = []
         for y in range(occupancy_map.height):
             for x in range(occupancy_map.width):
@@ -2428,6 +3096,13 @@ class RosExplorationSession:
                         "x": round(pose.x - occupancy_map.resolution / 2.0, 3),
                         "y": round(pose.y - occupancy_map.resolution / 2.0, 3),
                         "state": "free" if value == 0 else "occupied",
+                        **(
+                            {"manual_override": "blocked"}
+                            if GridCell(x, y) in self.manual_occupancy_edits.blocked_cells
+                            else {"manual_override": "cleared"}
+                            if GridCell(x, y) in self.manual_occupancy_edits.cleared_cells
+                            else {}
+                        ),
                     }
                 )
         semantic_area_candidates = _aggregate_semantic_updates(self.semantic_updates)
@@ -2460,6 +3135,9 @@ class RosExplorationSession:
                 "decision_log": self.decision_log,
                 "frontier_memory": self.frontier_memory.snapshot(),
                 "guardrail_events": self.guardrail_events,
+                "manual_occupancy_edits": self.manual_occupancy_edits.to_dict(
+                    resolution=occupancy_map.resolution,
+                ),
                 "navigation": {
                     "control_steps": self.control_steps,
                     "total_distance_m": round(self.total_distance_m, 3),
@@ -2582,7 +3260,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--serve-review-ui", action="store_true")
     parser.add_argument("--review-host", default="127.0.0.1")
     parser.add_argument("--review-port", type=int, default=8770)
+    parser.add_argument("--review-ui-flavor", choices=("user", "developer"), default="user")
+    parser.add_argument("--open-browser", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--sensor-range-m", type=float, default=10.0)
+    parser.add_argument("--robot-radius-m", type=float, default=0.22)
+    parser.add_argument(
+        "--frontier-min-opening-m",
+        type=float,
+        default=None,
+        help="Override the minimum frontier opening width. Defaults to robot diameter plus clearance.",
+    )
+    parser.add_argument(
+        "--visited-frontier-filter-radius-m",
+        type=float,
+        default=None,
+        help=(
+            "Suppress frontier boundaries within this distance of previous robot poses. "
+            "Defaults to robot radius plus clearance."
+        ),
+    )
     parser.add_argument("--finish-coverage-threshold", type=float, default=0.96)
     parser.add_argument("--max-decisions", type=int, default=32)
     parser.add_argument("--nav2-mode", choices=("simulated", "ros"), default="simulated")
@@ -2650,7 +3346,11 @@ def main(argv: list[str] | None = None) -> int:
             serve_review_ui=args.serve_review_ui,
             review_host=args.review_host,
             review_port=args.review_port,
+            review_ui_flavor=args.review_ui_flavor,
             sensor_range_m=args.sensor_range_m,
+            robot_radius_m=args.robot_radius_m,
+            frontier_min_opening_m=args.frontier_min_opening_m,
+            visited_frontier_filter_radius_m=args.visited_frontier_filter_radius_m,
             finish_coverage_threshold=args.finish_coverage_threshold,
             max_decisions=args.max_decisions,
             nav2_mode=args.nav2_mode,
@@ -2674,13 +3374,7 @@ def main(argv: list[str] | None = None) -> int:
         ),
         backend,
     )
-    snapshot = runner.run()
-    current_map = snapshot.get("current_map") or {}
-    print(
-        f"Saved exploration map `{current_map.get('map_id', args.session)}` "
-        f"with {len(current_map.get('regions', []))} region(s), "
-        f"coverage {current_map.get('coverage', 0.0)}, to {args.persist_path}."
-    )
+    server: ExplorationReviewServer | None = None
     if args.serve_review_ui:
         controller = LocalExplorationUIController(backend)
         server = ExplorationReviewServer(
@@ -2688,9 +3382,36 @@ def main(argv: list[str] | None = None) -> int:
             host=args.review_host,
             port=args.review_port,
             allow_task_controls=False,
+            allow_task_launch_controls=False,
+            allow_task_state_controls=True,
+            allow_map_approval=True,
+            ui_flavor=args.review_ui_flavor,
         )
-        print(f"XLeRobot exploration review UI: http://{args.review_host}:{args.review_port}")
-        server.serve_forever()
+        server.serve_in_background()
+        print(
+            f"XLeRobot exploration review UI: http://{args.review_host}:{args.review_port} "
+            f"(flavor={args.review_ui_flavor})"
+        )
+        if args.open_browser:
+            webbrowser.open(f"http://{args.review_host}:{args.review_port}")
+    try:
+        snapshot = runner.run()
+        current_map = snapshot.get("current_map") or {}
+        print(
+            f"Saved exploration map `{current_map.get('map_id', args.session)}` "
+            f"with {len(current_map.get('regions', []))} region(s), "
+            f"coverage {current_map.get('coverage', 0.0)}, to {args.persist_path}."
+        )
+        if args.serve_review_ui:
+            print("Review UI remains live for pause/edit/approval inspection. Press Ctrl-C to exit.")
+            try:
+                while True:
+                    time.sleep(0.5)
+            except KeyboardInterrupt:
+                pass
+    finally:
+        if server is not None:
+            server.shutdown()
     return 0
 
 
@@ -2989,6 +3710,26 @@ def _centroid_cell(cells: Iterable[GridCell]) -> GridCell:
     return GridCell(mean_x, mean_y)
 
 
+def _cell_mean_pose(cells: Iterable[GridCell], resolution: float, *, yaw: float = 0.0) -> Pose2D:
+    normalized = list(cells)
+    if not normalized:
+        return Pose2D(0.0, 0.0, yaw)
+    mean_x = sum((cell.x + 0.5) * resolution for cell in normalized) / len(normalized)
+    mean_y = sum((cell.y + 0.5) * resolution for cell in normalized) / len(normalized)
+    return Pose2D(mean_x, mean_y, yaw)
+
+
+def _frontier_opening_width_m(cells: Iterable[GridCell], resolution: float) -> float:
+    normalized = list(cells)
+    if not normalized:
+        return 0.0
+    span_x_cells = max(cell.x for cell in normalized) - min(cell.x for cell in normalized) + 1
+    span_y_cells = max(cell.y for cell in normalized) - min(cell.y for cell in normalized) + 1
+    # Bound by member count so sparse diagonal/noisy components do not look wider than their evidence.
+    effective_width_cells = min(max(span_x_cells, span_y_cells), len(normalized))
+    return max(0.0, effective_width_cells * resolution)
+
+
 def _search_known_safe_path(start: GridCell, goal: GridCell, traversable: set[GridCell]) -> list[GridCell]:
     if start == goal:
         return [start]
@@ -3056,6 +3797,19 @@ def _pose_distance_m(a: Pose2D, b: Pose2D) -> float:
     return math.hypot(a.x - b.x, a.y - b.y)
 
 
+def _pose_from_mapping(value: Any) -> Pose2D | None:
+    if not isinstance(value, dict):
+        return None
+    try:
+        return Pose2D(
+            float(value["x"]),
+            float(value["y"]),
+            float(value.get("yaw", 0.0)),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 def _clamp_float(value: Any, *, default: float, low: float, high: float) -> float:
     try:
         parsed = float(value)
@@ -3091,12 +3845,13 @@ def _frontier_selection_guidance() -> list[str]:
     return [
         "Treat frontier coordinates as partial RGB-D-derived boundary information from what the camera has scanned, not as complete apartment knowledge or a command to visit every boundary.",
         "Select frontiers that likely expand robot-navigable floor space: doors, room entrances, hallway continuations, open areas, or meaningful sensor-range-limit expansions.",
-        "This is robot exploration, not a sightseeing tour: for similarly useful candidates, prefer lower path_cost_m and clear nearby openings before crossing the map to a far frontier.",
-        "Deterministic frontier candidates are proposals, not truth. A single-edge unknown boundary can be worth checking when robot-sized free space exists nearby, but you should veto it if the navigation-map image and RGB views suggest already-mapped empty space, a wall sliver, or clutter.",
+        "`free_space_path_distance_m` is an approximate route through currently known free cells from the robot to the frontier approach pose. Locality is a primary objective: choose nearby useful frontiers first and avoid zig-zagging across the apartment.",
+        "Do not choose a frontier more than about 2x farther than another plausible frontier unless the navigation map and RGB views show it is clearly much more valuable, such as opening a major new room or corridor.",
+        "Deterministic frontier candidates are proposals, not truth. They should have a robot-sized opening width, but you should still veto them if the navigation-map image and RGB views suggest already-mapped empty space, a wall sliver, or clutter.",
         "Use recent RGB views to interpret ambiguous frontier information, especially when geometry alone could be a doorway, furniture edge, or clutter shadow.",
         "Deprioritize frontiers that look like furniture-shadow boundaries behind or under couches, tables, cabinets, shelves, or clutter unless evidence suggests a real traversable opening.",
         "If a listed frontier looks wrong after overlaying the navigation map, frontier label, and camera images, do not select it; use memory_updates with `suppress` or `keep` to veto it explicitly.",
-        "Use path_cost_m, unknown_gain, currently_visible, recent views, navigation-map image, and frontier memory together; choose a far frontier only when it clearly offers better navigable expansion than nearby alternatives.",
+        "Use free_space_path_distance_m first, then unknown_gain, source, recent views, navigation-map image, and frontier memory; choose a far frontier only when it clearly offers substantially better navigable expansion than nearby alternatives.",
         "If remaining frontiers are reachable but likely not useful for robot navigation, explain that in reasoning_summary before finishing or choosing a better stored frontier.",
     ]
 

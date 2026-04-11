@@ -4,6 +4,7 @@ import base64
 from dataclasses import dataclass, field
 import hashlib
 import json
+import math
 from pathlib import Path
 import threading
 import time
@@ -133,6 +134,7 @@ class _TaskState:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "paused": self.paused,
+            "canceled": self.canceled,
         }
 
 
@@ -176,6 +178,49 @@ class FileMapStore:
         self.path.write_text(json.dumps(payload, indent=2))
 
 
+def _overlay_occupancy_payload_with_manual_edits(
+    occupancy: dict[str, Any] | None,
+    edits: dict[str, Any],
+) -> dict[str, Any] | None:
+    if not isinstance(occupancy, dict):
+        return occupancy
+    resolution = float(occupancy.get("resolution", 0.25) or 0.25)
+    index: dict[tuple[int, int], dict[str, Any]] = {}
+    for item in occupancy.get("cells", []):
+        if not isinstance(item, dict):
+            continue
+        try:
+            cell_x = int(math.floor(float(item["x"]) / resolution))
+            cell_y = int(math.floor(float(item["y"]) / resolution))
+        except Exception:
+            continue
+        index[(cell_x, cell_y)] = dict(item)
+
+    def _apply(items: Any, *, state: str, override: str) -> None:
+        if not isinstance(items, list):
+            return
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            try:
+                cell_x = int(item["cell_x"])
+                cell_y = int(item["cell_y"])
+            except Exception:
+                continue
+            index[(cell_x, cell_y)] = {
+                "x": round(cell_x * resolution, 3),
+                "y": round(cell_y * resolution, 3),
+                "state": state,
+                "manual_override": override,
+            }
+
+    _apply(edits.get("blocked_cells"), state="occupied", override="blocked")
+    _apply(edits.get("cleared_cells"), state="free", override="cleared")
+    payload = dict(occupancy)
+    payload["cells"] = sorted(index.values(), key=lambda item: (float(item["y"]), float(item["x"])))
+    return payload
+
+
 class ExplorationBackend:
     def __init__(
         self,
@@ -190,6 +235,7 @@ class ExplorationBackend:
         self._threads: dict[str, threading.Thread] = {}
         self._current_map: dict[str, Any] | None = None
         self._maps: dict[str, dict[str, Any]] = {}
+        self._manual_occupancy_edits: dict[str, dict[str, Any]] = {}
         self._map_store: FileMapStore | None = (
             FileMapStore(self.config.persist_path) if self.config.persist_path is not None else None
         )
@@ -261,6 +307,7 @@ class ExplorationBackend:
         message: str | None = None,
         result: dict[str, Any] | None = None,
         state: str | None = None,
+        map_payload: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         with self._lock:
             task = self._tasks.get(task_id)
@@ -274,6 +321,8 @@ class ExplorationBackend:
                 task.result = json.loads(json.dumps(result))
             if state is not None:
                 task.state = str(state)
+            if map_payload is not None:
+                self._set_current_map(map_payload)
             task.updated_at = time.time()
             self._persist()
             return task.to_dict()
@@ -497,6 +546,81 @@ class ExplorationBackend:
             self._persist()
             return json.loads(json.dumps(named_place))
 
+    def occupancy_edit_snapshot(self, task_id: str | None = None) -> dict[str, Any]:
+        with self._lock:
+            task = self._resolve_task(task_id)
+            if task is None:
+                return {"blocked_cells": [], "cleared_cells": []}
+            payload = self._manual_occupancy_edits.get(task.task_id)
+            if not isinstance(payload, dict):
+                return {"blocked_cells": [], "cleared_cells": []}
+            return json.loads(json.dumps(payload))
+
+    def update_occupancy_edits(
+        self,
+        *,
+        task_id: str | None = None,
+        mode: str,
+        cells: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        normalized_mode = str(mode).strip().lower()
+        with self._lock:
+            task = self._resolve_task(task_id)
+            if task is None:
+                return {"blocked_cells": [], "cleared_cells": []}
+            edits = json.loads(json.dumps(self._manual_occupancy_edits.get(task.task_id, {"blocked_cells": [], "cleared_cells": []})))
+            blocked = {(int(item["cell_x"]), int(item["cell_y"])) for item in edits.get("blocked_cells", []) if "cell_x" in item and "cell_y" in item}
+            cleared = {(int(item["cell_x"]), int(item["cell_y"])) for item in edits.get("cleared_cells", []) if "cell_x" in item and "cell_y" in item}
+            for item in cells:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    if "cell_x" in item and "cell_y" in item:
+                        cell = (int(item["cell_x"]), int(item["cell_y"]))
+                    else:
+                        resolution = float(self._current_map.get("occupancy", {}).get("resolution", self.config.occupancy_resolution)) if self._current_map else self.config.occupancy_resolution
+                        cell = (
+                            int(float(item["x"]) // resolution),
+                            int(float(item["y"]) // resolution),
+                        )
+                except Exception:
+                    continue
+                if normalized_mode == "block":
+                    cleared.discard(cell)
+                    blocked.add(cell)
+                elif normalized_mode == "clear":
+                    blocked.discard(cell)
+                    cleared.add(cell)
+                elif normalized_mode == "reset":
+                    blocked.discard(cell)
+                    cleared.discard(cell)
+            resolution = float(self._current_map.get("occupancy", {}).get("resolution", self.config.occupancy_resolution)) if self._current_map else self.config.occupancy_resolution
+            payload = {
+                "blocked_cells": [
+                    {
+                        "cell_x": cell_x,
+                        "cell_y": cell_y,
+                        "x": round(cell_x * resolution, 3),
+                        "y": round(cell_y * resolution, 3),
+                    }
+                    for cell_x, cell_y in sorted(blocked)
+                ],
+                "cleared_cells": [
+                    {
+                        "cell_x": cell_x,
+                        "cell_y": cell_y,
+                        "x": round(cell_x * resolution, 3),
+                        "y": round(cell_y * resolution, 3),
+                    }
+                    for cell_x, cell_y in sorted(cleared)
+                ],
+            }
+            self._manual_occupancy_edits[task.task_id] = payload
+            if self._current_map is not None:
+                self._attach_manual_edits(self._current_map, task.task_id)
+            self._persist()
+            return json.loads(json.dumps(payload))
+
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             active_task = self._resolve_task(None)
@@ -716,9 +840,21 @@ class ExplorationBackend:
 
     def _set_current_map(self, map_payload: dict[str, Any]) -> None:
         self._current_map = json.loads(json.dumps(map_payload))
+        active_task = self._resolve_task(None)
+        if active_task is not None:
+            self._attach_manual_edits(self._current_map, active_task.task_id)
         self._rebuild_named_places()
         if self._current_map is not None:
             self._maps[self._current_map["map_id"]] = json.loads(json.dumps(self._current_map))
+
+    def _attach_manual_edits(self, map_payload: dict[str, Any], task_id: str) -> None:
+        artifacts = map_payload.setdefault("artifacts", {})
+        edits = self._manual_occupancy_edits.get(task_id, {"blocked_cells": [], "cleared_cells": []})
+        artifacts["manual_occupancy_edits"] = json.loads(json.dumps(edits))
+        map_payload["occupancy"] = _overlay_occupancy_payload_with_manual_edits(
+            map_payload.get("occupancy"),
+            edits,
+        )
 
     def _find_region(self, region_id: str) -> dict[str, Any] | None:
         if self._current_map is None:
@@ -766,6 +902,36 @@ class ExplorationBackend:
             for item in maps:
                 if isinstance(item, dict) and item.get("map_id"):
                     self._maps[str(item["map_id"])] = item
+        tasks = payload.get("tasks")
+        if isinstance(tasks, list):
+            for item in tasks:
+                if not isinstance(item, dict) or not item.get("task_id"):
+                    continue
+                task = _TaskState(
+                    task_id=str(item["task_id"]),
+                    tool_id=str(item.get("tool_id", "unknown")),
+                    area=str(item.get("area", "workspace")),
+                    session=str(item.get("session", "restored")),
+                    source=str(item.get("source", "restored")),
+                    state=str(item.get("state", ExecutionStatus.IN_PROGRESS.value)),
+                    progress=float(item.get("progress", 0.0) or 0.0),
+                    message=str(item.get("message", "")),
+                    result=dict(item.get("result", {})) if isinstance(item.get("result"), dict) else {},
+                    created_at=float(item.get("created_at", time.time()) or time.time()),
+                    updated_at=float(item.get("updated_at", time.time()) or time.time()),
+                    paused=bool(item.get("paused", False)),
+                    canceled=bool(item.get("canceled", False)),
+                )
+                self._tasks[task.task_id] = task
+        if self._tasks and self._current_map is not None:
+            edits = (
+                self._current_map.get("artifacts", {}).get("manual_occupancy_edits")
+                if isinstance(self._current_map, dict)
+                else None
+            )
+            if isinstance(edits, dict):
+                latest_task_id = next(reversed(self._tasks))
+                self._manual_occupancy_edits[latest_task_id] = json.loads(json.dumps(edits))
 
 
 def _build_scenario(*, session: str, area: str, current_pose: str) -> ExplorationScenario:

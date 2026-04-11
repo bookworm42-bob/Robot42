@@ -7,11 +7,14 @@ from pathlib import Path
 from xlerobot_agent.exploration import ExplorationBackend, ExplorationBackendConfig, Pose2D
 from xlerobot_playground.sim_exploration_backend import (
     ExplorationDecision,
+    ExplorationLLMPolicy,
+    FrontierCandidate,
     FrontierMemory,
     FrontierRecord,
     GridCell,
     ManiSkillExplorationRunner,
     SimExplorationConfig,
+    _mark_frontier_unreachable_as_visited,
     build_parser,
 )
 from xlerobot_playground.interactive_exploration_playground import ManiSkillTeleportExplorationSession
@@ -22,9 +25,61 @@ from xlerobot_playground.interactive_exploration_playground import (
     _zero_mobile_base_qvel,
     build_parser as build_interactive_playground_parser,
 )
+from xlerobot_playground.map_editing import ACTIVE_RGBD_SCAN_FUSION_CONFIG, merge_occupancy_observation
 
 
 class SimExplorationBackendTests(unittest.TestCase):
+    def test_occupancy_fusion_preserves_observed_walls_against_later_free_updates(self) -> None:
+        wall_cell = GridCell(2, 3)
+        known_cells = {wall_cell: "occupied"}
+        evidence = {wall_cell: 2.0}
+
+        merge_occupancy_observation(known_cells, wall_cell, "free", evidence_scores=evidence)
+
+        self.assertEqual(known_cells[wall_cell], "occupied")
+
+    def test_occupancy_fusion_clears_wall_after_repeated_free_updates(self) -> None:
+        wall_cell = GridCell(2, 3)
+        known_cells = {wall_cell: "occupied"}
+        evidence = {wall_cell: 2.0}
+
+        merge_occupancy_observation(known_cells, wall_cell, "free", evidence_scores=evidence)
+        merge_occupancy_observation(known_cells, wall_cell, "free", evidence_scores=evidence)
+
+        self.assertEqual(known_cells[wall_cell], "free")
+
+    def test_occupancy_fusion_promotes_free_cell_to_wall_when_obstacle_observed(self) -> None:
+        wall_cell = GridCell(2, 3)
+        known_cells = {wall_cell: "free"}
+        evidence: dict[GridCell, float] = {}
+
+        merge_occupancy_observation(known_cells, wall_cell, "occupied", evidence_scores=evidence)
+
+        self.assertEqual(known_cells[wall_cell], "occupied")
+
+    def test_active_rgbd_scan_requires_supported_obstacle_hit(self) -> None:
+        noisy_cell = GridCell(2, 3)
+        known_cells: dict[GridCell, str] = {}
+        evidence: dict[GridCell, float] = {}
+
+        merge_occupancy_observation(
+            known_cells,
+            noisy_cell,
+            "occupied",
+            evidence_scores=evidence,
+            config=ACTIVE_RGBD_SCAN_FUSION_CONFIG,
+        )
+        self.assertNotIn(noisy_cell, known_cells)
+
+        merge_occupancy_observation(
+            known_cells,
+            noisy_cell,
+            "occupied",
+            evidence_scores=evidence,
+            config=ACTIVE_RGBD_SCAN_FUSION_CONFIG,
+        )
+        self.assertEqual(known_cells[noisy_cell], "occupied")
+
     def test_parser_accepts_llm_policy_controls(self) -> None:
         args = build_parser().parse_args(
             [
@@ -47,6 +102,8 @@ class SimExplorationBackendTests(unittest.TestCase):
                 "--ros-map-topic",
                 "/map",
                 "--serve-review-ui",
+                "--visited-frontier-filter-radius-m",
+                "0.7",
             ]
         )
         self.assertEqual(args.session, "agentic_session")
@@ -59,6 +116,7 @@ class SimExplorationBackendTests(unittest.TestCase):
         self.assertEqual(args.nav2_controller_id, "FollowPath")
         self.assertEqual(args.ros_map_topic, "/map")
         self.assertTrue(args.serve_review_ui)
+        self.assertEqual(args.visited_frontier_filter_radius_m, 0.7)
 
     def test_runner_builds_real_agentic_map_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -199,14 +257,13 @@ class SimExplorationBackendTests(unittest.TestCase):
         session.options = type("Options", (), {"max_frontiers": 12})()
         session.frontier_memory = FrontierMemory(session.config.occupancy_resolution)
         session.known_cells = {
-            GridCell(0, 0): "free",
-            GridCell(2, 0): "free",
-            GridCell(4, 0): "free",
+            GridCell(x, 0): "free"
+            for x in range(0, 5)
         }
         session.range_edge_cells = set()
         session.guardrail_events = []
         session._current_pose = lambda: Pose2D(0.125, 0.125, 0.0)
-        session._reachable_safe_navigation_cells = lambda _cell: {GridCell(0, 0), GridCell(2, 0), GridCell(4, 0)}
+        session._reachable_safe_navigation_cells = lambda _cell: {GridCell(x, 0) for x in range(0, 5)}
 
         visible = FrontierRecord(
             frontier_id="frontier_visible",
@@ -255,6 +312,132 @@ class SimExplorationBackendTests(unittest.TestCase):
         self.assertEqual([record.frontier_id for record in records], ["frontier_visible", "frontier_remembered"])
         self.assertIsNone(inaccessible.path_cost_m)
 
+    def test_manishkill_reachability_does_not_jump_to_disconnected_safe_island(self) -> None:
+        session = ManiSkillTeleportExplorationSession.__new__(ManiSkillTeleportExplorationSession)
+        session.config = SimExplorationConfig(
+            repo_root="/tmp/XLeRobot",
+            persist_path="",
+            occupancy_resolution=0.25,
+        )
+        session.known_cells = {
+            GridCell(0, 0): "free",
+            GridCell(10, 0): "free",
+            GridCell(11, 0): "free",
+        }
+        safe_island = {GridCell(10, 0), GridCell(11, 0)}
+        session._is_valid_robot_center_cell = lambda cell, **_kwargs: cell in safe_island
+
+        reachable = session._reachable_safe_navigation_cells(GridCell(0, 0))
+
+        self.assertEqual(reachable, set())
+
+    def test_manishkill_candidate_paths_reject_disconnected_known_free_target(self) -> None:
+        session = ManiSkillTeleportExplorationSession.__new__(ManiSkillTeleportExplorationSession)
+        session.config = SimExplorationConfig(
+            repo_root="/tmp/XLeRobot",
+            persist_path="",
+            occupancy_resolution=0.25,
+        )
+        session.options = type("Options", (), {"max_frontiers": 12})()
+        session.frontier_memory = FrontierMemory(session.config.occupancy_resolution)
+        session.known_cells = {
+            GridCell(0, 0): "free",
+            GridCell(2, 0): "free",
+        }
+        session.range_edge_cells = set()
+        session.guardrail_events = []
+        session._current_pose = lambda: Pose2D(0.125, 0.125, 0.0)
+        session._reachable_safe_navigation_cells = lambda _cell: {GridCell(0, 0), GridCell(2, 0)}
+        disconnected = FrontierRecord(
+            frontier_id="frontier_disconnected",
+            nav_pose=GridCell(2, 0).center_pose(session.config.occupancy_resolution),
+            centroid_pose=GridCell(2, 0).center_pose(session.config.occupancy_resolution),
+            status="stored",
+            discovered_step=1,
+            last_seen_step=2,
+            unknown_gain=5,
+            sensor_range_edge=False,
+            room_hint=None,
+            currently_visible=True,
+        )
+        session.frontier_memory.records = {disconnected.frontier_id: disconnected}
+
+        records = session._refresh_candidate_paths()
+
+        self.assertEqual(records, [])
+        self.assertIsNone(disconnected.path_cost_m)
+
+    def test_manishkill_candidate_paths_drop_stored_frontier_when_boundary_is_unreachable(self) -> None:
+        session = ManiSkillTeleportExplorationSession.__new__(ManiSkillTeleportExplorationSession)
+        session.config = SimExplorationConfig(
+            repo_root="/tmp/XLeRobot",
+            persist_path="",
+            occupancy_resolution=0.25,
+        )
+        session.options = type("Options", (), {"max_frontiers": 12})()
+        session.frontier_memory = FrontierMemory(session.config.occupancy_resolution)
+        session.known_cells = {
+            GridCell(0, 0): "free",
+            GridCell(1, 0): "free",
+            GridCell(6, 0): "free",
+        }
+        session.range_edge_cells = set()
+        session.guardrail_events = []
+        session._current_pose = lambda: Pose2D(0.125, 0.125, 0.0)
+        session._reachable_safe_navigation_cells = lambda _cell: {GridCell(0, 0), GridCell(1, 0)}
+        remembered = FrontierRecord(
+            frontier_id="frontier_unreachable_boundary",
+            nav_pose=GridCell(1, 0).center_pose(session.config.occupancy_resolution),
+            centroid_pose=GridCell(6, 0).center_pose(session.config.occupancy_resolution),
+            status="stored",
+            discovered_step=1,
+            last_seen_step=1,
+            unknown_gain=8,
+            sensor_range_edge=False,
+            room_hint=None,
+            currently_visible=False,
+        )
+        session.frontier_memory.records = {remembered.frontier_id: remembered}
+
+        records = session._refresh_candidate_paths()
+
+        self.assertEqual(records, [])
+        self.assertIsNone(remembered.path_cost_m)
+        self.assertTrue(
+            any(
+                event["type"] == "stored_frontier_boundary_unreachable_through_known_free"
+                for event in session.guardrail_events
+            )
+        )
+
+    def test_manishkill_detected_frontier_requires_boundary_reachable_through_known_free(self) -> None:
+        session = ManiSkillTeleportExplorationSession.__new__(ManiSkillTeleportExplorationSession)
+        session.config = SimExplorationConfig(
+            repo_root="/tmp/XLeRobot",
+            persist_path="",
+            occupancy_resolution=0.25,
+        )
+        session.options = type("Options", (), {"max_frontiers": 12})()
+        session.guardrail_events = []
+        session.latest_scan_known_cells = {
+            GridCell(0, 0): "free",
+            GridCell(6, 0): "free",
+            GridCell(7, 0): "free",
+            GridCell(8, 0): "free",
+        }
+        session.latest_scan_range_edge_cells = set()
+        session.known_cells = dict(session.latest_scan_known_cells)
+        session.range_edge_cells = set()
+        session._current_pose = lambda: Pose2D(0.125, 0.125, 0.0)
+        session._reachable_safe_navigation_cells = lambda _cell: {GridCell(0, 0)}
+
+        candidates = session._detect_frontier_candidates()
+
+        self.assertEqual(candidates, [])
+        self.assertTrue(
+            any(event["type"] == "frontier_boundary_unreachable_through_known_free" for event in session.guardrail_events)
+        )
+
     def test_manishkill_candidate_paths_filter_frontier_at_current_pose(self) -> None:
         session = ManiSkillTeleportExplorationSession.__new__(ManiSkillTeleportExplorationSession)
         session.config = SimExplorationConfig(
@@ -264,11 +447,11 @@ class SimExplorationBackendTests(unittest.TestCase):
         )
         session.options = type("Options", (), {"max_frontiers": 12})()
         session.frontier_memory = FrontierMemory(session.config.occupancy_resolution)
-        session.known_cells = {GridCell(0, 0): "free", GridCell(3, 0): "free"}
+        session.known_cells = {GridCell(x, 0): "free" for x in range(0, 4)}
         session.range_edge_cells = set()
         session.guardrail_events = []
         session._current_pose = lambda: Pose2D(0.125, 0.125, 0.0)
-        session._reachable_safe_navigation_cells = lambda _cell: {GridCell(0, 0), GridCell(3, 0)}
+        session._reachable_safe_navigation_cells = lambda _cell: {GridCell(x, 0) for x in range(0, 4)}
 
         current = FrontierRecord(
             frontier_id="frontier_current",
@@ -304,6 +487,241 @@ class SimExplorationBackendTests(unittest.TestCase):
         self.assertEqual([record.frontier_id for record in records], ["frontier_nearby"])
         self.assertIsNone(current.path_cost_m)
         self.assertTrue(any(event["type"] == "frontier_at_current_pose_filtered" for event in session.guardrail_events))
+
+    def test_manishkill_candidate_paths_filter_frontier_near_previous_visit(self) -> None:
+        session = ManiSkillTeleportExplorationSession.__new__(ManiSkillTeleportExplorationSession)
+        session.config = SimExplorationConfig(
+            repo_root="/tmp/XLeRobot",
+            persist_path="",
+            occupancy_resolution=0.25,
+            visited_frontier_filter_radius_m=0.5,
+        )
+        session.options = type("Options", (), {"max_frontiers": 12})()
+        session.frontier_memory = FrontierMemory(session.config.occupancy_resolution)
+        session.known_cells = {GridCell(x, 0): "free" for x in range(0, 6)}
+        session.range_edge_cells = set()
+        session.guardrail_events = []
+        session._current_pose = lambda: Pose2D(0.125, 0.125, 0.0)
+        session._reachable_safe_navigation_cells = lambda _cell: {GridCell(x, 0) for x in range(0, 6)}
+        session.trajectory = [
+            GridCell(4, 0).center_pose(session.config.occupancy_resolution).to_dict(),
+            GridCell(0, 0).center_pose(session.config.occupancy_resolution).to_dict(),
+        ]
+
+        revisited_area = FrontierRecord(
+            frontier_id="frontier_revisited_area",
+            nav_pose=GridCell(4, 0).center_pose(session.config.occupancy_resolution),
+            centroid_pose=GridCell(4, 0).center_pose(session.config.occupancy_resolution),
+            status="stored",
+            discovered_step=1,
+            last_seen_step=2,
+            unknown_gain=8,
+            sensor_range_edge=False,
+            room_hint=None,
+            currently_visible=True,
+        )
+        session.frontier_memory.records = {revisited_area.frontier_id: revisited_area}
+
+        records = session._refresh_candidate_paths()
+
+        self.assertEqual(records, [])
+        self.assertEqual(revisited_area.status, "suppressed")
+        self.assertIsNone(revisited_area.path_cost_m)
+        self.assertTrue(any(event["type"] == "frontier_near_visited_pose_filtered" for event in session.guardrail_events))
+
+    def test_manishkill_current_pose_filter_uses_boundary_not_approach_pose(self) -> None:
+        session = ManiSkillTeleportExplorationSession.__new__(ManiSkillTeleportExplorationSession)
+        session.config = SimExplorationConfig(
+            repo_root="/tmp/XLeRobot",
+            persist_path="",
+            occupancy_resolution=0.25,
+        )
+        session.options = type("Options", (), {"max_frontiers": 12})()
+        session.frontier_memory = FrontierMemory(session.config.occupancy_resolution)
+        session.known_cells = {GridCell(x, 0): "free" for x in range(0, 5)}
+        session.range_edge_cells = set()
+        session.guardrail_events = []
+        session._current_pose = lambda: Pose2D(0.125, 0.125, 0.0)
+        session._reachable_safe_navigation_cells = lambda _cell: {GridCell(x, 0) for x in range(0, 5)}
+
+        same_approach_far_boundary = FrontierRecord(
+            frontier_id="frontier_far_boundary",
+            nav_pose=GridCell(0, 0).center_pose(session.config.occupancy_resolution),
+            centroid_pose=GridCell(4, 0).center_pose(session.config.occupancy_resolution),
+            status="stored",
+            discovered_step=1,
+            last_seen_step=2,
+            unknown_gain=6,
+            sensor_range_edge=False,
+            room_hint=None,
+            currently_visible=True,
+        )
+        session.frontier_memory.records = {
+            same_approach_far_boundary.frontier_id: same_approach_far_boundary,
+        }
+
+        records = session._refresh_candidate_paths()
+
+        self.assertEqual([record.frontier_id for record in records], ["frontier_far_boundary"])
+        self.assertEqual(same_approach_far_boundary.path_cost_m, 0.0)
+        self.assertFalse(any(event["type"] == "frontier_at_current_pose_filtered" for event in session.guardrail_events))
+
+    def test_frontier_record_exposes_free_space_path_distance_alias(self) -> None:
+        record = FrontierRecord(
+            frontier_id="frontier_distance",
+            nav_pose=Pose2D(1.0, 0.0, 0.0),
+            centroid_pose=Pose2D(1.5, 0.0, 0.0),
+            status="stored",
+            discovered_step=1,
+            last_seen_step=1,
+            unknown_gain=3,
+            sensor_range_edge=False,
+            room_hint=None,
+            path_cost_m=1.2349,
+        )
+
+        payload = record.to_dict()
+
+        self.assertEqual(payload["path_cost_m"], 1.235)
+        self.assertEqual(payload["free_space_path_distance_m"], 1.235)
+
+    def test_mock_policy_prioritizes_nearby_useful_frontier_over_far_high_gain(self) -> None:
+        policy = ExplorationLLMPolicy(
+            SimExplorationConfig(
+                repo_root="/tmp/XLeRobot",
+                persist_path="",
+                explorer_policy="llm",
+                llm_provider="mock",
+                llm_model="mock",
+            )
+        )
+        near = FrontierRecord(
+            frontier_id="frontier_near",
+            nav_pose=Pose2D(1.0, 0.0, 0.0),
+            centroid_pose=Pose2D(1.5, 0.0, 0.0),
+            status="stored",
+            discovered_step=1,
+            last_seen_step=1,
+            unknown_gain=16,
+            sensor_range_edge=False,
+            room_hint=None,
+            currently_visible=True,
+            path_cost_m=2.75,
+        )
+        far = FrontierRecord(
+            frontier_id="frontier_far",
+            nav_pose=Pose2D(8.0, 0.0, 0.0),
+            centroid_pose=Pose2D(8.5, 0.0, 0.0),
+            status="stored",
+            discovered_step=1,
+            last_seen_step=1,
+            unknown_gain=20,
+            sensor_range_edge=False,
+            room_hint=None,
+            currently_visible=True,
+            path_cost_m=8.75,
+        )
+
+        decision = policy._heuristic_decision(
+            [far, near],
+            return_waypoints=[],
+            coverage=0.2,
+            current_room_id=None,
+        )
+
+        self.assertEqual(decision.selected_frontier_id, "frontier_near")
+        self.assertIn("nearest useful reachable frontier", decision.reasoning_summary)
+
+    def test_manishkill_close_enough_frontier_completion_uses_boundary_pose(self) -> None:
+        session = ManiSkillTeleportExplorationSession.__new__(ManiSkillTeleportExplorationSession)
+        session.config = SimExplorationConfig(
+            repo_root="/tmp/XLeRobot",
+            persist_path="",
+            occupancy_resolution=0.25,
+            robot_radius_m=0.22,
+        )
+        near = FrontierRecord(
+            frontier_id="frontier_near",
+            nav_pose=Pose2D(0.0, 0.0, 0.0),
+            centroid_pose=Pose2D(1.0, 0.0, 0.0),
+            status="active",
+            discovered_step=1,
+            last_seen_step=1,
+            unknown_gain=3,
+            sensor_range_edge=False,
+            room_hint=None,
+        )
+        far = FrontierRecord(
+            frontier_id="frontier_far",
+            nav_pose=Pose2D(0.0, 0.0, 0.0),
+            centroid_pose=Pose2D(2.5, 0.0, 0.0),
+            status="active",
+            discovered_step=1,
+            last_seen_step=1,
+            unknown_gain=3,
+            sensor_range_edge=False,
+            room_hint=None,
+        )
+
+        self.assertTrue(session._is_close_enough_to_complete_frontier(Pose2D(0.0, 0.0, 0.0), near))
+        self.assertFalse(session._is_close_enough_to_complete_frontier(Pose2D(0.0, 0.0, 0.0), far))
+
+    def test_nav2_unreachable_frontier_is_marked_visited_to_avoid_retries(self) -> None:
+        memory = FrontierMemory(0.25)
+        record = FrontierRecord(
+            frontier_id="frontier_blocked",
+            nav_pose=Pose2D(1.0, 0.0, 0.0),
+            centroid_pose=Pose2D(1.5, 0.0, 0.0),
+            status="stored",
+            discovered_step=1,
+            last_seen_step=1,
+            unknown_gain=3,
+            sensor_range_edge=False,
+            room_hint=None,
+        )
+        memory.records = {record.frontier_id: record}
+        memory.active_frontier_id = record.frontier_id
+
+        completed = _mark_frontier_unreachable_as_visited(memory, record.frontier_id, "Nav2 could not plan a path")
+
+        self.assertIs(completed, record)
+        self.assertEqual(record.status, "completed")
+        self.assertEqual(record.visit_count, 1)
+        self.assertIsNone(memory.active_frontier_id)
+        self.assertTrue(any("Nav2 could not plan a path" in evidence for evidence in record.evidence))
+
+    def test_frontier_memory_matches_candidates_by_boundary_not_approach_pose(self) -> None:
+        memory = FrontierMemory(0.25)
+        existing = FrontierRecord(
+            frontier_id="frontier_existing",
+            nav_pose=Pose2D(0.0, 0.0, 0.0),
+            centroid_pose=Pose2D(5.0, 0.0, 0.0),
+            status="stored",
+            discovered_step=1,
+            last_seen_step=1,
+            unknown_gain=2,
+            sensor_range_edge=False,
+            room_hint=None,
+        )
+        memory.records = {existing.frontier_id: existing}
+
+        candidate = FrontierCandidate(
+            frontier_id=None,
+            member_cells=(GridCell(0, 0),),
+            nav_cell=GridCell(0, 0),
+            centroid_cell=GridCell(32, 0),
+            nav_pose=Pose2D(0.0, 0.0, 0.0),
+            centroid_pose=Pose2D(8.0, 0.0, 0.0),
+            unknown_gain=4,
+            sensor_range_edge=False,
+            room_hint=None,
+            evidence=["same approach pose but different original frontier boundary"],
+        )
+
+        memory.upsert_candidates([candidate], step_index=2)
+
+        self.assertEqual(len(memory.records), 2)
+        self.assertEqual(memory.records["frontier_existing"].centroid_pose.x, 5.0)
 
     def test_manishkill_candidate_paths_do_not_expose_stored_memory_that_is_not_global_frontier(self) -> None:
         session = ManiSkillTeleportExplorationSession.__new__(ManiSkillTeleportExplorationSession)
@@ -355,13 +773,17 @@ class SimExplorationBackendTests(unittest.TestCase):
         session.frontier_memory = FrontierMemory(session.config.occupancy_resolution)
         session.known_cells = {
             GridCell(0, 0): "free",
+            GridCell(1, 0): "free",
             GridCell(2, 0): "free",
+            GridCell(3, 0): "free",
+            GridCell(4, 0): "free",
+            GridCell(5, 0): "free",
             GridCell(6, 0): "free",
         }
         session.range_edge_cells = set()
         session.guardrail_events = []
         session._current_pose = lambda: Pose2D(0.125, 0.125, 0.0)
-        session._reachable_safe_navigation_cells = lambda _cell: {GridCell(0, 0), GridCell(2, 0)}
+        session._reachable_safe_navigation_cells = lambda _cell: {GridCell(0, 0), GridCell(1, 0), GridCell(2, 0)}
         remembered = FrontierRecord(
             frontier_id="frontier_remembered",
             nav_pose=GridCell(10, 0).center_pose(session.config.occupancy_resolution),
@@ -380,7 +802,7 @@ class SimExplorationBackendTests(unittest.TestCase):
 
         self.assertEqual([record.frontier_id for record in records], ["frontier_remembered"])
         self.assertEqual(session._world_to_cell(remembered.nav_pose.x, remembered.nav_pose.y), GridCell(2, 0))
-        self.assertEqual(session._world_to_cell(remembered.centroid_pose.x, remembered.centroid_pose.y), GridCell(6, 0))
+        self.assertEqual(session._world_to_cell(remembered.centroid_pose.x, remembered.centroid_pose.y), GridCell(5, 0))
         self.assertIsNotNone(remembered.path_cost_m)
         self.assertTrue(
             any(event["type"] == "stored_frontier_revisit_pose_resnapped" for event in session.guardrail_events)
@@ -397,8 +819,13 @@ class SimExplorationBackendTests(unittest.TestCase):
         session.frontier_memory = FrontierMemory(session.config.occupancy_resolution)
         session.known_cells = {
             GridCell(0, 0): "free",
+            GridCell(1, 0): "free",
+            GridCell(2, 0): "free",
             GridCell(3, 0): "free",
-            GridCell(2, 0): "occupied",
+            GridCell(1, -1): "occupied",
+            GridCell(1, 1): "occupied",
+            GridCell(2, -1): "occupied",
+            GridCell(2, 1): "occupied",
             GridCell(4, 0): "occupied",
             GridCell(3, -1): "occupied",
             GridCell(6, 0): "free",
@@ -409,7 +836,12 @@ class SimExplorationBackendTests(unittest.TestCase):
         session.range_edge_cells = set()
         session.guardrail_events = []
         session._current_pose = lambda: Pose2D(0.125, 0.125, 0.0)
-        session._reachable_safe_navigation_cells = lambda _cell: {GridCell(3, 0)}
+        session._reachable_safe_navigation_cells = lambda _cell: {
+            GridCell(0, 0),
+            GridCell(1, 0),
+            GridCell(2, 0),
+            GridCell(3, 0),
+        }
         remembered = FrontierRecord(
             frontier_id="frontier_relaxed",
             nav_pose=GridCell(10, 0).center_pose(session.config.occupancy_resolution),
@@ -440,6 +872,11 @@ class SimExplorationBackendTests(unittest.TestCase):
         session.frontier_memory = FrontierMemory(session.config.occupancy_resolution)
         session.known_cells = {
             GridCell(0, 0): "free",
+            GridCell(1, 0): "free",
+            GridCell(2, 0): "free",
+            GridCell(3, 0): "free",
+            GridCell(4, 0): "free",
+            GridCell(5, 0): "free",
             GridCell(6, 0): "free",
         }
         session.range_edge_cells = set()
@@ -467,7 +904,7 @@ class SimExplorationBackendTests(unittest.TestCase):
             any(event["type"] == "stored_frontier_without_reachable_revisit_pose" for event in session.guardrail_events)
         )
 
-    def test_manishkill_detects_single_edge_frontier_when_robot_sized_approach_exists(self) -> None:
+    def test_manishkill_rejects_single_cell_frontier_as_too_narrow_for_robot(self) -> None:
         session = ManiSkillTeleportExplorationSession.__new__(ManiSkillTeleportExplorationSession)
         session.config = SimExplorationConfig(
             repo_root="/tmp/XLeRobot",
@@ -491,9 +928,34 @@ class SimExplorationBackendTests(unittest.TestCase):
 
         candidates = session._detect_frontier_candidates()
 
+        self.assertEqual(candidates, [])
+        self.assertTrue(any(event["type"] == "frontier_opening_too_narrow" for event in session.guardrail_events))
+
+    def test_manishkill_detects_robot_sized_frontier_opening(self) -> None:
+        session = ManiSkillTeleportExplorationSession.__new__(ManiSkillTeleportExplorationSession)
+        session.config = SimExplorationConfig(
+            repo_root="/tmp/XLeRobot",
+            persist_path="",
+            occupancy_resolution=0.25,
+        )
+        session.options = type("Options", (), {"max_frontiers": 12})()
+        session.guardrail_events = []
+        session.latest_scan_known_cells = {
+            GridCell(0, 0): "free",
+            GridCell(1, 0): "free",
+            GridCell(2, 0): "free",
+        }
+        session.latest_scan_range_edge_cells = set()
+        session.known_cells = dict(session.latest_scan_known_cells)
+        session.range_edge_cells = set()
+        session._current_pose = lambda: Pose2D(0.125, 0.125, 0.0)
+        session._reachable_safe_navigation_cells = lambda _cell: {GridCell(0, 0), GridCell(1, 0)}
+        session._select_frontier_approach_cell = lambda **_kwargs: GridCell(0, 0)
+
+        candidates = session._detect_frontier_candidates()
+
         self.assertEqual(len(candidates), 1)
-        self.assertEqual(candidates[0].unknown_gain, 1)
-        self.assertTrue(any("single unknown-facing edge" in evidence for evidence in candidates[0].evidence))
+        self.assertTrue(any("frontier opening width" in evidence for evidence in candidates[0].evidence))
 
     def test_manishkill_finish_guardrail_falls_back_to_reachable_stored_frontier(self) -> None:
         session = ManiSkillTeleportExplorationSession.__new__(ManiSkillTeleportExplorationSession)
@@ -584,9 +1046,14 @@ class SimExplorationBackendTests(unittest.TestCase):
         )
         session.options = type("Options", (), {"max_frontiers": 12})()
         session.guardrail_events = []
-        session.latest_scan_known_cells = {GridCell(0, 0): "free"}
+        session.latest_scan_known_cells = {
+            GridCell(0, 0): "free",
+            GridCell(1, 0): "free",
+            GridCell(2, 0): "free",
+            GridCell(3, 0): "free",
+        }
         session.latest_scan_range_edge_cells = set()
-        session.known_cells = {GridCell(0, 0): "free"}
+        session.known_cells = dict(session.latest_scan_known_cells)
         session._current_pose = lambda: Pose2D(0.125, 0.125, 0.0)
         session._reachable_safe_navigation_cells = lambda _cell: {GridCell(0, 0)}
         session._select_frontier_approach_cell = lambda **_kwargs: GridCell(0, 0)
@@ -594,10 +1061,33 @@ class SimExplorationBackendTests(unittest.TestCase):
         candidates = session._detect_frontier_candidates()
 
         self.assertEqual(len(candidates), 1)
-        self.assertEqual(candidates[0].unknown_gain, 4)
+        self.assertEqual(candidates[0].unknown_gain, 10)
         self.assertTrue(
             any("passed merged-map validation" in evidence for evidence in candidates[0].evidence)
         )
+
+    def test_manishkill_scan_merge_preserves_previous_wall_cells(self) -> None:
+        session = ManiSkillTeleportExplorationSession.__new__(ManiSkillTeleportExplorationSession)
+        session.known_cells = {
+            GridCell(1, 1): "occupied",
+            GridCell(2, 1): "free",
+        }
+        session.occupancy_evidence = {
+            GridCell(1, 1): 2.0,
+            GridCell(2, 1): -1.0,
+        }
+        session.latest_scan_known_cells = {
+            GridCell(1, 1): "free",
+            GridCell(3, 1): "free",
+        }
+        session.range_edge_cells = set()
+        session.latest_scan_range_edge_cells = set()
+
+        session._merge_latest_scan_into_global()
+
+        self.assertEqual(session.known_cells[GridCell(1, 1)], "occupied")
+        self.assertEqual(session.known_cells[GridCell(2, 1)], "free")
+        self.assertEqual(session.known_cells[GridCell(3, 1)], "free")
 
     def test_navigation_map_data_url_renders_selectable_and_memory_frontiers(self) -> None:
         current = FrontierRecord(
@@ -649,6 +1139,8 @@ class SimExplorationBackendTests(unittest.TestCase):
                 "front_only",
                 "--scan-yaw-samples",
                 "1",
+                "--visited-frontier-filter-radius-m",
+                "0.8",
             ]
         )
 
@@ -656,6 +1148,7 @@ class SimExplorationBackendTests(unittest.TestCase):
         self.assertEqual(args.spawn_facing, "left")
         self.assertEqual(args.scan_mode, "front_only")
         self.assertEqual(args.scan_yaw_samples, 1)
+        self.assertEqual(args.visited_frontier_filter_radius_m, 0.8)
 
     def test_resolve_manishkill_start_pose_rotates_default_spawn_in_place(self) -> None:
         pose = _resolve_manishkill_start_pose(

@@ -14,12 +14,14 @@ from xlerobot_playground.launcher import default_sim_python_bin, exec_python_mod
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Run live XLeRobot exploration in the ManiSkill simulator, save the map, "
-            "and optionally launch the post-run review UI."
+            "Run the XLeRobot exploration playground in either teleport-debug mode or "
+            "the live Nav2-shaped runtime with the review UI."
         )
     )
     parser.add_argument("--repo-root", default=None)
     parser.add_argument("--sim-python-bin", default=None)
+    parser.add_argument("--movement-mode", choices=("teleport", "simulated", "ros"), default=None)
+    parser.add_argument("--ui-flavor", choices=("user", "developer"), default="user")
     parser.add_argument("--persist-path", default="./artifacts/xlerobot_exploration_map.json")
     parser.add_argument("--area", default="workspace")
     parser.add_argument("--session", default="house_v1")
@@ -49,9 +51,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--llm-reasoning-effort", default=None)
     parser.add_argument("--trace-policy-stdout", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--trace-llm-stdout", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--serve-review-ui", action="store_true")
+    parser.add_argument("--serve-review-ui", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--review-host", default="127.0.0.1")
     parser.add_argument("--review-port", type=int, default=8770)
+    parser.add_argument("--open-browser", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--display-yaw-offset-deg", type=float, default=None)
+    parser.add_argument("--build-config-idx", type=int, default=None)
+    parser.add_argument("--spawn-x", type=float, default=None)
+    parser.add_argument("--spawn-y", type=float, default=None)
+    parser.add_argument("--spawn-yaw", type=float, default=0.0)
+    parser.add_argument("--spawn-facing", choices=("front", "left", "right", "back"), default="front")
+    parser.add_argument("--scan-mode", choices=("turnaround", "front_only"), default="turnaround")
+    parser.add_argument("--scan-yaw-samples", type=int, default=12)
+    parser.add_argument("--depth-beam-stride", type=int, default=2)
+    parser.add_argument("--teleport-z", type=float, default=None)
+    parser.add_argument("--teleport-settle-steps", type=int, default=1)
+    parser.add_argument("--max-frontiers", type=int, default=12)
     parser.add_argument("--sensor-range-m", type=float, default=10.0)
     parser.add_argument("--finish-coverage-threshold", type=float, default=0.96)
     parser.add_argument("--max-decisions", type=int, default=32)
@@ -80,6 +95,97 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     repo_root = resolve_repo_root(args.repo_root)
     python_bin = args.sim_python_bin or default_sim_python_bin(REPO_ROOT)
+    movement_mode = args.movement_mode or args.nav2_mode
+    if movement_mode == "teleport":
+        interactive_args = [
+            "--backend",
+            "maniskill",
+            "--repo-root",
+            str(repo_root),
+            "--session",
+            args.session,
+            "--area",
+            args.area,
+            "--source",
+            args.source,
+            "--env-id",
+            args.env_id,
+            "--robot-uid",
+            args.robot_uid,
+            "--control-mode",
+            args.control_mode,
+            "--render-mode",
+            args.render_mode,
+            "--shader",
+            args.shader,
+            "--sim-backend",
+            args.sim_backend,
+            "--num-envs",
+            str(args.num_envs),
+            "--spawn-yaw",
+            str(args.spawn_yaw),
+            "--spawn-facing",
+            args.spawn_facing,
+            "--scan-mode",
+            args.scan_mode,
+            "--scan-yaw-samples",
+            str(args.scan_yaw_samples),
+            "--depth-beam-stride",
+            str(args.depth_beam_stride),
+            "--teleport-settle-steps",
+            str(args.teleport_settle_steps),
+            "--max-frontiers",
+            str(args.max_frontiers),
+            "--occupancy-resolution",
+            str(args.occupancy_resolution),
+            "--sensor-range-m",
+            str(args.sensor_range_m),
+            "--finish-coverage-threshold",
+            str(args.finish_coverage_threshold),
+            "--max-decisions",
+            str(args.max_decisions),
+            "--explorer-policy",
+            args.explorer_policy,
+            "--llm-provider",
+            args.llm_provider,
+            "--llm-model",
+            args.llm_model,
+            "--llm-temperature",
+            str(args.llm_temperature),
+            "--llm-max-tokens",
+            str(args.llm_max_tokens),
+            "--host",
+            args.review_host,
+            "--port",
+            str(args.review_port),
+            f"--{'open-browser' if args.open_browser else 'no-open-browser'}",
+            "--ui-flavor",
+            args.ui_flavor,
+        ]
+        if args.display_yaw_offset_deg is not None:
+            interactive_args.extend(["--display-yaw-offset-deg", str(args.display_yaw_offset_deg)])
+        if args.build_config_idx is not None:
+            interactive_args.extend(["--build-config-idx", str(args.build_config_idx)])
+        if args.spawn_x is not None:
+            interactive_args.extend(["--spawn-x", str(args.spawn_x)])
+        if args.spawn_y is not None:
+            interactive_args.extend(["--spawn-y", str(args.spawn_y)])
+        if args.teleport_z is not None:
+            interactive_args.extend(["--teleport-z", str(args.teleport_z)])
+        if args.llm_base_url:
+            interactive_args.extend(["--llm-base-url", args.llm_base_url])
+        if args.llm_api_key:
+            interactive_args.extend(["--llm-api-key", args.llm_api_key])
+        if args.llm_reasoning_effort:
+            interactive_args.extend(["--llm-reasoning-effort", args.llm_reasoning_effort])
+        if args.force_reload:
+            interactive_args.append("--force-reload")
+        return exec_python_module(
+            "xlerobot_playground.interactive_exploration_playground",
+            python_bin=python_bin,
+            argv=interactive_args,
+            cwd=REPO_ROOT,
+        )
     backend_args = [
         "--repo-root",
         str(repo_root),
@@ -144,7 +250,7 @@ def main(argv: list[str] | None = None) -> int:
         "--max-decisions",
         str(args.max_decisions),
         "--nav2-mode",
-        args.nav2_mode,
+        movement_mode,
         "--nav2-planner-id",
         args.nav2_planner_id,
         "--nav2-controller-id",
@@ -155,6 +261,9 @@ def main(argv: list[str] | None = None) -> int:
         args.review_host,
         "--review-port",
         str(args.review_port),
+        "--review-ui-flavor",
+        args.ui_flavor,
+        f"--{'open-browser' if args.open_browser else 'no-open-browser'}",
         "--ros-map-topic",
         args.ros_map_topic,
         "--ros-scan-topic",

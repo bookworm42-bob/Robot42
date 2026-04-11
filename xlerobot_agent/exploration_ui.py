@@ -51,6 +51,15 @@ class ExplorationUIController(Protocol):
     def approve_map(self) -> dict[str, Any] | None:
         ...
 
+    def update_occupancy_edits(
+        self,
+        *,
+        task_id: str | None = None,
+        mode: str,
+        cells: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        ...
+
 
 class LocalExplorationUIController:
     def __init__(self, backend: ExplorationBackend) -> None:
@@ -100,6 +109,15 @@ class LocalExplorationUIController:
 
     def approve_map(self) -> dict[str, Any] | None:
         return self.backend.approve_current_map()
+
+    def update_occupancy_edits(
+        self,
+        *,
+        task_id: str | None = None,
+        mode: str,
+        cells: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        return self.backend.update_occupancy_edits(task_id=task_id, mode=mode, cells=cells)
 
 
 class RemoteExplorationUIController:
@@ -151,6 +169,15 @@ class RemoteExplorationUIController:
 
     def approve_map(self) -> dict[str, Any] | None:
         return self.client.approve_mapping_map()
+
+    def update_occupancy_edits(
+        self,
+        *,
+        task_id: str | None = None,
+        mode: str,
+        cells: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        raise NotImplementedError("Remote occupancy editing is not implemented yet.")
 
 
 HTML_PAGE = """<!doctype html>
@@ -211,6 +238,13 @@ HTML_PAGE = """<!doctype html>
       gap: 18px;
       align-items: start;
     }
+    .grid > * {
+      min-width: 0;
+      position: relative;
+    }
+    .left-column { z-index: 3; }
+    .center-column { z-index: 2; }
+    .right-column { z-index: 3; }
     .panel {
       background: var(--panel);
       backdrop-filter: blur(16px);
@@ -345,23 +379,25 @@ HTML_PAGE = """<!doctype html>
     </section>
 
     <div class="grid">
-      <div class="stack">
+      <div class="stack left-column">
         <section class="panel" __CONTROL_PANEL_ATTR__>
           <div class="eyebrow">Control</div>
-          <label for="area">Area</label>
-          <input id="area" value="downstairs" />
-          <label for="session">Session</label>
-          <input id="session" value="house_v1" />
-          <div class="button-row" style="margin-top:10px;">
+          <div __TASK_LAUNCH_ATTR__>
+            <label for="area">Area</label>
+            <input id="area" value="downstairs" />
+            <label for="session">Session</label>
+            <input id="session" value="house_v1" />
+          </div>
+          <div class="button-row" style="margin-top:10px;" __TASK_LAUNCH_ATTR__>
             <button class="primary" id="start-explore">Start Explore</button>
             <button class="secondary" id="start-map">Create Map</button>
           </div>
-          <div class="button-row" style="margin-top:10px;">
+          <div class="button-row" style="margin-top:10px;" __TASK_STATE_ATTR__>
             <button class="secondary" id="pause-task">Pause</button>
             <button class="secondary" id="resume-task">Resume</button>
             <button class="danger" id="cancel-task">Cancel</button>
           </div>
-          <div class="button-row" style="margin-top:10px;">
+          <div class="button-row" style="margin-top:10px;" __APPROVE_ATTR__>
             <button class="primary" id="approve-map">Approve Map</button>
           </div>
         </section>
@@ -372,12 +408,28 @@ HTML_PAGE = """<!doctype html>
         </section>
 
         <section class="panel">
+          <div class="eyebrow">Exploration</div>
+          <div id="decision-summary" class="muted">No exploration decision yet.</div>
+          <div id="frontier-list" class="list" style="margin-top:12px; max-height:220px;"></div>
+        </section>
+
+        <section class="panel">
+          <div class="eyebrow">Map Editing</div>
+          <div class="button-row" style="margin-top:10px;">
+            <button class="secondary" id="edit-block">Draw Wall</button>
+            <button class="secondary" id="edit-clear">Erase Wall</button>
+            <button class="secondary" id="edit-reset">Reset Cell</button>
+          </div>
+          <div id="edit-mode-summary" class="muted" style="margin-top:10px;">Click or drag on the map to add or remove occupancy overrides.</div>
+        </section>
+
+        <section class="panel">
           <div class="eyebrow">Regions</div>
           <div id="region-list" class="list"></div>
         </section>
       </div>
 
-      <section class="panel map-shell">
+      <section class="panel map-shell center-column">
         <div class="eyebrow">Map</div>
         <svg id="map-canvas" viewBox="0 0 1000 700"></svg>
         <div class="legend">
@@ -387,8 +439,8 @@ HTML_PAGE = """<!doctype html>
         </div>
       </section>
 
-      <div class="stack">
-        <section class="panel">
+      <div class="stack right-column">
+        <section class="panel" __DEVELOPER_PANEL_ATTR__>
           <div class="eyebrow">Selected Region</div>
           <div id="selected-summary" class="muted">Select a region from the map or list.</div>
           <label for="region-label">Label</label>
@@ -403,7 +455,7 @@ HTML_PAGE = """<!doctype html>
           </div>
         </section>
 
-        <section class="panel">
+        <section class="panel" __DEVELOPER_PANEL_ATTR__>
           <div class="eyebrow">Merge Regions</div>
           <label for="merge-ids">Region IDs JSON</label>
           <textarea id="merge-ids">[]</textarea>
@@ -414,7 +466,7 @@ HTML_PAGE = """<!doctype html>
           </div>
         </section>
 
-        <section class="panel">
+        <section class="panel" __DEVELOPER_PANEL_ATTR__>
           <div class="eyebrow">Named Place</div>
           <label for="place-name">Name</label>
           <input id="place-name" placeholder="kitchen_entry" />
@@ -429,6 +481,11 @@ HTML_PAGE = """<!doctype html>
           <div class="eyebrow">Keyframes</div>
           <div id="keyframes" class="thumbs"></div>
         </section>
+
+        <section class="panel" __DEVELOPER_PANEL_ATTR__>
+          <div class="eyebrow">Guardrails</div>
+          <div id="guardrail-list" class="list"></div>
+        </section>
       </div>
     </div>
   </div>
@@ -436,6 +493,13 @@ HTML_PAGE = """<!doctype html>
   <script>
     let selectedRegionId = null;
     let currentState = null;
+    let mapEditMode = 'block';
+    let currentMapBounds = null;
+    let isPaintingMap = false;
+    let pendingPaintCells = new Map();
+    let paintFlushTimer = null;
+    let lastPaintedCellKey = null;
+    let currentOccupancyCellStates = new Map();
 
     async function postJson(url, payload) {
       const response = await fetch(url, {
@@ -486,6 +550,71 @@ HTML_PAGE = """<!doctype html>
       };
     }
 
+    function svgPointFromClient(svg, clientX, clientY) {
+      const point = svg.createSVGPoint();
+      point.x = clientX;
+      point.y = clientY;
+      const matrix = svg.getScreenCTM();
+      if (!matrix) return {x: 0, y: 0};
+      return point.matrixTransform(matrix.inverse());
+    }
+
+    function worldFromSvgViewPoint(bounds, svgX, svgY) {
+      const pad = 36;
+      const width = Math.max(bounds.max_x - bounds.min_x, 1);
+      const height = Math.max(bounds.max_y - bounds.min_y, 1);
+      const normalizedX = Math.min(Math.max((svgX - pad) / Math.max(1000 - pad * 2, 1), 0), 1);
+      const normalizedY = Math.min(Math.max((svgY - pad) / Math.max(700 - pad * 2, 1), 0), 1);
+      return {
+        x: bounds.min_x + normalizedX * width,
+        y: bounds.max_y - normalizedY * height,
+      };
+    }
+
+    function cellFromMapEvent(map, event) {
+      const svg = document.getElementById('map-canvas');
+      const bounds = currentMapBounds || mapBounds(map);
+      const point = svgPointFromClient(svg, event.clientX, event.clientY);
+      const world = worldFromSvgViewPoint(bounds, point.x, point.y);
+      const resolution = map.occupancy?.resolution || 0.5;
+      const cell = {
+        cell_x: Math.floor(world.x / resolution),
+        cell_y: Math.floor(world.y / resolution),
+      };
+      cell.key = `${cell.cell_x}:${cell.cell_y}`;
+      return cell;
+    }
+
+    function shouldPaintCell(cell) {
+      if (mapEditMode !== 'clear') return true;
+      const state = currentOccupancyCellStates.get(cell.key);
+      return !!state && (state.state === 'occupied' || state.manual_override === 'blocked');
+    }
+
+    function enqueuePaintCell(cell) {
+      if (!shouldPaintCell(cell)) return;
+      pendingPaintCells.set(cell.key, {cell_x: cell.cell_x, cell_y: cell.cell_y});
+      if (!paintFlushTimer) {
+        paintFlushTimer = setTimeout(flushPaintCells, 80);
+      }
+    }
+
+    async function flushPaintCells() {
+      if (paintFlushTimer) {
+        clearTimeout(paintFlushTimer);
+        paintFlushTimer = null;
+      }
+      const cells = Array.from(pendingPaintCells.values());
+      pendingPaintCells.clear();
+      if (!cells.length) return;
+      await postJson('/api/map/edit', {
+        task_id: currentState?.active_task?.task_id || null,
+        mode: mapEditMode,
+        cells,
+      });
+      await refresh();
+    }
+
     function renderMeta(state) {
       const task = state.active_task;
       const map = state.current_map;
@@ -523,6 +652,42 @@ HTML_PAGE = """<!doctype html>
       }
     }
 
+    function renderExploration(state) {
+      const map = state.current_map || {};
+      const frontiers = map.frontiers || [];
+      const lastDecision = ((map.artifacts || {}).decision_log || []).slice(-1)[0];
+      const frontierMemory = ((map.artifacts || {}).frontier_memory || {});
+      const summary = document.getElementById('decision-summary');
+      if (!lastDecision) {
+        summary.textContent = 'No exploration decision yet.';
+      } else {
+        const decision = lastDecision.decision || {};
+        summary.textContent = `${decision.decision_type || 'unknown'} · ${decision.selected_frontier_id || 'no frontier'} · coverage ${lastDecision.coverage ?? 'n/a'}`;
+      }
+      document.getElementById('frontier-list').innerHTML = frontiers.map((frontier) => `
+        <div class="list-card ${frontier.status === 'active' ? 'active' : ''}">
+          <strong>${escapeHtml(frontier.frontier_id || 'frontier')}</strong><br/>
+          <span class="muted">${escapeHtml(frontier.status || 'unknown')} · gain ${escapeHtml(String(frontier.unknown_gain ?? 'n/a'))} · path ${escapeHtml(String(frontier.path_cost_m ?? 'n/a'))}</span>
+        </div>
+      `).join('') || '<div class="muted">No frontiers available.</div>';
+      const edits = ((map.artifacts || {}).manual_occupancy_edits || {});
+      const blocked = (edits.blocked_cells || []).length;
+      const cleared = (edits.cleared_cells || []).length;
+      const activeFrontierId = frontierMemory.active_frontier_id || 'none';
+      const verb = mapEditMode === 'block' ? 'draw occupied wall cells' : mapEditMode === 'clear' ? 'erase wall cells into free space' : 'remove manual overrides';
+      document.getElementById('edit-mode-summary').textContent = `Edit mode: ${mapEditMode} (${verb}). Active frontier: ${activeFrontierId}. Manual walls ${blocked}, manual clears ${cleared}. Click or drag on the map to edit cells.`;
+      const guardrails = ((map.artifacts || {}).guardrail_events || []).slice(-12).reverse();
+      const guardrailElement = document.getElementById('guardrail-list');
+      if (guardrailElement) {
+        guardrailElement.innerHTML = guardrails.map((event) => `
+          <div class="list-card">
+            <strong>${escapeHtml(event.type || 'event')}</strong><br/>
+            <span class="muted">${escapeHtml(JSON.stringify(event))}</span>
+          </div>
+        `).join('') || '<div class="muted">No guardrail events.</div>';
+      }
+    }
+
     function renderMap(state) {
       const svg = document.getElementById('map-canvas');
       const map = state.current_map;
@@ -531,15 +696,28 @@ HTML_PAGE = """<!doctype html>
         return;
       }
       const bounds = mapBounds(map);
+      currentMapBounds = bounds;
       const project = makeProjector(bounds);
+      currentOccupancyCellStates = new Map();
       const occupancy = (map.occupancy?.cells || []).map((cell) => {
+        const resolution = map.occupancy.resolution || 0.5;
+        const cellX = Math.floor(cell.x / resolution);
+        const cellY = Math.floor(cell.y / resolution);
+        currentOccupancyCellStates.set(`${cellX}:${cellY}`, {
+          state: cell.state,
+          manual_override: cell.manual_override || null,
+        });
         const p = project({x: cell.x, y: cell.y});
-        const p2 = project({x: cell.x + (map.occupancy.resolution || 0.5), y: cell.y + (map.occupancy.resolution || 0.5)});
-        const fill = cell.state === 'occupied'
-          ? 'rgba(15,23,42,0.55)'
-          : cell.state === 'free'
+        const p2 = project({x: cell.x + resolution, y: cell.y + resolution});
+        const fill = cell.manual_override === 'blocked'
+          ? 'rgba(15,23,42,0.85)'
+          : cell.manual_override === 'cleared'
             ? 'rgba(148,163,184,0.22)'
-            : 'rgba(148,163,184,0.10)';
+            : cell.state === 'occupied'
+              ? 'rgba(15,23,42,0.55)'
+              : cell.state === 'free'
+                ? 'rgba(148,163,184,0.22)'
+                : 'rgba(148,163,184,0.10)';
         return `<rect x="${p.x}" y="${p2.y}" width="${Math.max(2, p2.x - p.x)}" height="${Math.max(2, p.y - p2.y)}" fill="${fill}" />`;
       }).join('');
       const trajectory = (map.trajectory || []).map((point) => {
@@ -568,12 +746,41 @@ HTML_PAGE = """<!doctype html>
           <text x="${p.x + 8}" y="${p.y - 8}" font-size="12" fill="#0f766e">${escapeHtml(place.name)}</text>
         `;
       }).join('');
+      const frontiers = (map.frontiers || []).map((frontier) => {
+        const p = project(frontier.approach_pose || frontier.nav_pose || {x: 0, y: 0});
+        const boundary = project(frontier.frontier_boundary_pose || frontier.centroid_pose || frontier.nav_pose || {x: 0, y: 0});
+        const fill = frontier.status === 'completed'
+          ? '#94a3b8'
+          : frontier.status === 'active'
+            ? '#b91c1c'
+            : frontier.currently_visible === false
+              ? 'rgba(82,96,109,0.42)'
+              : '#0f766e';
+        return `
+          <circle cx="${boundary.x}" cy="${boundary.y}" r="4" fill="none" stroke="${fill}" stroke-width="1.8" opacity="0.7" />
+          <line x1="${boundary.x}" y1="${boundary.y}" x2="${p.x}" y2="${p.y}" stroke="${fill}" stroke-width="1.4" stroke-dasharray="4 4" opacity="0.5" />
+          <circle cx="${p.x}" cy="${p.y}" r="7" fill="${fill}" />
+          <text x="${p.x + 10}" y="${p.y - 10}" font-size="12" fill="#172033">${escapeHtml(frontier.frontier_id || '')}</text>
+        `;
+      }).join('');
+      const robotPose = (map.trajectory || []).slice(-1)[0] || null;
+      const robot = robotPose ? project(robotPose) : null;
+      const headingLength = (map.occupancy?.resolution || 0.5) * 2.5;
+      const robotHeading = robotPose ? project({
+        x: robotPose.x + Math.cos(Number(robotPose.yaw || 0)) * headingLength,
+        y: robotPose.y + Math.sin(Number(robotPose.yaw || 0)) * headingLength,
+      }) : null;
       svg.innerHTML = `
         <rect x="0" y="0" width="1000" height="700" fill="rgba(255,255,255,0.92)" />
         ${occupancy}
         <polyline points="${trajectory}" fill="none" stroke="#0f766e" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" />
         ${regions}
         ${namedPlaces}
+        ${frontiers}
+        ${robot ? `<circle cx="${robot.x}" cy="${robot.y}" r="11" fill="#a52820" />` : ''}
+        ${robot && robotHeading ? `<line x1="${robot.x}" y1="${robot.y}" x2="${robotHeading.x}" y2="${robotHeading.y}" stroke="#6d0f0a" stroke-width="4.5" stroke-linecap="round" />` : ''}
+        ${robot && robotHeading ? `<circle cx="${robotHeading.x}" cy="${robotHeading.y}" r="4" fill="#6d0f0a" />` : ''}
+        ${robot ? `<text x="${robot.x + 12}" y="${robot.y - 12}" font-size="13" fill="#a52820" font-weight="700">robot</text>` : ''}
       `;
       for (const element of svg.querySelectorAll('[data-region-id]')) {
         element.addEventListener('click', () => {
@@ -583,6 +790,36 @@ HTML_PAGE = """<!doctype html>
           renderMap(currentState);
         });
       }
+      svg.onpointerdown = (event) => {
+        if (!currentMapBounds) return;
+        event.preventDefault();
+        isPaintingMap = true;
+        lastPaintedCellKey = null;
+        const cell = cellFromMapEvent(map, event);
+        lastPaintedCellKey = cell.key;
+        enqueuePaintCell(cell);
+      };
+      svg.onpointermove = (event) => {
+        if (!isPaintingMap) return;
+        event.preventDefault();
+        const cell = cellFromMapEvent(map, event);
+        if (cell.key === lastPaintedCellKey) return;
+        lastPaintedCellKey = cell.key;
+        enqueuePaintCell(cell);
+      };
+      svg.onpointerup = async (event) => {
+        if (!isPaintingMap) return;
+        event.preventDefault();
+        isPaintingMap = false;
+        lastPaintedCellKey = null;
+        await flushPaintCells();
+      };
+      svg.onpointerleave = async () => {
+        if (!isPaintingMap) return;
+        isPaintingMap = false;
+        lastPaintedCellKey = null;
+        await flushPaintCells();
+      };
     }
 
     function refreshSelectedRegion() {
@@ -622,6 +859,7 @@ HTML_PAGE = """<!doctype html>
       const response = await fetch('/api/state');
       currentState = await response.json();
       renderMeta(currentState);
+      renderExploration(currentState);
       renderRegions(currentState);
       renderMap(currentState);
       refreshSelectedRegion();
@@ -661,6 +899,18 @@ HTML_PAGE = """<!doctype html>
     document.getElementById('approve-map').addEventListener('click', async () => {
       await postJson('/api/approve');
       await refresh();
+    });
+    document.getElementById('edit-block').addEventListener('click', () => {
+      mapEditMode = 'block';
+      renderExploration(currentState || {});
+    });
+    document.getElementById('edit-clear').addEventListener('click', () => {
+      mapEditMode = 'clear';
+      renderExploration(currentState || {});
+    });
+    document.getElementById('edit-reset').addEventListener('click', () => {
+      mapEditMode = 'reset';
+      renderExploration(currentState || {});
     });
     document.getElementById('save-region').addEventListener('click', async () => {
       if (!selectedRegionId) return;
@@ -710,24 +960,61 @@ class ExplorationReviewServer:
         host: str = "127.0.0.1",
         port: int = 8770,
         allow_task_controls: bool = True,
+        allow_task_launch_controls: bool | None = None,
+        allow_task_state_controls: bool | None = None,
+        allow_map_approval: bool = True,
+        ui_flavor: str = "user",
     ) -> None:
         self.controller = controller
         self.host = host
         self.port = port
         self.allow_task_controls = allow_task_controls
+        self.allow_task_launch_controls = (
+            allow_task_controls if allow_task_launch_controls is None else allow_task_launch_controls
+        )
+        self.allow_task_state_controls = (
+            allow_task_controls if allow_task_state_controls is None else allow_task_state_controls
+        )
+        self.allow_map_approval = allow_map_approval
+        self.ui_flavor = ui_flavor
         self._server: ThreadingHTTPServer | None = None
 
     def _html_page(self) -> str:
         subtitle = (
-            "Manual exploration triggers, live map progress, semantic room editing, and final approval all happen here."
-            if self.allow_task_controls
+            "Live map progress, pause/resume controls, manual wall editing, semantic room editing, and final approval all happen here."
+            if (self.allow_task_controls or self.allow_task_state_controls or self.allow_task_launch_controls)
             else "Post-run map review, region correction, waypoint edits, and approval happen here."
         )
-        control_attr = "" if self.allow_task_controls else 'style="display:none;"'
+        show_control_panel = (
+            self.allow_task_controls
+            or self.allow_task_launch_controls
+            or self.allow_task_state_controls
+            or self.allow_map_approval
+        )
+        control_attr = "" if show_control_panel else 'style="display:none;"'
+        launch_attr = "" if self.allow_task_launch_controls else 'style="display:none;"'
+        task_state_attr = "" if self.allow_task_state_controls else 'style="display:none;"'
+        approve_attr = "" if self.allow_map_approval else 'style="display:none;"'
+        developer_attr = "" if self.ui_flavor == "developer" else 'style="display:none;"'
         return (
             HTML_PAGE.replace("__HERO_SUBTITLE__", subtitle)
             .replace("__CONTROL_PANEL_ATTR__", control_attr)
+            .replace("__TASK_LAUNCH_ATTR__", launch_attr)
+            .replace("__TASK_STATE_ATTR__", task_state_attr)
+            .replace("__APPROVE_ATTR__", approve_attr)
+            .replace("__DEVELOPER_PANEL_ATTR__", developer_attr)
         )
+
+    def serve_in_background(self) -> Any:
+        import threading
+
+        thread = threading.Thread(
+            target=self.serve_forever,
+            name="exploration_review_http",
+            daemon=True,
+        )
+        thread.start()
+        return thread
 
     def serve_forever(self) -> None:
         controller = self.controller
@@ -805,6 +1092,14 @@ class ExplorationReviewServer:
                         region_id=payload.get("region_id"),
                     )
                     self._send_json(response or {"status": "missing"})
+                    return
+                if self.path == "/api/map/edit":
+                    response = controller.update_occupancy_edits(
+                        task_id=payload.get("task_id"),
+                        mode=str(payload.get("mode", "block")),
+                        cells=list(payload.get("cells", [])),
+                    )
+                    self._send_json(response)
                     return
                 if self.path == "/api/approve":
                     self._send_json(controller.approve_map() or {"status": "missing"})

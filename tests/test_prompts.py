@@ -39,6 +39,11 @@ class PromptExamplesTests(unittest.TestCase):
         self.assertIn("memory_updates", prompt)
         self.assertIn("same response", prompt)
         self.assertIn("veto", prompt)
+        self.assertIn("free_space_path_distance_m", prompt)
+        self.assertIn("Locality is a primary objective", prompt)
+        self.assertIn("nearest useful region", prompt)
+        self.assertIn("2x farther", prompt)
+        self.assertIn("avoid zig-zagging", prompt)
 
     def test_exploration_policy_user_prompt_includes_ascii_map_and_guardrails(self) -> None:
         prompt = build_exploration_policy_user_prompt(
@@ -46,7 +51,13 @@ class PromptExamplesTests(unittest.TestCase):
                 "mission": "Explore the apartment.",
                 "robot": {"coverage": 0.4},
                 "frontier_memory": {"stored_frontiers": []},
-                "frontier_information": [{"frontier_id": "frontier_001"}],
+                "frontier_information": [
+                    {
+                        "frontier_id": "frontier_001",
+                        "currently_visible": True,
+                        "free_space_path_distance_m": 1.25,
+                    }
+                ],
                 "frontier_selection_guidance": ["Select likely navigable openings."],
                 "navigation_map_views": [
                     {
@@ -63,7 +74,16 @@ class PromptExamplesTests(unittest.TestCase):
         self.assertIn("ASCII Occupancy Map:", prompt)
         self.assertIn("Frontier Information:", prompt)
         self.assertIn("Frontier Memory Status:", prompt)
-        self.assertIn("currently scanned RGB-D evidence", prompt)
+        self.assertIn("latest scan/global-map update", prompt)
+        self.assertIn("source", prompt)
+        self.assertIn("current_rgbd_scan", prompt)
+        self.assertIn("frontier_memory", prompt)
+        self.assertIn("previous scans", prompt)
+        self.assertIn("free_space_path_distance_m", prompt)
+        self.assertIn("known free space", prompt)
+        self.assertIn("Locality is a primary objective", prompt)
+        self.assertIn("2x farther", prompt)
+        self.assertIn("avoid jumping across the apartment", prompt)
         self.assertIn("Navigation Map View:", prompt)
         self.assertIn("nav_map_001", prompt)
         self.assertIn("recent RGB visual input", prompt)
@@ -94,6 +114,7 @@ class PromptExamplesTests(unittest.TestCase):
                         "frontier_id": "frontier_001",
                         "status": "stored",
                         "currently_visible": True,
+                        "path_cost_m": 2.0,
                         "approach_pose": {"x": 1.0, "y": 1.0, "yaw": 0.0},
                         "frontier_boundary_pose": {"x": 1.2, "y": 1.1, "yaw": 0.0},
                         "evidence": ["canonical frontier evidence"],
@@ -103,8 +124,12 @@ class PromptExamplesTests(unittest.TestCase):
         )
 
         self.assertIn("frontier_999", prompt)
+        self.assertIn('"source": "frontier_memory"', prompt)
+        self.assertIn('"source": "current_rgbd_scan"', prompt)
+        self.assertIn('"free_space_path_distance_m": 2.0', prompt)
         self.assertIn("canonical frontier evidence", prompt)
         self.assertNotIn("memory duplicate evidence should not be repeated", prompt)
+        self.assertNotIn("currently_visible", prompt)
         self.assertNotIn('"x": 9.0', prompt)
 
     def test_exploration_policy_user_prompt_redacts_data_urls(self) -> None:
