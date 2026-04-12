@@ -9,7 +9,13 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from xlerobot_playground.nav2_params import dump_yaml, load_yaml, patch_nav2_params, render_slam_toolbox_params
+from xlerobot_playground.nav2_params import (
+    dump_yaml,
+    load_yaml,
+    patch_nav2_params,
+    rectangular_footprint,
+    render_slam_toolbox_params,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -35,10 +41,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--odom-frame", default="odom")
     parser.add_argument("--base-frame", default="base_link")
     parser.add_argument("--robot-radius", type=float, default=0.24)
-    parser.add_argument("--footprint-padding", type=float, default=0.02)
+    parser.add_argument("--footprint-length-m", type=float, default=0.3913)
+    parser.add_argument("--footprint-width-m", type=float, default=0.459)
+    parser.add_argument("--footprint-padding", type=float, default=0.0)
     parser.add_argument("--obstacle-max-range", type=float, default=9.5)
     parser.add_argument("--raytrace-max-range", type=float, default=10.0)
-    parser.add_argument("--inflation-radius", type=float, default=0.35)
+    parser.add_argument("--inflation-radius", type=float, default=0.0)
     parser.add_argument("--max-linear-velocity", type=float, default=0.65)
     parser.add_argument("--max-angular-velocity", type=float, default=0.45)
     parser.add_argument("--trans-stopped-velocity", type=float, default=0.05)
@@ -64,6 +72,10 @@ def main(argv: list[str] | None = None) -> int:
 
     output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    footprint = rectangular_footprint(
+        length_m=args.footprint_length_m,
+        width_m=args.footprint_width_m,
+    )
 
     nav2_params = patch_nav2_params(
         load_yaml(default_params),
@@ -73,6 +85,7 @@ def main(argv: list[str] | None = None) -> int:
         base_frame=args.base_frame,
         scan_topic=args.scan_topic,
         robot_radius=args.robot_radius,
+        footprint=footprint,
         footprint_padding=args.footprint_padding,
         obstacle_max_range=args.obstacle_max_range,
         raytrace_max_range=args.raytrace_max_range,

@@ -5,7 +5,7 @@ import unittest
 import numpy as np
 
 from xlerobot_playground.maniskill_ros_bridge import build_parser, synthesize_scan_from_depth
-from xlerobot_playground.nav2_params import patch_nav2_params, render_slam_toolbox_params
+from xlerobot_playground.nav2_params import patch_nav2_params, rectangular_footprint, render_slam_toolbox_params
 
 
 class Nav2BridgeTests(unittest.TestCase):
@@ -138,12 +138,21 @@ class Nav2BridgeTests(unittest.TestCase):
             odom_frame="odom",
             map_frame="map",
             robot_radius=0.3,
+            footprint=rectangular_footprint(length_m=0.3913, width_m=0.459),
         )
 
-        obstacle_scan = patched["global_costmap"]["global_costmap"]["ros__parameters"]["obstacle_layer"]["scan"]
-        self.assertEqual(obstacle_scan["topic"], "/bridge/scan")
-        self.assertTrue(obstacle_scan["inf_is_valid"])
-        self.assertEqual(patched["global_costmap"]["global_costmap"]["ros__parameters"]["robot_radius"], 0.3)
+        local_scan = patched["local_costmap"]["local_costmap"]["ros__parameters"]["voxel_layer"]["scan"]
+        self.assertEqual(local_scan["topic"], "/bridge/scan")
+        self.assertTrue(local_scan["inf_is_valid"])
+        self.assertEqual(local_scan["observation_persistence"], 0.35)
+        self.assertNotIn("obstacle_layer", patched["global_costmap"]["global_costmap"]["ros__parameters"]["plugins"])
+        self.assertNotIn("obstacle_layer", patched["global_costmap"]["global_costmap"]["ros__parameters"])
+        self.assertEqual(
+            patched["global_costmap"]["global_costmap"]["ros__parameters"]["footprint"],
+            "[[0.1956, 0.2295], [0.1956, -0.2295], [-0.1956, -0.2295], [-0.1956, 0.2295]]",
+        )
+        self.assertNotIn("robot_radius", patched["global_costmap"]["global_costmap"]["ros__parameters"])
+        self.assertNotIn("robot_radius", patched["local_costmap"]["local_costmap"]["ros__parameters"])
         self.assertNotIn("inflation_layer", patched["global_costmap"]["global_costmap"]["ros__parameters"]["plugins"])
         self.assertNotIn("inflation_layer", patched["global_costmap"]["global_costmap"]["ros__parameters"])
         self.assertNotIn("inflation_layer", patched["local_costmap"]["local_costmap"]["ros__parameters"]["plugins"])

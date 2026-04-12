@@ -83,6 +83,88 @@ SIM_MOTION_SPEED_PRESETS = {
     "faster": {"linear_m_s": 0.60, "angular_multiplier": 1.8},
     "fastest": {"linear_m_s": 1.00, "angular_multiplier": 3.0},
 }
+LOCAL_PATH_GUARD_LOOKAHEAD_M = 0.6
+LOCAL_PATH_GUARD_PADDING_M = 0.0
+LOCAL_PATH_GUARD_MAX_REPLANS = 4
+
+
+class Nav2LocalPathBlocked(RuntimeError):
+    def __init__(self, blocker: dict[str, Any], *, travelled_distance_m: float) -> None:
+        self.blocker = blocker
+        self.travelled_distance_m = travelled_distance_m
+        super().__init__(str(blocker.get("reason", "local RGB-D scan blocked the current path")))
+
+
+def _local_scan_path_blocker(
+    observation: dict[str, Any] | None,
+    *,
+    current_pose: Pose2D,
+    target_pose: Pose2D,
+    robot_length_m: float,
+    robot_width_m: float,
+    lookahead_m: float = LOCAL_PATH_GUARD_LOOKAHEAD_M,
+    safety_padding_m: float = LOCAL_PATH_GUARD_PADDING_M,
+) -> dict[str, Any] | None:
+    if not isinstance(observation, dict):
+        return None
+    sensor_pose = observation.get("pose")
+    if not isinstance(sensor_pose, Pose2D):
+        return None
+    dx = target_pose.x - current_pose.x
+    dy = target_pose.y - current_pose.y
+    segment_distance_m = math.hypot(dx, dy)
+    if segment_distance_m <= 1e-4:
+        return None
+    ranges = observation.get("ranges", ())
+    if not ranges:
+        return None
+    unit_x = dx / segment_distance_m
+    unit_y = dy / segment_distance_m
+    angle_min = float(observation.get("angle_min", 0.0) or 0.0)
+    angle_increment = float(observation.get("angle_increment", 0.0) or 0.0)
+    range_min = float(observation.get("range_min", 0.05) or 0.05)
+    range_max = float(observation.get("range_max", 0.0) or 0.0)
+    half_length_m = max(robot_length_m * 0.5 + safety_padding_m, 0.05)
+    half_width_m = max(robot_width_m * 0.5 + safety_padding_m, 0.05)
+    center_lookahead_m = min(max(lookahead_m, robot_length_m), segment_distance_m)
+    sweep_forward_min_m = -half_length_m
+    sweep_forward_max_m = center_lookahead_m + half_length_m
+    closest: dict[str, Any] | None = None
+    for index, raw_range in enumerate(ranges):
+        try:
+            range_m = float(raw_range)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(range_m) or range_m < range_min:
+            continue
+        if range_max > 0.0 and range_m >= range_max * 0.995:
+            continue
+        beam_angle = sensor_pose.yaw + angle_min + angle_increment * index
+        point_x = sensor_pose.x + math.cos(beam_angle) * range_m
+        point_y = sensor_pose.y + math.sin(beam_angle) * range_m
+        rel_x = point_x - current_pose.x
+        rel_y = point_y - current_pose.y
+        forward_m = rel_x * unit_x + rel_y * unit_y
+        if forward_m < sweep_forward_min_m or forward_m > sweep_forward_max_m:
+            continue
+        lateral_m = abs(rel_x * unit_y - rel_y * unit_x)
+        if lateral_m > half_width_m:
+            continue
+        clearance_forward_m = max(forward_m - half_length_m, 0.0)
+        if closest is None or clearance_forward_m < closest["forward_clearance_m"]:
+            closest = {
+                "reason": "local RGB-D scan observed an obstacle in the swept robot footprint",
+                "beam_index": index,
+                "range_m": round(range_m, 3),
+                "forward_distance_m": round(forward_m, 3),
+                "forward_clearance_m": round(clearance_forward_m, 3),
+                "lateral_distance_m": round(lateral_m, 3),
+                "point": {"x": round(point_x, 3), "y": round(point_y, 3)},
+                "half_length_m": round(half_length_m, 3),
+                "half_width_m": round(half_width_m, 3),
+                "lookahead_m": round(center_lookahead_m, 3),
+            }
+    return closest
 
 
 def _manual_region_from_cells(
@@ -1779,7 +1861,10 @@ class ManiSkillTeleportExplorationSession:
     ) -> None:
         self._teleport_robot(pose)
 
-    def _integrate_depth_scan(self, head_data: dict[str, np.ndarray]) -> dict[str, Any]:
+    def _build_scan_observation_from_head_data(
+        self,
+        head_data: dict[str, np.ndarray],
+    ) -> tuple[dict[str, Any], np.ndarray]:
         depth = np.asarray(head_data.get("depth"))
         if depth.ndim == 3:
             depth = depth[..., 0]
@@ -1794,16 +1879,30 @@ class ManiSkillTeleportExplorationSession:
         head_position = self._tensor_to_numpy(self.head_link.pose.p)
         head_quaternion = normalize_quaternion_wxyz(self._tensor_to_numpy(self.head_link.pose.q))
         laser_yaw = quaternion_to_yaw(head_quaternion)
+        observation = {
+            "frame_id": "maniskill_head_scan",
+            "reference_frame": "maniskill_world",
+            "pose": Pose2D(float(head_position[0]), float(head_position[1]), laser_yaw),
+            "range_min": 0.05,
+            "range_max": float(self.config.sensor_range_m),
+            "angle_min": float(angles[0]) if len(angles) else -HEAD_CAMERA_FOV_RAD / 2.0,
+            "angle_increment": float(angles[1] - angles[0]) if len(angles) > 1 else 0.0,
+            "ranges": tuple(float(item) for item in ranges),
+        }
+        return observation, depth_for_scan
+
+    def _integrate_depth_scan(self, head_data: dict[str, np.ndarray]) -> dict[str, Any]:
+        observation, depth_for_scan = self._build_scan_observation_from_head_data(head_data)
         active_scan_cells = getattr(self, "_active_scan_cells", None)
         active_scan_known_cells = getattr(self, "_active_scan_known_cells", None)
         active_scan_range_edge_cells = getattr(self, "_active_scan_range_edge_cells", None)
         active_scan_occupancy_evidence = getattr(self, "_active_scan_occupancy_evidence", None)
         beam_stride = max(int(self.options.depth_beam_stride), 1)
         summary = integrate_planar_scan(
-            pose=Pose2D(float(head_position[0]), float(head_position[1]), laser_yaw),
-            ranges=tuple(float(item) for item in ranges),
-            angle_min=float(angles[0]) if len(angles) else -HEAD_CAMERA_FOV_RAD / 2.0,
-            angle_increment=float(angles[1] - angles[0]) if len(angles) > 1 else 0.0,
+            pose=observation["pose"],
+            ranges=observation["ranges"],
+            angle_min=float(observation["angle_min"]),
+            angle_increment=float(observation["angle_increment"]),
             range_min_m=0.05,
             range_max_m=self.config.sensor_range_m,
             resolution_m=self.config.occupancy_resolution,
@@ -1815,16 +1914,7 @@ class ManiSkillTeleportExplorationSession:
             beam_stride=beam_stride,
             config=ACTIVE_RGBD_SCAN_FUSION_CONFIG,
         )
-        self._latest_scan_observation = {
-            "frame_id": "maniskill_head_scan",
-            "reference_frame": "maniskill_world",
-            "pose": Pose2D(float(head_position[0]), float(head_position[1]), laser_yaw),
-            "range_min": 0.05,
-            "range_max": float(self.config.sensor_range_m),
-            "angle_min": float(angles[0]) if len(angles) else -HEAD_CAMERA_FOV_RAD / 2.0,
-            "angle_increment": float(angles[1] - angles[0]) if len(angles) > 1 else 0.0,
-            "ranges": tuple(float(item) for item in ranges),
-        }
+        self._latest_scan_observation = observation
 
         depth_summary = _depth_summary(depth_for_scan, max_range_m=self.config.sensor_range_m)
         depth_summary.update(
@@ -2856,6 +2946,7 @@ class ManiSkillNav2RouterExplorationSession(ManiSkillTeleportExplorationSession)
         super().__init__(config, options)
 
     def reset(self) -> dict[str, Any]:
+        self._transient_navigation_obstacle_cells: set[GridCell] = set()
         snapshot = super().reset()
         self._publish_router_state()
         return snapshot
@@ -2886,22 +2977,22 @@ class ManiSkillNav2RouterExplorationSession(ManiSkillTeleportExplorationSession)
             start_pose = self._current_pose()
             current_cell = self._world_to_cell(start_pose.x, start_pose.y)
             reachable_safe_cells = self._reachable_safe_navigation_cells(current_cell)
-            target_pose, rejection_reason = self._resolve_physically_valid_target_pose(
+            target_pose, path_poses, rejection_reason = self._plan_router_path_to_frontier(
                 record=record,
                 start_pose=start_pose,
                 reachable_safe_cells=reachable_safe_cells,
             )
-            if target_pose is None:
+            if target_pose is None or not path_poses:
                 if self._is_close_enough_to_complete_frontier(start_pose, record):
                     record.evidence = _dedupe_text(
                         record.evidence
                         + [
-                            "frontier marked completed from the current pose because the exact projected approach pose was not physically valid, but the robot was already close enough to observe the frontier boundary"
+                            "frontier marked completed from the current pose because no router-approved approach path was found, but the robot was already close enough to observe the frontier boundary"
                         ]
                     )
                     self.last_error = (
                         f"`{record.frontier_id}` was marked completed from the current pose; "
-                        f"no collision-free target was found nearby ({rejection_reason or 'unknown reason'})."
+                        f"no router-approved approach path was found nearby ({rejection_reason or 'unknown reason'})."
                     )
                     return self._complete_active_frontier_locked(
                         record=record,
@@ -2910,40 +3001,13 @@ class ManiSkillNav2RouterExplorationSession(ManiSkillTeleportExplorationSession)
                     )
                 self.frontier_memory.fail(
                     record.frontier_id,
-                    f"no physically valid target near frontier: {rejection_reason or 'unknown reason'}",
+                    f"no router-approved path near frontier: {rejection_reason or 'unknown reason'}",
                 )
                 self.last_error = (
-                    f"Router move rejected `{record.frontier_id}` because no nearby collision-free target pose "
+                    f"Router move rejected `{record.frontier_id}` because no nearby target pose "
                     f"could be found ({rejection_reason or 'unknown reason'})."
                 )
                 self._log_decision("router_target_invalid")
-                self._prepare_decision_locked()
-                return self.snapshot()
-
-            try:
-                self._publish_router_state(required=True)
-                status, path_poses, status_label = self.router.compute_path(
-                    goal_pose=target_pose,
-                    planner_id=self.config.nav2_planner_id,
-                )
-                self._validate_router_path(path_poses, start_pose=start_pose, target_pose=target_pose)
-            except Exception as exc:
-                record.status = "stored"
-                self.frontier_memory.active_frontier_id = None
-                self.last_error = f"Nav2 router failed to plan `{record.frontier_id}`: {exc}"
-                self._log_decision("router_planner_failed")
-                self._prepare_decision_locked()
-                return self.snapshot()
-            if status_label != "succeeded" or not path_poses:
-                self.frontier_memory.fail(
-                    record.frontier_id,
-                    f"router compute_path returned `{status_label}` with {len(path_poses)} poses",
-                )
-                self.last_error = (
-                    f"Nav2 router rejected `{record.frontier_id}` with status `{status_label}` "
-                    f"and {len(path_poses)} path poses."
-                )
-                self._log_decision("router_planner_rejected")
                 self._prepare_decision_locked()
                 return self.snapshot()
 
@@ -3006,8 +3070,140 @@ class ManiSkillNav2RouterExplorationSession(ManiSkillTeleportExplorationSession)
                 "Nav2 path ends too far from the requested frontier target "
                 f"({end_error_m:.2f} m)."
             )
+        crossing = self._first_known_occupied_path_crossing(
+            [start_pose] + list(path_poses) + [target_pose],
+        )
+        if crossing is not None:
+            raise RuntimeError(
+                "Nav2 path crosses a known occupied map cell "
+                f"at ({crossing['x']:.2f}, {crossing['y']:.2f}) "
+                f"cell=({crossing['cell_x']},{crossing['cell_y']})."
+            )
+
+    def _first_known_occupied_path_crossing(self, poses: list[Pose2D]) -> dict[str, Any] | None:
+        if len(poses) < 2:
+            return None
+        resolution = max(float(self.config.occupancy_resolution), 1e-6)
+        for segment_index, (start, end) in enumerate(zip(poses, poses[1:])):
+            dx = end.x - start.x
+            dy = end.y - start.y
+            distance_m = math.hypot(dx, dy)
+            sample_count = max(int(math.ceil(distance_m / max(resolution * 0.5, 0.05))), 1)
+            for sample_index in range(sample_count + 1):
+                fraction = sample_index / sample_count
+                x = start.x + dx * fraction
+                y = start.y + dy * fraction
+                cell = self._world_to_cell(x, y)
+                if self._navigation_planning_cell_state(cell) == "occupied":
+                    return {
+                        "segment_index": segment_index,
+                        "sample_index": sample_index,
+                        "x": x,
+                        "y": y,
+                        "cell_x": cell.x,
+                        "cell_y": cell.y,
+                    }
+        return None
+
+    def _navigation_planning_cell_state(self, cell: GridCell) -> str | None:
+        if cell in getattr(self, "_transient_navigation_obstacle_cells", set()):
+            return "occupied"
+        return self._effective_known_cells().get(cell)
+
+    def _plan_router_path_to_frontier(
+        self,
+        *,
+        record: FrontierRecord,
+        start_pose: Pose2D,
+        reachable_safe_cells: set[GridCell],
+    ) -> tuple[Pose2D | None, list[Pose2D], str | None]:
+        candidates = self._candidate_target_poses(
+            record=record,
+            start_pose=start_pose,
+            reachable_safe_cells=reachable_safe_cells,
+        )
+        if not candidates:
+            return None, [], "no safe target pose candidates were available near the frontier"
+
+        rejection_reasons: list[str] = []
+        for index, candidate in enumerate(candidates, start=1):
+            ok, reason = self._probe_teleport_pose(candidate)
+            if not ok:
+                rejection_reasons.append(
+                    f"candidate {index} physical validation failed: {reason or 'unknown reason'}"
+                )
+                continue
+            try:
+                self._publish_router_state(required=True)
+                status, path_poses, status_label = self.router.compute_path(
+                    goal_pose=candidate,
+                    planner_id=self.config.nav2_planner_id,
+                )
+                if status_label != "succeeded" or not path_poses:
+                    rejection_reasons.append(
+                        f"candidate {index} Nav2 returned `{status_label}` with {len(path_poses)} poses"
+                    )
+                    continue
+                self._validate_router_path(path_poses, start_pose=start_pose, target_pose=candidate)
+                if index > 1:
+                    self.guardrail_events.append(
+                        {
+                            "type": "router_frontier_target_candidate_recovered",
+                            "frontier_id": record.frontier_id,
+                            "candidate_index": index,
+                            "rejected_candidates": rejection_reasons[-5:],
+                        }
+                    )
+                return candidate, path_poses, None
+            except Exception as exc:
+                rejection_reasons.append(f"candidate {index} rejected: {exc}")
+
+        return None, [], "; ".join(rejection_reasons[-5:]) if rejection_reasons else "all candidates were rejected"
+
+    def _request_router_replan(self, *, final_pose: Pose2D) -> list[Pose2D]:
+        self._publish_router_state(required=True)
+        status, path_poses, status_label = self.router.compute_path(
+            goal_pose=final_pose,
+            planner_id=self.config.nav2_planner_id,
+        )
+        if status_label != "succeeded" or not path_poses:
+            raise RuntimeError(f"Nav2 replan returned `{status_label}` with {len(path_poses)} poses")
+        self._validate_router_path(
+            path_poses,
+            start_pose=self._current_pose(),
+            target_pose=final_pose,
+        )
+        return path_poses
 
     def _execute_router_path(self, path_poses: list[Pose2D], *, final_pose: Pose2D) -> float:
+        travelled_distance_m = 0.0
+        replans = 0
+        active_path = list(path_poses)
+        while True:
+            try:
+                travelled_distance_m += self._execute_router_path_once(active_path, final_pose=final_pose)
+                self._transient_navigation_obstacle_cells.clear()
+                self._publish_router_state()
+                return travelled_distance_m
+            except Nav2LocalPathBlocked as exc:
+                travelled_distance_m += exc.travelled_distance_m
+                replans += 1
+                self._remember_transient_navigation_obstacle(exc.blocker)
+                self.guardrail_events.append(
+                    {
+                        "type": "nav2_local_path_blocked_replan_requested",
+                        "replan_index": replans,
+                        "blocker": exc.blocker,
+                    }
+                )
+                if replans > LOCAL_PATH_GUARD_MAX_REPLANS:
+                    raise RuntimeError(
+                        "local RGB-D path guard exhausted replan attempts "
+                        f"({LOCAL_PATH_GUARD_MAX_REPLANS})"
+                    ) from exc
+                active_path = self._request_router_replan(final_pose=final_pose)
+
+    def _execute_router_path_once(self, path_poses: list[Pose2D], *, final_pose: Pose2D) -> float:
         if not path_poses:
             self._teleport_robot(final_pose)
             self.control_steps += 1
@@ -3028,12 +3224,15 @@ class ManiSkillNav2RouterExplorationSession(ManiSkillTeleportExplorationSession)
             if distance > 1e-4:
                 segment_yaw = math.atan2(dy, dx)
                 self._rotate_in_place(segment_yaw, publish_stride=pose_publish_stride)
-                travelled_distance_m += self._drive_straight_to(
-                    Pose2D(waypoint.x, waypoint.y, segment_yaw),
-                    publish_stride=pose_publish_stride,
-                )
+                try:
+                    travelled_distance_m += self._drive_straight_to(
+                        Pose2D(waypoint.x, waypoint.y, segment_yaw),
+                        publish_stride=pose_publish_stride,
+                    )
+                except Nav2LocalPathBlocked as exc:
+                    exc.travelled_distance_m += travelled_distance_m
+                    raise
         self._rotate_in_place(final_pose.yaw, publish_stride=pose_publish_stride)
-        self._publish_router_state()
         return travelled_distance_m
 
     def _rotate_in_place(self, target_yaw: float, *, publish_stride: int) -> None:
@@ -3052,7 +3251,7 @@ class ManiSkillNav2RouterExplorationSession(ManiSkillTeleportExplorationSession)
             self._teleport_robot(pose)
             self.control_steps += 1
             if step % publish_stride == 0 or step == steps:
-                self._publish_router_state()
+                self._publish_navigation_only_observation()
             self._sleep_after_motion_step(step_s)
 
     def _drive_straight_to(self, target_pose: Pose2D, *, publish_stride: int) -> float:
@@ -3070,6 +3269,10 @@ class ManiSkillNav2RouterExplorationSession(ManiSkillTeleportExplorationSession)
         travelled_distance_m = 0.0
         previous = current
         for step in range(1, steps + 1):
+            observation = self._publish_navigation_only_observation()
+            blocker = self._local_path_blocker_from_observation(observation, target_pose=target_pose)
+            if blocker is not None:
+                raise Nav2LocalPathBlocked(blocker, travelled_distance_m=travelled_distance_m)
             fraction = step / steps
             pose = Pose2D(
                 current.x + dx * fraction,
@@ -3082,7 +3285,6 @@ class ManiSkillNav2RouterExplorationSession(ManiSkillTeleportExplorationSession)
             previous = pose
             if step % publish_stride == 0 or step == steps:
                 self.trajectory.append(pose.to_dict())
-                self._publish_router_state()
             self._sleep_after_motion_step(step_s)
         return travelled_distance_m
 
@@ -3105,6 +3307,80 @@ class ManiSkillNav2RouterExplorationSession(ManiSkillTeleportExplorationSession)
     def _perform_scan(self, *, full_turnaround: bool, capture_frame: bool, reason: str) -> None:
         super()._perform_scan(full_turnaround=full_turnaround, capture_frame=capture_frame, reason=reason)
         self._publish_router_state()
+
+    def _publish_navigation_only_observation(self) -> dict[str, Any] | None:
+        try:
+            head_data = self._capture_head_camera()
+            observation, _depth_for_scan = self._build_scan_observation_from_head_data(head_data)
+            self._latest_scan_observation = observation
+            self.router.update_state(
+                occupancy_map=None,
+                pose=self._current_pose(),
+                scan_observation=observation,
+                image_data_url=None,
+            )
+            return observation
+        except Exception as exc:
+            self.last_error = f"Nav2 local observation update failed: {exc}"
+            self.guardrail_events.append(
+                {
+                    "type": "nav2_local_observation_update_failed",
+                    "reason": str(exc),
+                }
+            )
+            return None
+
+    def _local_path_blocker_from_observation(
+        self,
+        observation: dict[str, Any] | None,
+        *,
+        target_pose: Pose2D,
+    ) -> dict[str, Any] | None:
+        blocker = _local_scan_path_blocker(
+            observation,
+            current_pose=self._current_pose(),
+            target_pose=target_pose,
+            robot_length_m=XLEROBOT_IKEA_CART_FOOTPRINT_LENGTH_M,
+            robot_width_m=XLEROBOT_IKEA_CART_FOOTPRINT_WIDTH_M,
+        )
+        if blocker is None:
+            return None
+        point = blocker.get("point")
+        if isinstance(point, dict):
+            try:
+                cell = self._world_to_cell(float(point["x"]), float(point["y"]))
+            except Exception:
+                cell = None
+            if cell is not None and self._is_known_static_obstacle_near(cell):
+                self.guardrail_events.append(
+                    {
+                        "type": "local_path_guard_ignored_known_static_obstacle",
+                        "blocker": blocker,
+                    }
+                )
+                return None
+        return blocker
+
+    def _is_known_static_obstacle_near(self, cell: GridCell) -> bool:
+        effective = self._effective_known_cells()
+        if effective.get(cell) == "occupied":
+            return True
+        for neighbor in _neighbors8(cell):
+            if effective.get(neighbor) == "occupied":
+                return True
+        return False
+
+    def _remember_transient_navigation_obstacle(self, blocker: dict[str, Any]) -> None:
+        point = blocker.get("point")
+        if not isinstance(point, dict):
+            return
+        try:
+            center = self._world_to_cell(float(point["x"]), float(point["y"]))
+        except Exception:
+            return
+        cells = getattr(self, "_transient_navigation_obstacle_cells", set())
+        cells.add(center)
+        self._transient_navigation_obstacle_cells = cells
 
     def _move_to_scan_sample_pose(
         self,
@@ -3156,8 +3432,10 @@ class ManiSkillNav2RouterExplorationSession(ManiSkillTeleportExplorationSession)
 
     def _router_navigation_map(self) -> RosOccupancyMap:
         effective_known = self._effective_known_cells()
+        transient_obstacles = set(getattr(self, "_transient_navigation_obstacle_cells", set()))
         resolution = float(self.config.occupancy_resolution)
-        if not effective_known:
+        map_cells = set(effective_known) | transient_obstacles
+        if not map_cells:
             pose = self._current_pose()
             base_x = int(math.floor(pose.x / resolution))
             base_y = int(math.floor(pose.y / resolution))
@@ -3169,10 +3447,10 @@ class ManiSkillNav2RouterExplorationSession(ManiSkillTeleportExplorationSession)
                 origin_y=base_y * resolution,
                 data=(0,),
             )
-        min_x = min(cell.x for cell in effective_known) - 2
-        min_y = min(cell.y for cell in effective_known) - 2
-        max_x = max(cell.x for cell in effective_known) + 2
-        max_y = max(cell.y for cell in effective_known) + 2
+        min_x = min(cell.x for cell in map_cells) - 2
+        min_y = min(cell.y for cell in map_cells) - 2
+        max_x = max(cell.x for cell in map_cells) + 2
+        max_y = max(cell.y for cell in map_cells) + 2
         width = max_x - min_x + 1
         height = max_y - min_y + 1
         data = [-1] * (width * height)
@@ -3180,6 +3458,11 @@ class ManiSkillNav2RouterExplorationSession(ManiSkillTeleportExplorationSession)
             local_x = cell.x - min_x
             local_y = cell.y - min_y
             data[local_y * width + local_x] = 0 if state == "free" else 100
+        for cell in transient_obstacles:
+            local_x = cell.x - min_x
+            local_y = cell.y - min_y
+            if 0 <= local_x < width and 0 <= local_y < height:
+                data[local_y * width + local_x] = 100
         return RosOccupancyMap(
             resolution=resolution,
             width=width,

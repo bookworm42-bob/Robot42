@@ -19,8 +19,13 @@ from xlerobot_playground.sim_exploration_backend import (
     _mark_frontier_unreachable_as_visited,
     build_parser,
 )
-from xlerobot_playground.interactive_exploration_playground import InteractiveNoNav2ExplorationSession, ManiSkillTeleportExplorationSession
 from xlerobot_playground.interactive_exploration_playground import (
+    InteractiveNoNav2ExplorationSession,
+    ManiSkillNav2RouterExplorationSession,
+    ManiSkillTeleportExplorationSession,
+)
+from xlerobot_playground.interactive_exploration_playground import (
+    _local_scan_path_blocker,
     _navigation_map_data_url,
     _resolve_manishkill_start_pose,
     _updated_mobile_base_qpos,
@@ -48,6 +53,216 @@ from xlerobot_playground.scan_fusion import integrate_planar_scan
 
 
 class SimExplorationBackendTests(unittest.TestCase):
+    def test_local_scan_path_guard_detects_obstacle_in_path_corridor(self) -> None:
+        observation = {
+            "pose": Pose2D(0.0, 0.0, 0.0),
+            "range_min": 0.05,
+            "range_max": 10.0,
+            "angle_min": -0.2,
+            "angle_increment": 0.1,
+            "ranges": (10.0, 10.0, 0.55, 10.0, 10.0),
+        }
+
+        blocker = _local_scan_path_blocker(
+            observation,
+            current_pose=Pose2D(0.0, 0.0, 0.0),
+            target_pose=Pose2D(2.0, 0.0, 0.0),
+            robot_length_m=0.3913,
+            robot_width_m=0.459,
+        )
+
+        self.assertIsNotNone(blocker)
+        assert blocker is not None
+        self.assertEqual(blocker["beam_index"], 2)
+        self.assertLess(blocker["forward_distance_m"], 0.7)
+
+    def test_local_scan_path_guard_ignores_obstacle_outside_corridor(self) -> None:
+        observation = {
+            "pose": Pose2D(0.0, 0.0, 0.0),
+            "range_min": 0.05,
+            "range_max": 10.0,
+            "angle_min": 0.45,
+            "angle_increment": 0.1,
+            "ranges": (0.7, 10.0, 10.0),
+        }
+
+        blocker = _local_scan_path_blocker(
+            observation,
+            current_pose=Pose2D(0.0, 0.0, 0.0),
+            target_pose=Pose2D(2.0, 0.0, 0.0),
+            robot_length_m=0.3913,
+            robot_width_m=0.459,
+        )
+
+        self.assertIsNone(blocker)
+
+    def test_local_scan_path_guard_uses_padded_rectangular_footprint(self) -> None:
+        observation = {
+            "pose": Pose2D(0.0, 0.0, 0.0),
+            "range_min": 0.05,
+            "range_max": 10.0,
+            "angle_min": 0.48,
+            "angle_increment": 0.0,
+            "ranges": (0.6,),
+        }
+
+        blocker = _local_scan_path_blocker(
+            observation,
+            current_pose=Pose2D(0.0, 0.0, 0.0),
+            target_pose=Pose2D(2.0, 0.0, 0.0),
+            robot_length_m=0.3913,
+            robot_width_m=0.459,
+            safety_padding_m=0.06,
+        )
+
+        self.assertIsNotNone(blocker)
+        assert blocker is not None
+        self.assertAlmostEqual(blocker["half_length_m"], 0.256, places=3)
+        self.assertAlmostEqual(blocker["half_width_m"], 0.289, places=3)
+        self.assertLess(blocker["lateral_distance_m"], blocker["half_width_m"])
+
+    def test_local_scan_path_guard_rejects_point_outside_rectangular_width(self) -> None:
+        observation = {
+            "pose": Pose2D(0.0, 0.0, 0.0),
+            "range_min": 0.05,
+            "range_max": 10.0,
+            "angle_min": 0.62,
+            "angle_increment": 0.0,
+            "ranges": (0.6,),
+        }
+
+        blocker = _local_scan_path_blocker(
+            observation,
+            current_pose=Pose2D(0.0, 0.0, 0.0),
+            target_pose=Pose2D(2.0, 0.0, 0.0),
+            robot_length_m=0.3913,
+            robot_width_m=0.459,
+            safety_padding_m=0.06,
+        )
+
+        self.assertIsNone(blocker)
+
+    def test_nav2_router_path_guard_ignores_known_static_obstacles(self) -> None:
+        session = ManiSkillNav2RouterExplorationSession.__new__(ManiSkillNav2RouterExplorationSession)
+        session.config = SimExplorationConfig(
+            repo_root="/tmp/XLeRobot",
+            persist_path="",
+            occupancy_resolution=0.25,
+        )
+        session.known_cells = {GridCell(2, 0): "occupied"}
+        session.manual_occupancy_edits = ManualOccupancyEdits()
+        session.guardrail_events = []
+        session._current_pose = lambda: Pose2D(0.0, 0.0, 0.0)
+        observation = {
+            "pose": Pose2D(0.0, 0.0, 0.0),
+            "range_min": 0.05,
+            "range_max": 10.0,
+            "angle_min": 0.0,
+            "angle_increment": 0.0,
+            "ranges": (0.55,),
+        }
+
+        blocker = session._local_path_blocker_from_observation(
+            observation,
+            target_pose=Pose2D(2.0, 0.0, 0.0),
+        )
+
+        self.assertIsNone(blocker)
+        self.assertTrue(
+            any(event["type"] == "local_path_guard_ignored_known_static_obstacle" for event in session.guardrail_events)
+        )
+
+    def test_nav2_router_rejects_path_crossing_known_occupied_cell(self) -> None:
+        session = ManiSkillNav2RouterExplorationSession.__new__(ManiSkillNav2RouterExplorationSession)
+        session.config = SimExplorationConfig(
+            repo_root="/tmp/XLeRobot",
+            persist_path="",
+            occupancy_resolution=0.25,
+        )
+        session.known_cells = {GridCell(2, 0): "occupied"}
+        session.manual_occupancy_edits = ManualOccupancyEdits()
+        session._transient_navigation_obstacle_cells = set()
+
+        with self.assertRaisesRegex(RuntimeError, "known occupied map cell"):
+            session._validate_router_path(
+                [Pose2D(0.0, 0.1, 0.0), Pose2D(1.0, 0.1, 0.0)],
+                start_pose=Pose2D(0.0, 0.1, 0.0),
+                target_pose=Pose2D(1.0, 0.1, 0.0),
+            )
+
+    def test_nav2_router_allows_path_through_unknown_cells(self) -> None:
+        session = ManiSkillNav2RouterExplorationSession.__new__(ManiSkillNav2RouterExplorationSession)
+        session.config = SimExplorationConfig(
+            repo_root="/tmp/XLeRobot",
+            persist_path="",
+            occupancy_resolution=0.25,
+        )
+        session.known_cells = {}
+        session.manual_occupancy_edits = ManualOccupancyEdits()
+        session._transient_navigation_obstacle_cells = set()
+
+        session._validate_router_path(
+            [Pose2D(0.0, 0.1, 0.0), Pose2D(1.0, 0.1, 0.0)],
+            start_pose=Pose2D(0.0, 0.1, 0.0),
+            target_pose=Pose2D(1.0, 0.1, 0.0),
+        )
+
+    def test_nav2_router_tries_alternate_frontier_target_when_first_path_crosses_wall(self) -> None:
+        session = ManiSkillNav2RouterExplorationSession.__new__(ManiSkillNav2RouterExplorationSession)
+        session.config = SimExplorationConfig(
+            repo_root="/tmp/XLeRobot",
+            persist_path="",
+            occupancy_resolution=0.25,
+            nav2_planner_id="",
+        )
+        session.known_cells = {GridCell(2, 0): "occupied"}
+        session.manual_occupancy_edits = ManualOccupancyEdits()
+        session._transient_navigation_obstacle_cells = set()
+        session.guardrail_events = []
+        session._publish_router_state = lambda **_kwargs: None
+        session._probe_teleport_pose = lambda _pose: (True, None)
+        first = Pose2D(1.0, 0.1, 0.0)
+        second = Pose2D(0.0, 1.0, 0.0)
+        session._candidate_target_poses = lambda **_kwargs: [first, second]
+
+        class FakeRouter:
+            def __init__(self) -> None:
+                self.goals: list[Pose2D] = []
+
+            def compute_path(self, *, goal_pose: Pose2D, planner_id: str = ""):
+                self.goals.append(goal_pose)
+                if goal_pose == first:
+                    return 4, [Pose2D(0.0, 0.1, 0.0), first], "succeeded"
+                return 4, [Pose2D(0.0, 0.1, 0.0), Pose2D(0.0, 0.5, 0.0), second], "succeeded"
+
+        router = FakeRouter()
+        session.router = router
+
+        target, path, reason = session._plan_router_path_to_frontier(
+            record=FrontierRecord(
+                frontier_id="frontier_retry",
+                nav_pose=first,
+                centroid_pose=Pose2D(1.0, 0.0, 0.0),
+                status="active",
+                discovered_step=1,
+                last_seen_step=1,
+                unknown_gain=1,
+                sensor_range_edge=False,
+                room_hint=None,
+                evidence=[],
+            ),
+            start_pose=Pose2D(0.0, 0.1, 0.0),
+            reachable_safe_cells={GridCell(0, 0)},
+        )
+
+        self.assertEqual(target, second)
+        self.assertEqual(path[-1], second)
+        self.assertIsNone(reason)
+        self.assertEqual(router.goals, [first, second])
+        self.assertTrue(
+            any(event["type"] == "router_frontier_target_candidate_recovered" for event in session.guardrail_events)
+        )
+
     def test_occupancy_fusion_preserves_observed_walls_against_later_free_updates(self) -> None:
         wall_cell = GridCell(2, 3)
         known_cells = {wall_cell: "occupied"}

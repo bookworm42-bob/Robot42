@@ -7,6 +7,24 @@ from typing import Any
 import yaml
 
 
+def rectangular_footprint(
+    *,
+    length_m: float,
+    width_m: float,
+    center_x_m: float = 0.0,
+    center_y_m: float = 0.0,
+) -> str:
+    half_length = max(float(length_m), 0.0) / 2.0
+    half_width = max(float(width_m), 0.0) / 2.0
+    points = [
+        (round(center_x_m + half_length, 4), round(center_y_m + half_width, 4)),
+        (round(center_x_m + half_length, 4), round(center_y_m - half_width, 4)),
+        (round(center_x_m - half_length, 4), round(center_y_m - half_width, 4)),
+        (round(center_x_m - half_length, 4), round(center_y_m + half_width, 4)),
+    ]
+    return "[" + ", ".join(f"[{x}, {y}]" for x, y in points) + "]"
+
+
 def load_yaml(path: str | Path) -> dict[str, Any]:
     with Path(path).expanduser().open("r", encoding="utf-8") as handle:
         data = yaml.safe_load(handle) or {}
@@ -65,10 +83,12 @@ def patch_nav2_params(
     base_frame: str = "base_link",
     scan_topic: str = "/scan",
     robot_radius: float = 0.24,
+    footprint: str | None = None,
     footprint_padding: float = 0.0,
     obstacle_max_range: float = 9.5,
     raytrace_max_range: float = 10.0,
     inflation_radius: float = 0.0,
+    local_observation_persistence_s: float = 0.35,
     local_costmap_width: int = 4,
     local_costmap_height: int = 4,
     voxel_origin_z: float = 0.0,
@@ -120,13 +140,23 @@ def patch_nav2_params(
         root["global_frame"] = global_frame
         root["robot_base_frame"] = base_frame
         root["use_sim_time"] = use_sim_time
-        root["robot_radius"] = robot_radius
+        if footprint:
+            root["footprint"] = deepcopy(footprint)
+            root.pop("robot_radius", None)
+        else:
+            root["robot_radius"] = robot_radius
+            root.pop("footprint", None)
         root["footprint_padding"] = footprint_padding
         if costmap_name == "local_costmap":
             root["width"] = local_costmap_width
             root["height"] = local_costmap_height
 
         plugins = list(root.get("plugins", []))
+        if costmap_name == "global_costmap":
+            plugins = [plugin for plugin in plugins if plugin not in {"obstacle_layer", "voxel_layer"}]
+            root["plugins"] = plugins
+            root.pop("obstacle_layer", None)
+            root.pop("voxel_layer", None)
         if inflation_radius <= 0.0 and "inflation_layer" in plugins:
             plugins = [plugin for plugin in plugins if plugin != "inflation_layer"]
             root["plugins"] = plugins
@@ -143,6 +173,7 @@ def patch_nav2_params(
                 "raytrace_max_range": raytrace_max_range,
                 "obstacle_max_range": obstacle_max_range,
                 "max_obstacle_height": 2.0,
+                "observation_persistence": local_observation_persistence_s,
             }
 
         if "voxel_layer" in plugins:
@@ -164,6 +195,7 @@ def patch_nav2_params(
                 "raytrace_max_range": raytrace_max_range,
                 "obstacle_max_range": obstacle_max_range,
                 "max_obstacle_height": 2.0,
+                "observation_persistence": local_observation_persistence_s,
             }
 
         if inflation_radius > 0.0 and "inflation_layer" in plugins:

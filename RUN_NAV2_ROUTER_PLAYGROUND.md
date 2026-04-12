@@ -5,6 +5,7 @@ This is the current intended architecture:
 - The exploration playground owns ManiSkill, RGB-D scan fusion, map building, frontier selection, and the UI.
 - The ROS/Nav2 adapter is only a router: it receives map/pose/scan state from the playground, publishes ROS topics, and asks Nav2 for paths.
 - Nav2 consumes the router-published map/TF/scan and returns planned paths.
+- The persistent `/map` comes from the playground's fused RGB-D map. During movement, the playground sends short-lived scan observations to `/scan` for Nav2's local costmap without merging those observations back into the persistent map.
 - Do not run `examples/xlerobot_nav2_bridge_playground.py` for this flow.
 
 ## Terminal 1: Start The ROS/Nav2 Router
@@ -112,5 +113,8 @@ Expected basics:
   - `fastest`: about `1.00 m/s` path following and `3.0x` base turn speed.
 - The base turn speed for `normal` is still set by `--ros-manual-spin-angular-speed-rad-s`.
 - Nav2 costmap inflation is disabled in `artifacts/nav2/xlerobot_nav2_params.yaml`.
-- Nav2 still uses `robot_radius: 0.24` as the actual robot collision footprint.
+- Nav2 uses a centered rectangular `footprint` polygon as the collision model: `0.3913 m` long by `0.459 m` wide.
+- Nav2's global costmap uses the persistent static map only. Nav2's local costmap consumes `/scan` with short observation persistence, so local obstacle observations are refreshed and discarded during navigation.
 - Movement in ManiSkill follows Nav2 path poses kinematically. It should no longer jump directly to the frontier.
+- While following a path, the playground checks each RGB-D-derived local scan against the swept rectangular base footprint aligned to the current path segment. Known static map obstacles such as door frames are ignored by this emergency guard; only newly observed blockers stop ManiSkill, add a temporary single-cell obstacle overlay for replanning, and ask Nav2 for a fresh path to the same target.
+- If Nav2 returns a path that crosses a known occupied map cell, the playground rejects that candidate target and tries another valid target pose near the same frontier before failing the move.

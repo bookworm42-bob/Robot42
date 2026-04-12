@@ -200,12 +200,13 @@ class RosNav2RouterNode(Node):
     def update_state(
         self,
         *,
-        occupancy_map: RosOccupancyMap,
+        occupancy_map: RosOccupancyMap | None = None,
         pose: Pose2D,
         scan_observation: dict[str, Any] | None = None,
         image_data_url: str | None = None,
     ) -> None:
-        self.latest_map = occupancy_map
+        if occupancy_map is not None:
+            self.latest_map = occupancy_map
         self.latest_pose = pose
         self.received_external_state = True
         self.latest_image_data_url = image_data_url or self.latest_image_data_url
@@ -383,7 +384,7 @@ class RemoteNav2RouterClient:
     def update_state(
         self,
         *,
-        occupancy_map: RosOccupancyMap,
+        occupancy_map: RosOccupancyMap | None = None,
         pose: Pose2D,
         scan_observation: dict[str, Any] | None = None,
         image_data_url: str | None = None,
@@ -487,8 +488,8 @@ class RosNav2RouterServer:
                         if path == "/api/router/update_state":
                             occupancy_map = map_from_payload(payload.get("occupancy_map"))
                             pose = pose_from_payload(payload.get("pose"))
-                            if occupancy_map is None or pose is None:
-                                raise ValueError("occupancy_map and pose are required")
+                            if pose is None:
+                                raise ValueError("pose is required")
                             outer.node.update_state(
                                 occupancy_map=occupancy_map,
                                 pose=pose,
