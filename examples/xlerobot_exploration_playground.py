@@ -49,6 +49,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--llm-temperature", type=float, default=0.1)
     parser.add_argument("--llm-max-tokens", type=int, default=1200)
     parser.add_argument("--llm-reasoning-effort", default=None)
+    parser.add_argument("--semantic-waypoints-enabled", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--automatic-semantic-waypoints", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--semantic-llm-provider", default=None)
+    parser.add_argument("--semantic-llm-model", default=None)
+    parser.add_argument("--semantic-llm-base-url", default=None)
+    parser.add_argument("--semantic-llm-api-key", default=None)
+    parser.add_argument("--semantic-vlm-async", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--trace-policy-stdout", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--trace-llm-stdout", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--serve-review-ui", action=argparse.BooleanOptionalAction, default=True)
@@ -75,18 +82,30 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--nav2-controller-id", default="FollowPath")
     parser.add_argument("--nav2-behavior-tree", default="navigate_to_pose_w_replanning_and_recovery.xml")
     parser.add_argument("--nav2-recovery-enabled", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--ros-navigation-map-source", choices=("fused_scan", "external"), default="fused_scan")
     parser.add_argument("--ros-map-topic", default="/map")
     parser.add_argument("--ros-scan-topic", default="/scan")
     parser.add_argument("--ros-rgb-topic", default="/camera/head/image_raw")
     parser.add_argument("--ros-cmd-vel-topic", default="/cmd_vel")
     parser.add_argument("--ros-map-frame", default="map")
+    parser.add_argument("--ros-adapter-url", default=None)
+    parser.add_argument("--ros-adapter-timeout-s", type=float, default=30.0)
+    parser.add_argument(
+        "--ros-odom-frame",
+        default="odom",
+        help=(
+            "Accepted for ROS launch command compatibility. The playground reads the robot pose from TF "
+            "between --ros-map-frame and --ros-base-frame; odom frame configuration lives in the bridge/Nav2 launch."
+        ),
+    )
     parser.add_argument("--ros-base-frame", default="base_link")
     parser.add_argument("--ros-server-timeout-s", type=float, default=10.0)
     parser.add_argument("--ros-ready-timeout-s", type=float, default=20.0)
     parser.add_argument("--ros-turn-scan-timeout-s", type=float, default=45.0)
     parser.add_argument("--ros-turn-scan-settle-s", type=float, default=1.0)
-    parser.add_argument("--ros-manual-spin-angular-speed-rad-s", type=float, default=0.55)
-    parser.add_argument("--ros-manual-spin-publish-hz", type=float, default=10.0)
+    parser.add_argument("--ros-manual-spin-angular-speed-rad-s", type=float, default=0.25)
+    parser.add_argument("--ros-manual-spin-publish-hz", type=float, default=20.0)
+    parser.add_argument("--sim-motion-speed", choices=("normal", "faster", "fastest"), default="normal")
     parser.add_argument("--ros-allow-multiple-action-servers", action=argparse.BooleanOptionalAction, default=False)
     return parser
 
@@ -96,10 +115,10 @@ def main(argv: list[str] | None = None) -> int:
     repo_root = resolve_repo_root(args.repo_root)
     python_bin = args.sim_python_bin or default_sim_python_bin(REPO_ROOT)
     movement_mode = args.movement_mode or args.nav2_mode
-    if movement_mode == "teleport":
+    if movement_mode in {"teleport", "ros"}:
         interactive_args = [
             "--backend",
-            "maniskill",
+            "ros" if movement_mode == "ros" else "maniskill",
             "--repo-root",
             str(repo_root),
             "--session",
@@ -161,6 +180,49 @@ def main(argv: list[str] | None = None) -> int:
             f"--{'open-browser' if args.open_browser else 'no-open-browser'}",
             "--ui-flavor",
             args.ui_flavor,
+            f"--{'semantic-waypoints-enabled' if args.semantic_waypoints_enabled else 'no-semantic-waypoints-enabled'}",
+            f"--{'automatic-semantic-waypoints' if args.automatic_semantic_waypoints else 'no-automatic-semantic-waypoints'}",
+            f"--{'semantic-vlm-async' if args.semantic_vlm_async else 'no-semantic-vlm-async'}",
+            "--nav2-planner-id",
+            args.nav2_planner_id,
+            "--nav2-controller-id",
+            args.nav2_controller_id,
+            "--nav2-behavior-tree",
+            args.nav2_behavior_tree,
+            f"--{'nav2-recovery-enabled' if args.nav2_recovery_enabled else 'no-nav2-recovery-enabled'}",
+            "--ros-navigation-map-source",
+            args.ros_navigation_map_source,
+            "--ros-map-topic",
+            args.ros_map_topic,
+            "--ros-scan-topic",
+            args.ros_scan_topic,
+            "--ros-rgb-topic",
+            args.ros_rgb_topic,
+            "--ros-cmd-vel-topic",
+            args.ros_cmd_vel_topic,
+            "--ros-map-frame",
+            args.ros_map_frame,
+            "--ros-adapter-timeout-s",
+            str(args.ros_adapter_timeout_s),
+            "--ros-odom-frame",
+            args.ros_odom_frame,
+            "--ros-base-frame",
+            args.ros_base_frame,
+            "--ros-server-timeout-s",
+            str(args.ros_server_timeout_s),
+            "--ros-ready-timeout-s",
+            str(args.ros_ready_timeout_s),
+            "--ros-turn-scan-timeout-s",
+            str(args.ros_turn_scan_timeout_s),
+            "--ros-turn-scan-settle-s",
+            str(args.ros_turn_scan_settle_s),
+            "--ros-manual-spin-angular-speed-rad-s",
+            str(args.ros_manual_spin_angular_speed_rad_s),
+            "--ros-manual-spin-publish-hz",
+            str(args.ros_manual_spin_publish_hz),
+            "--sim-motion-speed",
+            args.sim_motion_speed,
+            f"--{'ros-allow-multiple-action-servers' if args.ros_allow_multiple_action_servers else 'no-ros-allow-multiple-action-servers'}",
         ]
         if args.display_yaw_offset_deg is not None:
             interactive_args.extend(["--display-yaw-offset-deg", str(args.display_yaw_offset_deg)])
@@ -172,12 +234,22 @@ def main(argv: list[str] | None = None) -> int:
             interactive_args.extend(["--spawn-y", str(args.spawn_y)])
         if args.teleport_z is not None:
             interactive_args.extend(["--teleport-z", str(args.teleport_z)])
+        if args.ros_adapter_url:
+            interactive_args.extend(["--ros-adapter-url", args.ros_adapter_url])
         if args.llm_base_url:
             interactive_args.extend(["--llm-base-url", args.llm_base_url])
         if args.llm_api_key:
             interactive_args.extend(["--llm-api-key", args.llm_api_key])
         if args.llm_reasoning_effort:
             interactive_args.extend(["--llm-reasoning-effort", args.llm_reasoning_effort])
+        if args.semantic_llm_provider:
+            interactive_args.extend(["--semantic-llm-provider", args.semantic_llm_provider])
+        if args.semantic_llm_model:
+            interactive_args.extend(["--semantic-llm-model", args.semantic_llm_model])
+        if args.semantic_llm_base_url:
+            interactive_args.extend(["--semantic-llm-base-url", args.semantic_llm_base_url])
+        if args.semantic_llm_api_key:
+            interactive_args.extend(["--semantic-llm-api-key", args.semantic_llm_api_key])
         if args.force_reload:
             interactive_args.append("--force-reload")
         return exec_python_module(
@@ -213,6 +285,9 @@ def main(argv: list[str] | None = None) -> int:
         str(args.num_envs),
         "--occupancy-resolution",
         str(args.occupancy_resolution),
+        f"--{'semantic-waypoints-enabled' if args.semantic_waypoints_enabled else 'no-semantic-waypoints-enabled'}",
+        f"--{'automatic-semantic-waypoints' if args.automatic_semantic_waypoints else 'no-automatic-semantic-waypoints'}",
+        f"--{'semantic-vlm-async' if args.semantic_vlm_async else 'no-semantic-vlm-async'}",
     ]
     if args.max_control_steps is not None:
         backend_args.extend([
@@ -274,6 +349,10 @@ def main(argv: list[str] | None = None) -> int:
         args.ros_cmd_vel_topic,
         "--ros-map-frame",
         args.ros_map_frame,
+        "--ros-adapter-timeout-s",
+        str(args.ros_adapter_timeout_s),
+        "--ros-odom-frame",
+        args.ros_odom_frame,
         "--ros-base-frame",
         args.ros_base_frame,
         "--ros-server-timeout-s",
@@ -288,17 +367,29 @@ def main(argv: list[str] | None = None) -> int:
         str(args.ros_manual_spin_angular_speed_rad_s),
         "--ros-manual-spin-publish-hz",
         str(args.ros_manual_spin_publish_hz),
+        "--sim-motion-speed",
+        args.sim_motion_speed,
     ])
     backend_args.append(f"--{'nav2-recovery-enabled' if args.nav2_recovery_enabled else 'no-nav2-recovery-enabled'}")
     backend_args.append(
         f"--{'ros-allow-multiple-action-servers' if args.ros_allow_multiple_action_servers else 'no-ros-allow-multiple-action-servers'}"
     )
+    if args.ros_adapter_url:
+        backend_args.extend(["--ros-adapter-url", args.ros_adapter_url])
     if args.llm_base_url:
         backend_args.extend(["--llm-base-url", args.llm_base_url])
     if args.llm_api_key:
         backend_args.extend(["--llm-api-key", args.llm_api_key])
     if args.llm_reasoning_effort:
         backend_args.extend(["--llm-reasoning-effort", args.llm_reasoning_effort])
+    if args.semantic_llm_provider:
+        backend_args.extend(["--semantic-llm-provider", args.semantic_llm_provider])
+    if args.semantic_llm_model:
+        backend_args.extend(["--semantic-llm-model", args.semantic_llm_model])
+    if args.semantic_llm_base_url:
+        backend_args.extend(["--semantic-llm-base-url", args.semantic_llm_base_url])
+    if args.semantic_llm_api_key:
+        backend_args.extend(["--semantic-llm-api-key", args.semantic_llm_api_key])
     backend_args.extend([
         f"--{'trace-policy-stdout' if args.trace_policy_stdout else 'no-trace-policy-stdout'}",
         f"--{'trace-llm-stdout' if args.trace_llm_stdout else 'no-trace-llm-stdout'}",

@@ -84,9 +84,9 @@ class ManualOccupancyEdits:
                 self.clear_override(cell)
 
     def state_for_cell(self, base_state: str | None, cell: Any) -> str | None:
-        if cell in self.blocked_cells:
+        if _cell_set_contains(self.blocked_cells, cell):
             return "occupied"
-        if cell in self.cleared_cells:
+        if _cell_set_contains(self.cleared_cells, cell):
             return "free"
         return base_state
 
@@ -291,9 +291,9 @@ class EditableOccupancyMap:
 
     def value(self, cell_x: int, cell_y: int) -> int:
         cell_key = _TupleCell(cell_x, cell_y)
-        if cell_key in self.edits.blocked_cells:
+        if _cell_set_contains(self.edits.blocked_cells, cell_key):
             return 100
-        if cell_key in self.edits.cleared_cells:
+        if _cell_set_contains(self.edits.cleared_cells, cell_key):
             return 0
         return int(self.base_map.value(cell_x, cell_y))
 
@@ -326,9 +326,9 @@ class EditableOccupancyMap:
                 pose = self.cell_to_pose(x, y)
                 cell_key = _TupleCell(x, y)
                 manual_override = None
-                if cell_key in self.edits.blocked_cells:
+                if _cell_set_contains(self.edits.blocked_cells, cell_key):
                     manual_override = "blocked"
-                elif cell_key in self.edits.cleared_cells:
+                elif _cell_set_contains(self.edits.cleared_cells, cell_key):
                     manual_override = "cleared"
                 payload = {
                     "x": round(pose.x - self.resolution / 2.0, 3),
@@ -349,6 +349,16 @@ class EditableOccupancyMap:
 class _TupleCell:
     x: int
     y: int
+
+
+def _cell_set_contains(cells: set[Any], cell: Any) -> bool:
+    if cell in cells:
+        return True
+    cell_x = getattr(cell, "x", None)
+    cell_y = getattr(cell, "y", None)
+    if cell_x is None or cell_y is None:
+        return False
+    return any(getattr(item, "x", None) == cell_x and getattr(item, "y", None) == cell_y for item in cells)
 
 
 def edits_from_payload(

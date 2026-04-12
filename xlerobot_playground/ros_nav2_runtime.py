@@ -24,7 +24,7 @@ try:
     import rclpy
     from action_msgs.msg import GoalStatus
     from builtin_interfaces.msg import Duration as DurationMsg
-    from geometry_msgs.msg import PoseStamped, Quaternion, Twist
+    from geometry_msgs.msg import PoseStamped, Quaternion, TransformStamped, Twist
     from nav_msgs.msg import OccupancyGrid
     from nav2_msgs.action import ComputePathToPose, NavigateToPose, Spin
     from rclpy.action import ActionClient
@@ -38,7 +38,7 @@ try:
     )
     from rclpy.time import Time as RosTime
     from sensor_msgs.msg import Image, LaserScan
-    from tf2_ros import Buffer, TransformListener
+    from tf2_ros import Buffer, TransformBroadcaster, TransformListener
     from tf2_ros import ConnectivityException, ExtrapolationException, LookupException
 except Exception as exc:  # pragma: no cover - runtime guard.
     IMPORT_ERROR = exc
@@ -47,6 +47,7 @@ except Exception as exc:  # pragma: no cover - runtime guard.
     DurationMsg = None
     PoseStamped = None
     Quaternion = None
+    TransformStamped = None
     Twist = None
     OccupancyGrid = None
     ComputePathToPose = None
@@ -62,6 +63,7 @@ except Exception as exc:  # pragma: no cover - runtime guard.
     Image = None
     LaserScan = None
     Buffer = None
+    TransformBroadcaster = None
     TransformListener = None
     ConnectivityException = Exception
     ExtrapolationException = Exception
@@ -111,15 +113,17 @@ class RosRuntimeConfig:
     rgb_topic: str = "/camera/head/image_raw"
     cmd_vel_topic: str = "/cmd_vel"
     map_frame: str = "map"
+    odom_frame: str = "odom"
     base_frame: str = "base_link"
     server_timeout_s: float = 10.0
     ready_timeout_s: float = 20.0
     turn_scan_radians: float = math.tau
     turn_scan_timeout_s: float = 45.0
     turn_scan_settle_s: float = 1.0
-    manual_spin_angular_speed_rad_s: float = 0.55
-    manual_spin_publish_hz: float = 10.0
+    manual_spin_angular_speed_rad_s: float = 0.25
+    manual_spin_publish_hz: float = 20.0
     allow_multiple_action_servers: bool = False
+    publish_internal_navigation_map: bool = True
 
 
 @dataclass(frozen=True)
@@ -178,25 +182,31 @@ class RosExplorationRuntime(Node):
         self.config = config
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self, spin_thread=False)
+        self.tf_broadcaster = TransformBroadcaster(self)
         self.latest_map: RosOccupancyMap | None = None
         self.latest_map_stamp_s: float = 0.0
         self.latest_scan: LaserScan | None = None
+        self.latest_scan_stats: dict[str, Any] | None = None
+        self.scan_observations: list[dict[str, Any]] = []
         self.latest_image_msg: Image | None = None
         self.latest_image_data_url: str | None = None
         self._nav_goal_history: list[dict[str, Any]] = []
         self._nav_plan_history: list[dict[str, Any]] = []
         self._nav_scan_history: list[dict[str, Any]] = []
         self._cmd_vel_pub = self.create_publisher(Twist, config.cmd_vel_topic, 10)
-        self._compute_path_client = ActionClient(self, ComputePathToPose, "compute_path_to_pose")
-        self._navigate_to_pose_client = ActionClient(self, NavigateToPose, "navigate_to_pose")
-        self._spin_client = ActionClient(self, Spin, "spin")
-
         map_qos = QoSProfile(depth=1)
         map_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
         map_qos.reliability = ReliabilityPolicy.RELIABLE
+        self._map_pub = self.create_publisher(OccupancyGrid, config.map_topic, map_qos)
+        self._compute_path_client = ActionClient(self, ComputePathToPose, "compute_path_to_pose")
+        self._navigate_to_pose_client = ActionClient(self, NavigateToPose, "navigate_to_pose")
+        self._spin_client = ActionClient(self, Spin, "spin")
         self.create_subscription(OccupancyGrid, config.map_topic, self._on_map, map_qos)
         self.create_subscription(LaserScan, config.scan_topic, self._on_scan, qos_profile_sensor_data)
         self.create_subscription(Image, config.rgb_topic, self._on_rgb, qos_profile_sensor_data)
+        self._published_navigation_map: RosOccupancyMap | None = None
+        self._map_to_odom = Pose2D(0.0, 0.0, 0.0)
+        self._publish_timer = self.create_timer(0.2, self._publish_internal_navigation_state)
 
     def _on_map(self, message: OccupancyGrid) -> None:
         self.latest_map = RosOccupancyMap(
@@ -211,6 +221,39 @@ class RosExplorationRuntime(Node):
 
     def _on_scan(self, message: LaserScan) -> None:
         self.latest_scan = message
+        ranges = np.asarray(message.ranges, dtype=np.float32)
+        finite = np.isfinite(ranges)
+        valid = finite & (ranges >= float(message.range_min)) & (ranges <= float(message.range_max))
+        max_like = valid & (ranges >= float(message.range_max) * 0.999)
+        self.latest_scan_stats = {
+            "frame_id": message.header.frame_id,
+            "beam_count": int(ranges.size),
+            "valid_beam_count": int(np.count_nonzero(valid)),
+            "finite_beam_count": int(np.count_nonzero(finite)),
+            "max_range_beam_count": int(np.count_nonzero(max_like)),
+            "range_min": round(float(message.range_min), 3),
+            "range_max": round(float(message.range_max), 3),
+            "angle_min": round(float(message.angle_min), 3),
+            "angle_max": round(float(message.angle_max), 3),
+            "angle_increment": round(float(message.angle_increment), 6),
+        }
+        reference_frame = self.config.odom_frame if self.config.publish_internal_navigation_map else self.config.map_frame
+        sensor_pose = self.lookup_pose(reference_frame, message.header.frame_id)
+        if sensor_pose is not None:
+            self.scan_observations.append(
+                {
+                    "frame_id": str(message.header.frame_id),
+                    "pose": sensor_pose,
+                    "reference_frame": reference_frame,
+                    "range_min": float(message.range_min),
+                    "range_max": float(message.range_max),
+                    "angle_min": float(message.angle_min),
+                    "angle_increment": float(message.angle_increment),
+                    "ranges": tuple(float(item) for item in message.ranges),
+                }
+            )
+            if len(self.scan_observations) > 4096:
+                self.scan_observations = self.scan_observations[-2048:]
 
     def _on_rgb(self, message: Image) -> None:
         self.latest_image_msg = message
@@ -222,18 +265,31 @@ class RosExplorationRuntime(Node):
         deadline = time.time() + (timeout_s if timeout_s is not None else self.config.ready_timeout_s)
         while time.time() < deadline:
             rclpy.spin_once(self, timeout_sec=0.1)
-            if self.latest_map is not None and self.current_pose() is not None:
+            if self.config.publish_internal_navigation_map:
+                if self.current_pose_in_frame(self.config.odom_frame) is not None:
+                    return
+            elif self.latest_map is not None and self.current_pose() is not None:
                 return
             time.sleep(0.05)
         raise RuntimeError(
-            f"Timed out waiting for `{self.config.map_topic}` and `{self.config.map_frame}->{self.config.base_frame}` pose."
+            (
+                f"Timed out waiting for `{self.config.odom_frame}->{self.config.base_frame}` pose."
+                if self.config.publish_internal_navigation_map
+                else f"Timed out waiting for `{self.config.map_topic}` and `{self.config.map_frame}->{self.config.base_frame}` pose."
+            )
         )
 
     def current_pose(self) -> Pose2D | None:
+        return self.lookup_pose(self.config.map_frame, self.config.base_frame)
+
+    def current_pose_in_frame(self, frame_id: str) -> Pose2D | None:
+        return self.lookup_pose(frame_id, self.config.base_frame)
+
+    def lookup_pose(self, target_frame: str, source_frame: str) -> Pose2D | None:
         try:
             transform = self.tf_buffer.lookup_transform(
-                self.config.map_frame,
-                self.config.base_frame,
+                target_frame,
+                source_frame,
                 RosTime(),
             )
         except (LookupException, ConnectivityException, ExtrapolationException):
@@ -250,6 +306,18 @@ class RosExplorationRuntime(Node):
         deadline = time.time() + duration_s
         while time.time() < deadline:
             rclpy.spin_once(self, timeout_sec=0.05)
+
+    def scan_observation_count(self) -> int:
+        return len(self.scan_observations)
+
+    def drain_scan_observations(self, since_index: int) -> tuple[list[dict[str, Any]], int]:
+        self.spin_for(0.05)
+        stop_index = len(self.scan_observations)
+        if since_index < 0:
+            since_index = 0
+        if since_index >= stop_index:
+            return [], stop_index
+        return list(self.scan_observations[since_index:stop_index]), stop_index
 
     def compute_path(
         self,
@@ -345,41 +413,70 @@ class RosExplorationRuntime(Node):
         reason: str,
         should_cancel: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
+        start_time = time.time()
+        start_pose = self.current_pose()
+        sample_count = 12
+        step_radians = float(self.config.turn_scan_radians) / float(sample_count)
         event = {
             "reason": reason,
-            "mode": "nav2_spin",
+            "mode": "discrete_stop_and_scan",
             "target_yaw_rad": round(self.config.turn_scan_radians, 3),
+            "sample_count": sample_count,
+            "sample_step_rad": round(step_radians, 3),
         }
-        try:
-            if not self._spin_client.wait_for_server(timeout_sec=3.0):
-                raise RuntimeError("Nav2 spin action server unavailable")
-            self._ensure_action_server_health("spin")
-            request = Spin.Goal()
-            request.target_yaw = float(self.config.turn_scan_radians)
-            request.time_allowance = _seconds_to_duration(self.config.turn_scan_timeout_s)
-            future = self._spin_client.send_goal_async(request)
-            rclpy.spin_until_future_complete(self, future)
-            goal_handle = future.result()
-            if goal_handle is None or not goal_handle.accepted:
-                raise RuntimeError("Nav2 rejected the spin goal")
-            result_future = goal_handle.get_result_async()
-            cancel_requested = False
-            while not result_future.done():
-                rclpy.spin_once(self, timeout_sec=0.1)
-                if should_cancel is not None and should_cancel() and not cancel_requested:
-                    cancel_requested = True
-                    cancel_future = goal_handle.cancel_goal_async()
-                    rclpy.spin_until_future_complete(self, cancel_future)
-            outcome = result_future.result()
-            event["status"] = ros_goal_status_label(getattr(outcome, "status", GoalStatus.STATUS_UNKNOWN))
-        except Exception as exc:
-            event["mode"] = "manual_cmd_vel_spin"
-            event["fallback_reason"] = str(exc)
-            self._manual_spin(should_cancel=should_cancel)
-            event["status"] = "succeeded"
+        observations: list[dict[str, Any]] = []
+        total_yaw_delta = 0.0
+        stop_reason = "target_yaw_reached"
+        completed = True
+        for index in range(sample_count):
+            if should_cancel is not None and should_cancel():
+                stop_reason = "canceled"
+                completed = False
+                break
+            if index > 0:
+                segment = self._spin_by_delta(step_radians, should_cancel=should_cancel)
+                total_yaw_delta += float(segment.get("actual_unwrapped_yaw_delta_rad", 0.0) or 0.0)
+                if not segment.get("spin_completed", False):
+                    stop_reason = str(segment.get("spin_stop_reason", "incomplete"))
+                    completed = False
+                    break
+            observation = self._capture_settled_scan_observation()
+            if observation is not None:
+                observations.append(observation)
+        if completed and sample_count > 1:
+            restore_segment = self._spin_by_delta(step_radians, should_cancel=should_cancel)
+            total_yaw_delta += float(restore_segment.get("actual_unwrapped_yaw_delta_rad", 0.0) or 0.0)
+            if not restore_segment.get("spin_completed", False):
+                stop_reason = str(restore_segment.get("spin_stop_reason", "restore_incomplete"))
+                completed = False
         self.spin_for(self.config.turn_scan_settle_s)
+        end_pose = self.current_pose()
+        event["elapsed_s"] = round(time.time() - start_time, 3)
+        event["spin_completed"] = completed
+        event["spin_stop_reason"] = stop_reason
+        event["spin_feedback_frame"] = self.config.odom_frame
+        event["actual_unwrapped_yaw_delta_rad"] = round(total_yaw_delta, 3)
+        event["spin_command_angular_speed_rad_s"] = round(float(self.config.manual_spin_angular_speed_rad_s), 3)
+        event["spin_timeout_s"] = round(float(self.config.turn_scan_timeout_s), 3)
+        event["captured_observation_count"] = len(observations)
+        if start_pose is not None:
+            event["start_pose"] = start_pose.to_dict()
+        if end_pose is not None:
+            event["end_pose"] = end_pose.to_dict()
+        if start_pose is not None and end_pose is not None:
+            yaw_delta = math.atan2(
+                math.sin(end_pose.yaw - start_pose.yaw),
+                math.cos(end_pose.yaw - start_pose.yaw),
+            )
+            event["wrapped_yaw_delta_rad"] = round(yaw_delta, 3)
+            event["note"] = (
+                "A full 360 degree spin wraps back near the start yaw, so wrapped_yaw_delta_rad may be near 0."
+            )
+        response = dict(event)
+        response["observations"] = observations
+        response["observation_stop_index"] = len(self.scan_observations)
         self._nav_scan_history.append(event)
-        return event
+        return response
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -387,9 +484,11 @@ class RosExplorationRuntime(Node):
             "map_topic": self.config.map_topic,
             "scan_topic": self.config.scan_topic,
             "rgb_topic": self.config.rgb_topic,
+            "navigation_map_source": "fused_scan" if self.config.publish_internal_navigation_map else "external",
             "goals": list(self._nav_goal_history),
             "plans": list(self._nav_plan_history),
             "turn_scans": list(self._nav_scan_history),
+            "latest_scan": self.latest_scan_stats,
         }
 
     def record_goal(self, payload: dict[str, Any]) -> None:
@@ -398,22 +497,170 @@ class RosExplorationRuntime(Node):
     def record_plan(self, payload: dict[str, Any]) -> None:
         self._nav_plan_history.append(payload)
 
+    def publish_navigation_map(
+        self,
+        occupancy_map: RosOccupancyMap,
+        *,
+        map_to_odom: Pose2D | None = None,
+    ) -> None:
+        self._published_navigation_map = occupancy_map
+        if map_to_odom is not None:
+            self._map_to_odom = map_to_odom
+        self.latest_map = occupancy_map
+        self.latest_map_stamp_s = time.time()
+        self._publish_internal_navigation_state()
+
     def close(self) -> None:
         self.destroy_node()
 
-    def _manual_spin(self, *, should_cancel: Callable[[], bool] | None = None) -> None:
+    def _publish_internal_navigation_state(self) -> None:
+        if not self.config.publish_internal_navigation_map:
+            return
+        self._publish_map_to_odom_transform()
+        if self._published_navigation_map is None:
+            return
+        self._map_pub.publish(self._occupancy_grid_message(self._published_navigation_map))
+
+    def _publish_map_to_odom_transform(self) -> None:
+        transform = TransformStamped()
+        transform.header.stamp = self.get_clock().now().to_msg()
+        transform.header.frame_id = self.config.map_frame
+        transform.child_frame_id = self.config.odom_frame
+        transform.transform.translation.x = float(self._map_to_odom.x)
+        transform.transform.translation.y = float(self._map_to_odom.y)
+        transform.transform.translation.z = 0.0
+        transform.transform.rotation = quaternion_from_yaw(float(self._map_to_odom.yaw))
+        self.tf_broadcaster.sendTransform(transform)
+
+    def _occupancy_grid_message(self, occupancy_map: RosOccupancyMap) -> OccupancyGrid:
+        message = OccupancyGrid()
+        message.header.stamp = self.get_clock().now().to_msg()
+        message.header.frame_id = self.config.map_frame
+        message.info.map_load_time = message.header.stamp
+        message.info.resolution = float(occupancy_map.resolution)
+        message.info.width = int(occupancy_map.width)
+        message.info.height = int(occupancy_map.height)
+        message.info.origin.position.x = float(occupancy_map.origin_x)
+        message.info.origin.position.y = float(occupancy_map.origin_y)
+        message.info.origin.position.z = 0.0
+        message.info.origin.orientation = quaternion_from_yaw(0.0)
+        message.data = [int(item) for item in occupancy_map.data]
+        return message
+
+    def _manual_spin(self, *, should_cancel: Callable[[], bool] | None = None) -> dict[str, Any]:
+        return self._spin_by_delta(float(self.config.turn_scan_radians), should_cancel=should_cancel)
+
+    def _spin_by_delta(
+        self,
+        target_yaw_rad: float,
+        *,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> dict[str, Any]:
         twist = Twist()
-        twist.angular.z = float(self.config.manual_spin_angular_speed_rad_s)
-        duration_s = abs(self.config.turn_scan_radians) / max(abs(twist.angular.z), 1e-6)
+        direction = 1.0 if target_yaw_rad >= 0.0 else -1.0
+        max_command_speed = abs(float(self.config.manual_spin_angular_speed_rad_s))
+        twist.angular.z = direction * max_command_speed
+        fallback_duration_s = abs(target_yaw_rad) / max(max_command_speed, 1e-6)
         step_s = 1.0 / max(self.config.manual_spin_publish_hz, 1e-6)
-        deadline = time.time() + duration_s
+        timeout_s = max(float(self.config.turn_scan_timeout_s), fallback_duration_s * 3.0, fallback_duration_s + 5.0)
+        deadline = time.time() + timeout_s
+        start_time = time.time()
+        pose = self.current_pose_in_frame(self.config.odom_frame)
+        previous_yaw = pose.yaw if pose is not None else None
+        accumulated_yaw = 0.0
+        used_odom_feedback = pose is not None
+        timed_fallback_deadline = start_time + fallback_duration_s
+        stop_tolerance_rad = math.radians(2.0)
+        slowdown_zone_rad = math.radians(50.0)
+        minimum_command_speed = min(max_command_speed, 0.18)
         while time.time() < deadline:
             if should_cancel is not None and should_cancel():
+                stop_reason = "canceled"
                 break
+            if pose is not None and previous_yaw is not None:
+                remaining_yaw = max(abs(target_yaw_rad) - abs(accumulated_yaw), 0.0)
+                if remaining_yaw <= stop_tolerance_rad:
+                    stop_reason = "target_yaw_reached"
+                    break
+                if remaining_yaw < slowdown_zone_rad:
+                    scaled_speed = max_command_speed * (remaining_yaw / slowdown_zone_rad)
+                    twist.angular.z = direction * max(minimum_command_speed, scaled_speed)
+                else:
+                    twist.angular.z = direction * max_command_speed
             self._cmd_vel_pub.publish(twist)
             rclpy.spin_once(self, timeout_sec=0.0)
+            pose = self.current_pose_in_frame(self.config.odom_frame)
+            if pose is not None and previous_yaw is not None:
+                delta = math.atan2(
+                    math.sin(pose.yaw - previous_yaw),
+                    math.cos(pose.yaw - previous_yaw),
+                )
+                accumulated_yaw += delta
+                previous_yaw = pose.yaw
+                used_odom_feedback = True
+            elif not used_odom_feedback and time.time() >= timed_fallback_deadline:
+                stop_reason = "time_fallback_elapsed"
+                break
             time.sleep(step_s)
+        else:
+            stop_reason = "timeout"
         self._cmd_vel_pub.publish(Twist())
+        if used_odom_feedback and previous_yaw is not None:
+            brake_deadline = time.time() + max(step_s * 6.0, 0.4)
+            stable_cycles = 0
+            while time.time() < brake_deadline:
+                self._cmd_vel_pub.publish(Twist())
+                rclpy.spin_once(self, timeout_sec=0.0)
+                pose = self.current_pose_in_frame(self.config.odom_frame)
+                if pose is None:
+                    time.sleep(step_s)
+                    continue
+                delta = math.atan2(
+                    math.sin(pose.yaw - previous_yaw),
+                    math.cos(pose.yaw - previous_yaw),
+                )
+                accumulated_yaw += delta
+                previous_yaw = pose.yaw
+                if abs(delta) <= math.radians(0.6):
+                    stable_cycles += 1
+                    if stable_cycles >= 2:
+                        break
+                else:
+                    stable_cycles = 0
+                time.sleep(step_s)
+        completed = bool(
+            (used_odom_feedback and abs(accumulated_yaw) >= max(abs(target_yaw_rad) - stop_tolerance_rad, 0.0))
+            or (not used_odom_feedback and stop_reason == "time_fallback_elapsed")
+        )
+        return {
+            "spin_completed": completed,
+            "spin_stop_reason": stop_reason,
+            "spin_feedback_frame": self.config.odom_frame if used_odom_feedback else "time_fallback",
+            "actual_unwrapped_yaw_delta_rad": round(accumulated_yaw, 3) if used_odom_feedback else None,
+            "spin_command_angular_speed_rad_s": round(direction * max_command_speed, 3),
+            "spin_timeout_s": round(timeout_s, 3),
+        }
+
+    def _capture_settled_scan_observation(self) -> dict[str, Any] | None:
+        reference_frame = self.config.odom_frame if self.config.publish_internal_navigation_map else self.config.map_frame
+        capture_start = len(self.scan_observations)
+        self.spin_for(self.config.turn_scan_settle_s)
+        observation = self._wait_for_next_scan_observation(capture_start)
+        if observation is not None:
+            return observation
+        if self.scan_observations:
+            latest = self.scan_observations[-1]
+            if str(latest.get("reference_frame", "")) == reference_frame:
+                return dict(latest)
+        return None
+
+    def _wait_for_next_scan_observation(self, after_index: int, *, timeout_s: float = 2.0) -> dict[str, Any] | None:
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            rclpy.spin_once(self, timeout_sec=0.05)
+            if len(self.scan_observations) > after_index:
+                return dict(self.scan_observations[-1])
+        return None
 
     def _action_servers(self, action_name: str) -> list[str]:
         normalized_action = action_name if action_name.startswith("/") else f"/{action_name}"

@@ -626,6 +626,9 @@ HTML_PAGE = """<!doctype html>
         ['Coverage', map ? String(map.coverage || 0) : '0'],
         ['Task', task ? (task.tool_id + ' ' + task.state) : 'idle']
       ];
+      if (map && map.automatic_semantic_waypoints) {
+        items.splice(4, 0, ['Automatic Semantic Places', ((map.semantic_memory || {}).named_places || []).length]);
+      }
       document.getElementById('meta-grid').innerHTML = items.map(([key, value]) => `
         <div class="meta-card">
           <div class="meta-key">${escapeHtml(key)}</div>
@@ -739,11 +742,25 @@ HTML_PAGE = """<!doctype html>
           <text x="${centroid.x}" y="${centroid.y}" text-anchor="middle" font-size="16" fill="#172033" font-weight="600">${escapeHtml(region.label)}</text>
         `;
       }).join('');
-      const namedPlaces = (map.named_places || []).map((place) => {
+      const namedPlaces = (map.named_places || []).filter((place) => place.source !== 'semantic_memory').map((place) => {
         const p = project(place.pose || {x: 0, y: 0});
         return `
           <circle cx="${p.x}" cy="${p.y}" r="5" fill="#0f766e" />
           <text x="${p.x + 8}" y="${p.y - 8}" font-size="12" fill="#0f766e">${escapeHtml(place.name)}</text>
+        `;
+      }).join('');
+      const semanticMemory = map.automatic_semantic_waypoints ? (map.semantic_memory || {}) : {};
+      const semanticEvidence = (semanticMemory.evidence || []).map((ev) => {
+        const p = project(ev.evidence_pose || {x: 0, y: 0});
+        return `<circle cx="${p.x}" cy="${p.y}" r="5" fill="#7c3aed" opacity="0.72"><title>${escapeHtml(ev.label_hint || '')} evidence</title></circle>`;
+      }).join('');
+      const semanticPlaces = (semanticMemory.named_places || []).map((place) => {
+        const anchor = project(place.anchor_pose || {x: 0, y: 0});
+        const evidence = place.evidence_pose ? project(place.evidence_pose) : null;
+        return `
+          ${evidence ? `<line x1="${evidence.x}" y1="${evidence.y}" x2="${anchor.x}" y2="${anchor.y}" stroke="#7c3aed" stroke-width="1.5" stroke-dasharray="3 5" opacity="0.58" />` : ''}
+          <rect x="${anchor.x - 7}" y="${anchor.y - 7}" width="14" height="14" rx="3" fill="#7c3aed" opacity="0.9" />
+          <text x="${anchor.x + 10}" y="${anchor.y + 4}" font-size="12" fill="#4c1d95" font-weight="700">${escapeHtml(place.label || '')}</text>
         `;
       }).join('');
       const frontiers = (map.frontiers || []).map((frontier) => {
@@ -776,6 +793,8 @@ HTML_PAGE = """<!doctype html>
         <polyline points="${trajectory}" fill="none" stroke="#0f766e" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" />
         ${regions}
         ${namedPlaces}
+        ${semanticEvidence}
+        ${semanticPlaces}
         ${frontiers}
         ${robot ? `<circle cx="${robot.x}" cy="${robot.y}" r="11" fill="#a52820" />` : ''}
         ${robot && robotHeading ? `<line x1="${robot.x}" y1="${robot.y}" x2="${robotHeading.x}" y2="${robotHeading.y}" stroke="#6d0f0a" stroke-width="4.5" stroke-linecap="round" />` : ''}

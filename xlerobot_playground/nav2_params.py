@@ -65,10 +65,10 @@ def patch_nav2_params(
     base_frame: str = "base_link",
     scan_topic: str = "/scan",
     robot_radius: float = 0.24,
-    footprint_padding: float = 0.02,
+    footprint_padding: float = 0.0,
     obstacle_max_range: float = 9.5,
     raytrace_max_range: float = 10.0,
-    inflation_radius: float = 0.35,
+    inflation_radius: float = 0.0,
     local_costmap_width: int = 4,
     local_costmap_height: int = 4,
     voxel_origin_z: float = 0.0,
@@ -126,7 +126,11 @@ def patch_nav2_params(
             root["width"] = local_costmap_width
             root["height"] = local_costmap_height
 
-        plugins = root.get("plugins", [])
+        plugins = list(root.get("plugins", []))
+        if inflation_radius <= 0.0 and "inflation_layer" in plugins:
+            plugins = [plugin for plugin in plugins if plugin != "inflation_layer"]
+            root["plugins"] = plugins
+            root.pop("inflation_layer", None)
         if "obstacle_layer" in plugins:
             obstacle_layer = root.setdefault("obstacle_layer", {})
             obstacle_layer["observation_sources"] = "scan"
@@ -135,6 +139,7 @@ def patch_nav2_params(
                 "data_type": "LaserScan",
                 "clearing": True,
                 "marking": True,
+                "inf_is_valid": True,
                 "raytrace_max_range": raytrace_max_range,
                 "obstacle_max_range": obstacle_max_range,
                 "max_obstacle_height": 2.0,
@@ -155,12 +160,13 @@ def patch_nav2_params(
                 "data_type": "LaserScan",
                 "clearing": True,
                 "marking": True,
+                "inf_is_valid": True,
                 "raytrace_max_range": raytrace_max_range,
                 "obstacle_max_range": obstacle_max_range,
                 "max_obstacle_height": 2.0,
             }
 
-        if "inflation_layer" in plugins:
+        if inflation_radius > 0.0 and "inflation_layer" in plugins:
             inflation = root.setdefault("inflation_layer", {})
             inflation["inflation_radius"] = inflation_radius
 
@@ -211,5 +217,6 @@ def patch_nav2_params(
         amcl["global_frame_id"] = map_frame
         amcl["odom_frame_id"] = odom_frame
         amcl["scan_topic"] = scan_topic.lstrip("/")
+        amcl["tf_broadcast"] = False
 
     return params

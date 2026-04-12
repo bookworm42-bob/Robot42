@@ -7,6 +7,7 @@ import heapq
 import json
 import math
 from pathlib import Path
+import threading
 import time
 from typing import Any, Callable, Iterable
 import webbrowser
@@ -17,6 +18,25 @@ from xlerobot_agent.llm import AgentLLMRouter, AgentModelSuite, ModelConfig
 from xlerobot_agent.prompts import (
     build_exploration_policy_system_prompt,
     build_exploration_policy_user_prompt,
+)
+from xlerobot_agent.semantic_prompts import (
+    build_semantic_evidence_extraction_system_prompt,
+    build_semantic_evidence_extraction_user_prompt,
+)
+from xlerobot_playground.semantic_anchors import build_semantic_anchor_candidate
+from xlerobot_playground.semantic_evidence import (
+    PixelRegion,
+    SemanticEvidence,
+    SemanticObservation,
+    deterministic_semantic_id,
+    parse_semantic_observation_payload,
+)
+from xlerobot_playground.semantic_memory import SemanticMemory, normalize_label
+from xlerobot_playground.semantic_projection import (
+    CameraIntrinsics,
+    project_pixel_region_to_map,
+    project_pixel_to_map,
+    representative_pixel_for_image_position,
 )
 from xlerobot_playground.ros_nav2_runtime import (
     GoalStatus,
@@ -29,14 +49,17 @@ from xlerobot_playground.ros_nav2_runtime import (
     rclpy,
     seconds_since,
 )
+from xlerobot_playground.ros_nav2_adapter import RemoteRosExplorationRuntime
 from xlerobot_playground.frontier_runtime import refresh_frontier_records
 from xlerobot_playground.map_editing import (
+    ACTIVE_RGBD_SCAN_FUSION_CONFIG,
     EditableOccupancyMap,
     edits_from_payload,
     merge_occupancy_observation,
     overlay_known_cells,
     overlay_occupancy_payload,
 )
+from xlerobot_playground.scan_fusion import integrate_planar_scan
 
 
 STORED_FRONTIER_REVALIDATION_RADIUS_M = 1.0
@@ -90,19 +113,32 @@ class SimExplorationConfig:
     nav2_behavior_tree: str = "navigate_to_pose_w_replanning_and_recovery.xml"
     nav2_recovery_enabled: bool = True
     nav2_mode: str = "simulated"
+    ros_navigation_map_source: str = "fused_scan"
     ros_map_topic: str = "/map"
     ros_scan_topic: str = "/scan"
     ros_rgb_topic: str = "/camera/head/image_raw"
     ros_cmd_vel_topic: str = "/cmd_vel"
     ros_map_frame: str = "map"
+    ros_odom_frame: str = "odom"
     ros_base_frame: str = "base_link"
+    ros_adapter_url: str | None = None
+    ros_adapter_timeout_s: float = 30.0
     ros_server_timeout_s: float = 10.0
     ros_ready_timeout_s: float = 20.0
     ros_turn_scan_timeout_s: float = 45.0
     ros_turn_scan_settle_s: float = 1.0
-    ros_manual_spin_angular_speed_rad_s: float = 0.55
-    ros_manual_spin_publish_hz: float = 10.0
+    ros_manual_spin_angular_speed_rad_s: float = 0.25
+    ros_manual_spin_publish_hz: float = 20.0
+    sim_motion_speed: str = "normal"
     ros_allow_multiple_action_servers: bool = False
+    experimental_free_space_semantic_waypoints: bool = False
+    semantic_waypoints_enabled: bool = True
+    automatic_semantic_waypoints: bool = False
+    semantic_llm_provider: str | None = None
+    semantic_llm_model: str | None = None
+    semantic_llm_base_url: str | None = None
+    semantic_llm_api_key: str | None = None
+    semantic_vlm_async: bool = True
 
 
 @dataclass(frozen=True, order=True)
@@ -649,7 +685,7 @@ class RosNav2NavigationModule(Nav2NavigationModule):
                 goal_cell=None,
                 reason="ROS occupancy map is not available yet",
             )
-        goal_cell = occupancy_map.world_to_cell(goal.target_pose.x, goal.target_pose.y)
+        goal_cell = GridCell(*occupancy_map.world_to_cell(goal.target_pose.x, goal.target_pose.y))
         normalized_cell = self._normalize_goal_cell(occupancy_map, goal_cell)
         if normalized_cell is None:
             return Nav2GoalValidation(
@@ -759,7 +795,7 @@ class RosNav2NavigationModule(Nav2NavigationModule):
                 reason=reason,
                 recovery_events=tuple(recovery_events),
             )
-        status = int(getattr(outcome, "status", GoalStatus.STATUS_UNKNOWN))
+        status = _goal_status_from_outcome(outcome)
         if status == GoalStatus.STATUS_SUCCEEDED:
             return Nav2NavigateResult(
                 status="succeeded",
@@ -810,17 +846,32 @@ class RosNav2NavigationModule(Nav2NavigationModule):
         )
         return snapshot
 
-    def _normalize_goal_cell(self, occupancy_map: RosOccupancyMap, goal_cell: GridCell) -> GridCell | None:
-        if occupancy_map.is_free(goal_cell.x, goal_cell.y):
+    def _normalize_goal_cell(
+        self,
+        occupancy_map: RosOccupancyMap | EditableOccupancyMap,
+        goal_cell: GridCell,
+    ) -> GridCell | None:
+        def _safe_free(cell: GridCell) -> bool:
+            if not occupancy_map.in_bounds(cell.x, cell.y):
+                return False
+            edge_margin_cells = 3
+            if (
+                cell.x < edge_margin_cells
+                or cell.y < edge_margin_cells
+                or cell.x >= occupancy_map.width - edge_margin_cells
+                or cell.y >= occupancy_map.height - edge_margin_cells
+            ):
+                return False
+            return occupancy_map.is_free(cell.x, cell.y)
+
+        if _safe_free(goal_cell):
             return goal_cell
-        for radius in range(1, 5):
+        for radius in range(1, 9):
             candidates: list[GridCell] = []
             for offset_x in range(-radius, radius + 1):
                 for offset_y in range(-radius, radius + 1):
                     cell = GridCell(goal_cell.x + offset_x, goal_cell.y + offset_y)
-                    if not occupancy_map.in_bounds(cell.x, cell.y):
-                        continue
-                    if not occupancy_map.is_free(cell.x, cell.y):
+                    if not _safe_free(cell):
                         continue
                     candidates.append(cell)
             if candidates:
@@ -829,6 +880,23 @@ class RosNav2NavigationModule(Nav2NavigationModule):
                     key=lambda item: _grid_distance_cells(item, goal_cell),
                 )
         return None
+
+
+def _occupancy_map_like_to_ros_map(
+    occupancy_map: RosOccupancyMap | EditableOccupancyMap,
+) -> RosOccupancyMap:
+    data: list[int] = []
+    for y in range(int(occupancy_map.height)):
+        for x in range(int(occupancy_map.width)):
+            data.append(int(occupancy_map.value(x, y)))
+    return RosOccupancyMap(
+        resolution=float(occupancy_map.resolution),
+        width=int(occupancy_map.width),
+        height=int(occupancy_map.height),
+        origin_x=float(occupancy_map.origin_x),
+        origin_y=float(occupancy_map.origin_y),
+        data=tuple(data),
+    )
 
 class FrontierMemory:
     def __init__(self, resolution: float) -> None:
@@ -1132,6 +1200,16 @@ class ExplorationLLMPolicy:
             trace["response"] = heuristic.to_dict()
             trace["fallback_reason"] = "llm_invalid_decision"
             return heuristic, trace
+        ignored_legacy_semantic_updates = self._ignored_legacy_semantic_updates(parsed)
+        if ignored_legacy_semantic_updates:
+            trace["ignored_legacy_frontier_semantic_update"] = {
+                "count": len(ignored_legacy_semantic_updates),
+                "reason": (
+                    "frontier policy semantic updates are deprecated; visual semantic places are handled by "
+                    "the passive RGB-D evidence pipeline"
+                ),
+                "items": ignored_legacy_semantic_updates,
+            }
         trace["response"] = decision.to_dict()
         return decision, trace
 
@@ -1190,7 +1268,7 @@ class ExplorationLLMPolicy:
         if hallway_waypoint and current_room_id not in {None, "region_hallway"} and best.room_hint != current_room_id:
             selected_return_waypoint_id = str(hallway_waypoint["waypoint_id"])
         semantic_updates: list[dict[str, Any]] = []
-        if best.room_hint:
+        if self.config.experimental_free_space_semantic_waypoints and best.room_hint:
             semantic_updates.append(
                 {
                     "label": best.room_hint.replace("region_", ""),
@@ -1270,11 +1348,13 @@ class ExplorationLLMPolicy:
             for item in payload.get("frontier_ids_to_store", [])
             if str(item) in valid_frontier_ids and str(item) != selected_frontier_id
         ]
-        semantic_updates = [
-            item
-            for item in payload.get("semantic_updates", [])
-            if isinstance(item, dict)
-        ][:6]
+        semantic_updates = []
+        if self.config.experimental_free_space_semantic_waypoints:
+            semantic_updates = [
+                item
+                for item in payload.get("semantic_updates", [])
+                if isinstance(item, dict)
+            ][:6]
         decision = ExplorationDecision(
             decision_type=decision_type,
             selected_frontier_id=selected_frontier_id,
@@ -1328,6 +1408,514 @@ class ExplorationLLMPolicy:
             )
         return parsed_updates
 
+    def _ignored_legacy_semantic_updates(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
+        if self.config.experimental_free_space_semantic_waypoints:
+            return []
+        raw_updates = payload.get("semantic_updates", [])
+        if not isinstance(raw_updates, list):
+            return []
+        ignored: list[dict[str, Any]] = []
+        for item in raw_updates:
+            if isinstance(item, dict):
+                ignored.append(json.loads(json.dumps(item)))
+        return ignored[:6]
+
+
+OBJECT_SEMANTIC_LABEL_HINTS = {
+    "fridge": "kitchen",
+    "sink": "kitchen",
+    "oven": "kitchen",
+    "counter": "kitchen",
+    "island": "kitchen",
+    "cabinet": "kitchen",
+    "sofa": "living_room",
+    "tv": "living_room",
+    "coffee table": "living_room",
+    "rug": "living_room",
+    "desk": "desk_area",
+    "monitor": "desk_area",
+    "keyboard": "desk_area",
+    "office chair": "desk_area",
+    "chair": "desk_area",
+    "table": "dining_area",
+    "dining table": "dining_area",
+    "dining chair": "dining_area",
+    "bed": "bedroom",
+    "wardrobe": "bedroom",
+    "nightstand": "bedroom",
+    "toilet": "bathroom_entry",
+    "bathtub": "bathroom_entry",
+    "mirror": "bathroom_entry",
+    "charging dock": "hallway",
+    "shoe rack": "hallway",
+}
+
+
+class SemanticWaypointObserver:
+    def __init__(self, config: SimExplorationConfig, *, scenario: ApartmentScenario | None = None) -> None:
+        self.config = config
+        self.scenario = scenario
+        self.memory = SemanticMemory()
+        self.traces: list[dict[str, Any]] = []
+        self._evidence_index = 0
+        self._anchor_index = 0
+        self._observation_index = 0
+        self._lock = threading.RLock()
+        self.router: AgentLLMRouter | None = None
+        provider = config.semantic_llm_provider or config.llm_provider
+        model = config.semantic_llm_model or config.llm_model
+        if config.automatic_semantic_waypoints and config.semantic_waypoints_enabled and provider != "mock" and model != "mock":
+            model_config = ModelConfig(
+                provider=provider,
+                model=model,
+                base_url=config.semantic_llm_base_url or config.llm_base_url,
+                api_key=config.semantic_llm_api_key or config.llm_api_key,
+                temperature=config.llm_temperature,
+                max_tokens=config.llm_max_tokens,
+                reasoning_effort=config.llm_reasoning_effort,
+            )
+            self.router = AgentLLMRouter(
+                AgentModelSuite(planner=model_config, critic=model_config, coder=model_config, visual_summary=model_config)
+            )
+
+    def observe_keyframe(
+        self,
+        *,
+        frame: dict[str, Any],
+        known_cells: dict[GridCell, str],
+        robot_cell: GridCell,
+        resolution: float,
+        depth_image: Any = None,
+        intrinsics: CameraIntrinsics | None = None,
+    ) -> None:
+        if not self.config.semantic_waypoints_enabled:
+            return
+        trace: dict[str, Any] = {
+            "type": "semantic_keyframe_observation",
+            "frame_id": frame.get("frame_id"),
+            "source": "heuristic_visible_objects",
+            "created_evidence_ids": [],
+            "created_anchor_ids": [],
+            "warnings": [],
+        }
+        observations = self._heuristic_observations_from_frame(frame)
+        if not observations and self.router is not None and frame.get("thumbnail_data_url"):
+            if self.config.semantic_vlm_async:
+                self._queue_vlm_observation(
+                    frame=frame,
+                    known_cells=known_cells,
+                    robot_cell=robot_cell,
+                    resolution=resolution,
+                    depth_image=depth_image,
+                    intrinsics=intrinsics,
+                    trace=trace,
+                )
+                return
+            observations, trace = self._vlm_observations_from_frame(frame, trace)
+        if not observations:
+            trace["status"] = "no_semantic_observations"
+            with self._lock:
+                self.traces.append(trace)
+            return
+        self._process_observations(
+            observations=observations,
+            frame=frame,
+            known_cells=known_cells,
+            robot_cell=robot_cell,
+            resolution=resolution,
+            depth_image=depth_image,
+            intrinsics=intrinsics,
+            trace=trace,
+        )
+
+    def observe_keyframe_batch(
+        self,
+        *,
+        frames: list[dict[str, Any]],
+        known_cells: dict[GridCell, str],
+        robot_cell: GridCell,
+        resolution: float,
+    ) -> dict[str, Any]:
+        if not self.config.semantic_waypoints_enabled:
+            return {"status": "disabled", "frame_count": len(frames)}
+        frame_ids = [str(frame.get("frame_id", "")) for frame in frames if frame.get("frame_id")]
+        trace: dict[str, Any] = {
+            "type": "semantic_spin_batch_observation",
+            "frame_ids": frame_ids,
+            "source": "heuristic_visible_objects_batch",
+            "created_evidence_ids": [],
+            "created_anchor_ids": [],
+            "warnings": [],
+        }
+        observations_by_frame = [
+            (frame, self._heuristic_observations_from_frame(frame))
+            for frame in frames
+        ]
+        if any(observations for _, observations in observations_by_frame):
+            for frame, observations in observations_by_frame:
+                if not observations:
+                    continue
+                self._process_observations(
+                    observations=observations,
+                    frame=frame,
+                    known_cells=known_cells,
+                    robot_cell=robot_cell,
+                    resolution=resolution,
+                    depth_image=None,
+                    intrinsics=None,
+                    trace=trace,
+                    append_trace=False,
+                )
+            trace["status"] = "processed"
+            with self._lock:
+                self.traces.append(trace)
+            return trace
+
+        if self.router is None or not frames:
+            trace["status"] = "no_semantic_observations"
+            with self._lock:
+                self.traces.append(trace)
+            return trace
+
+        observations, trace = self._vlm_observations_from_frames(frames, trace)
+        if not observations:
+            trace["status"] = "no_semantic_observations"
+            with self._lock:
+                self.traces.append(trace)
+            return trace
+        representative_frame = frames[-1]
+        self._process_observations(
+            observations=observations,
+            frame=representative_frame,
+            known_cells=known_cells,
+            robot_cell=robot_cell,
+            resolution=resolution,
+            depth_image=None,
+            intrinsics=None,
+            trace=trace,
+        )
+        return trace
+
+    def _process_observations(
+        self,
+        *,
+        observations: list[SemanticObservation],
+        frame: dict[str, Any],
+        known_cells: dict[GridCell, str],
+        robot_cell: GridCell,
+        resolution: float,
+        depth_image: Any,
+        intrinsics: CameraIntrinsics | None,
+        trace: dict[str, Any],
+        append_trace: bool = True,
+    ) -> None:
+        for observation in observations:
+            evidence_pose = self._project_observation(
+                observation=observation,
+                frame=frame,
+                depth_image=depth_image,
+                intrinsics=intrinsics,
+            )
+            if evidence_pose is None:
+                trace["warnings"].append(f"could not project observation {observation.observation_id}")
+                continue
+            with self._lock:
+                self._evidence_index += 1
+                evidence_id = deterministic_semantic_id("sem_ev", self._evidence_index)
+            evidence = SemanticEvidence(
+                evidence_id=evidence_id,
+                label_hint=normalize_label(observation.label_hint),
+                evidence_pose=evidence_pose,
+                source_frame_ids=(observation.frame_id,),
+                source_pixels=observation.pixel_regions,
+                confidence=observation.confidence,
+                evidence=tuple(
+                    _dedupe_text(
+                        [
+                            *observation.visual_cues,
+                            observation.reasoning_summary,
+                            "semantic evidence projected from RGB-D keyframe into map coordinates",
+                        ]
+                    )
+                ),
+            )
+            with self._lock:
+                self.memory.add_evidence(evidence)
+                self._anchor_index += 1
+                anchor_id = deterministic_semantic_id("sem_anchor", self._anchor_index)
+            anchor = build_semantic_anchor_candidate(
+                anchor_id=anchor_id,
+                evidence=evidence,
+                known_cells=known_cells,
+                resolution=resolution,
+                robot_cell=robot_cell,
+            )
+            with self._lock:
+                self.memory.add_anchor(anchor)
+            trace["created_evidence_ids"].append(evidence.evidence_id)
+            trace["created_anchor_ids"].append(anchor.anchor_id)
+        trace["status"] = "processed"
+        if append_trace:
+            with self._lock:
+                self.traces.append(trace)
+
+    def _queue_vlm_observation(
+        self,
+        *,
+        frame: dict[str, Any],
+        known_cells: dict[GridCell, str],
+        robot_cell: GridCell,
+        resolution: float,
+        depth_image: Any,
+        intrinsics: CameraIntrinsics | None,
+        trace: dict[str, Any],
+    ) -> None:
+        trace["source"] = "semantic_vlm_async"
+        trace["status"] = "queued"
+        trace["warnings"].append("semantic VLM queued in background so exploration UI startup is not blocked")
+        with self._lock:
+            self.traces.append(trace)
+
+        def _worker() -> None:
+            worker_trace: dict[str, Any] = {
+                "type": "semantic_keyframe_observation",
+                "frame_id": frame.get("frame_id"),
+                "source": "semantic_vlm_async",
+                "created_evidence_ids": [],
+                "created_anchor_ids": [],
+                "warnings": [],
+            }
+            observations, worker_trace = self._vlm_observations_from_frame(dict(frame), worker_trace)
+            if not observations:
+                worker_trace["status"] = "no_semantic_observations"
+                with self._lock:
+                    self.traces.append(worker_trace)
+                return
+            self._process_observations(
+                observations=observations,
+                frame=dict(frame),
+                known_cells=dict(known_cells),
+                robot_cell=robot_cell,
+                resolution=resolution,
+                depth_image=depth_image,
+                intrinsics=intrinsics,
+                trace=worker_trace,
+            )
+
+        threading.Thread(target=_worker, name=f"semantic-vlm-{frame.get('frame_id', 'frame')}", daemon=True).start()
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            snapshot = self.memory.snapshot()
+            snapshot["traces"] = list(self.traces)
+        snapshot["enabled"] = self.config.semantic_waypoints_enabled
+        snapshot["llm_provider"] = self.config.semantic_llm_provider or self.config.llm_provider
+        snapshot["llm_model"] = self.config.semantic_llm_model or self.config.llm_model
+        return snapshot
+
+    def _heuristic_observations_from_frame(self, frame: dict[str, Any]) -> list[SemanticObservation]:
+        frame_id = str(frame.get("frame_id", "")).strip()
+        visible_objects = [str(item).strip().lower() for item in frame.get("visible_objects", []) if str(item).strip()]
+        if not frame_id or not visible_objects:
+            return []
+        grouped: dict[str, list[str]] = {}
+        for object_label in visible_objects:
+            label = OBJECT_SEMANTIC_LABEL_HINTS.get(object_label)
+            if label is None:
+                continue
+            grouped.setdefault(label, []).append(object_label)
+        observations: list[SemanticObservation] = []
+        for label, objects in grouped.items():
+            self._observation_index += 1
+            regions = tuple(
+                PixelRegion(
+                    frame_id=frame_id,
+                    bbox_xyxy=(120, 120, 520, 380),
+                    center_uv=(320, 240),
+                    depth_m=None,
+                    image_position="center",
+                    object_label=object_label,
+                    description=f"{object_label} visible in simulated RGB-D scan",
+                )
+                for object_label in objects[:4]
+            )
+            observations.append(
+                SemanticObservation(
+                    observation_id=deterministic_semantic_id("sem_obs", self._observation_index),
+                    frame_id=frame_id,
+                    label_hint=label,
+                    confidence=min(0.55 + 0.08 * len(objects), 0.86),
+                    pixel_regions=regions,
+                    visual_cues=tuple(f"{item} visible" for item in objects[:6]),
+                    reasoning_summary=f"{', '.join(objects[:4])} support a {label} place label.",
+                )
+            )
+        return observations
+
+    def _vlm_observations_from_frame(
+        self,
+        frame: dict[str, Any],
+        trace: dict[str, Any],
+    ) -> tuple[list[SemanticObservation], dict[str, Any]]:
+        assert self.router is not None
+        payload = {
+            "frame_id": frame.get("frame_id"),
+            "camera_pose": frame.get("pose"),
+            "rgbd_summary": frame.get("rgbd_summary", {}),
+            "description": frame.get("description"),
+            "prior_semantic_memory": {
+                "named_places": self.memory.snapshot().get("named_places", [])[-8:],
+                "clusters": self.memory.snapshot().get("clusters", [])[-12:],
+            },
+            "rgb_image": frame.get("thumbnail_data_url"),
+        }
+        user_prompt = build_semantic_evidence_extraction_user_prompt(payload)
+        messages = [
+            {"role": "system", "content": build_semantic_evidence_extraction_system_prompt()},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": user_prompt},
+                    {"type": "image_url", "image_url": {"url": frame["thumbnail_data_url"]}},
+                ],
+            },
+        ]
+        parsed, llm_trace = self.router.complete_json_messages(
+            config=self.router.model_suite.planner,
+            messages=messages,
+        )
+        trace["source"] = "semantic_vlm"
+        trace["llm_trace"] = {
+            "provider": llm_trace.provider,
+            "model": llm_trace.model,
+            "duration_s": llm_trace.duration_s,
+            "error": llm_trace.error,
+            "response_text": llm_trace.response_text[:1000],
+        }
+        if parsed is None:
+            trace["warnings"].append("semantic VLM returned no parseable JSON")
+            return [], trace
+        observations, warnings = parse_semantic_observation_payload(
+            parsed,
+            fallback_frame_id=str(frame.get("frame_id", "")),
+            id_start=self._observation_index + 1,
+        )
+        self._observation_index += len(observations)
+        trace["warnings"].extend(warnings)
+        return observations, trace
+
+    def _vlm_observations_from_frames(
+        self,
+        frames: list[dict[str, Any]],
+        trace: dict[str, Any],
+    ) -> tuple[list[SemanticObservation], dict[str, Any]]:
+        assert self.router is not None
+        payload = {
+            "frame_id": f"spin_{frames[0].get('frame_id', 'start')}_to_{frames[-1].get('frame_id', 'end')}",
+            "frames": [
+                {
+                    "frame_id": frame.get("frame_id"),
+                    "camera_pose": frame.get("pose"),
+                    "rgbd_summary": frame.get("rgbd_summary", {}),
+                    "description": frame.get("description"),
+                    "rgb_image": frame.get("thumbnail_data_url"),
+                }
+                for frame in frames
+            ],
+            "instruction": "Analyze these images as one completed spin. Return one JSON object for the whole spin.",
+            "prior_semantic_memory": {
+                "named_places": self.memory.snapshot().get("named_places", [])[-8:],
+                "clusters": self.memory.snapshot().get("clusters", [])[-12:],
+            },
+        }
+        user_prompt = build_semantic_evidence_extraction_user_prompt(payload)
+        image_items = [
+            {"type": "image_url", "image_url": {"url": frame["thumbnail_data_url"]}}
+            for frame in frames
+            if frame.get("thumbnail_data_url")
+        ]
+        messages = [
+            {"role": "system", "content": build_semantic_evidence_extraction_system_prompt()},
+            {"role": "user", "content": [{"type": "text", "text": user_prompt}, *image_items]},
+        ]
+        parsed, llm_trace = self.router.complete_json_messages(
+            config=self.router.model_suite.planner,
+            messages=messages,
+        )
+        trace["source"] = "semantic_vlm_spin_batch"
+        trace["llm_trace"] = {
+            "provider": llm_trace.provider,
+            "model": llm_trace.model,
+            "duration_s": llm_trace.duration_s,
+            "error": llm_trace.error,
+            "response_text": llm_trace.response_text[:1000],
+        }
+        if parsed is None:
+            trace["warnings"].append("semantic VLM returned no parseable JSON for spin batch")
+            return [], trace
+        observations, warnings = parse_semantic_observation_payload(
+            parsed,
+            fallback_frame_id=str(payload["frame_id"]),
+            id_start=self._observation_index + 1,
+        )
+        self._observation_index += len(observations)
+        trace["warnings"].extend(warnings)
+        return observations, trace
+
+    def _project_observation(
+        self,
+        *,
+        observation: SemanticObservation,
+        frame: dict[str, Any],
+        depth_image: Any,
+        intrinsics: CameraIntrinsics | None,
+    ) -> Pose2D | None:
+        object_pose = self._scenario_object_pose(observation)
+        if object_pose is not None:
+            return object_pose
+        frame_pose = _pose_from_mapping(frame.get("pose", {}))
+        if frame_pose is None:
+            return None
+        if depth_image is not None and intrinsics is not None:
+            for region in observation.pixel_regions:
+                pose = project_pixel_region_to_map(
+                    pixel_region=region,
+                    depth_image=depth_image,
+                    intrinsics=intrinsics,
+                    camera_pose=frame_pose,
+                    fallback_depth_m=_frame_fallback_depth_m(frame),
+                )
+                if pose is not None:
+                    return pose
+        first_region = observation.pixel_regions[0] if observation.pixel_regions else None
+        if first_region is None or intrinsics is None:
+            depth_m = _frame_fallback_depth_m(frame)
+            if depth_m is None:
+                return None
+            return Pose2D(
+                frame_pose.x + math.cos(frame_pose.yaw) * depth_m,
+                frame_pose.y + math.sin(frame_pose.yaw) * depth_m,
+                0.0,
+            )
+        u, v = representative_pixel_for_image_position(first_region.image_position, intrinsics)
+        depth_m = _frame_fallback_depth_m(frame) or 2.0
+        return project_pixel_to_map(u=u, v=v, depth_m=depth_m, intrinsics=intrinsics, camera_pose=frame_pose)
+
+    def _scenario_object_pose(self, observation: SemanticObservation) -> Pose2D | None:
+        if self.scenario is None:
+            return None
+        labels = {
+            str(region.object_label).lower()
+            for region in observation.pixel_regions
+            if region.object_label
+        }
+        matches = [item for item in self.scenario.objects if item.label.lower() in labels]
+        if not matches:
+            return None
+        x = sum((item.cell.x + 0.5) * self.scenario.resolution for item in matches) / len(matches)
+        y = sum((item.cell.y + 0.5) * self.scenario.resolution for item in matches) / len(matches)
+        return Pose2D(x, y, 0.0)
+
 
 class _ApartmentExplorationSession:
     def __init__(self, config: SimExplorationConfig, backend: ExplorationBackend, task_id: str) -> None:
@@ -1337,6 +1925,7 @@ class _ApartmentExplorationSession:
         self.scenario = _build_simple_apartment(config.occupancy_resolution)
         self.policy = ExplorationLLMPolicy(config)
         self.frontier_memory = FrontierMemory(config.occupancy_resolution)
+        self.semantic_observer = SemanticWaypointObserver(config, scenario=self.scenario)
         self.current_cell = self.scenario.start_cell
         self.current_yaw = 0.0
         self.known_cells: dict[GridCell, str] = {}
@@ -1351,6 +1940,11 @@ class _ApartmentExplorationSession:
         self.decision_log: list[dict[str, Any]] = []
         self.guardrail_events: list[dict[str, Any]] = []
         self.semantic_updates: list[dict[str, Any]] = []
+        self.scan_known_cells: dict[GridCell, str] = {}
+        self.scan_occupancy_evidence: dict[GridCell, float] = {}
+        self.scan_range_edge_cells: set[GridCell] = set()
+        self.scan_observation_index = 0
+        self.scan_map_resolution = config.occupancy_resolution
         self.total_distance_m = 0.0
         self.control_steps = 0
         self.decision_index = 0
@@ -1593,6 +2187,13 @@ class _ApartmentExplorationSession:
                 "thumbnail_data_url": scan.thumbnail_data_url,
             }
             self.keyframes.append(frame)
+            if self.config.automatic_semantic_waypoints:
+                self.semantic_observer.observe_keyframe(
+                    frame=frame,
+                    known_cells=self._effective_known_cells(),
+                    robot_cell=self.current_cell,
+                    resolution=self.scenario.resolution,
+                )
             if current_room_id:
                 self.room_frames.setdefault(current_room_id, []).append(frame_id)
         self._sleep()
@@ -2068,6 +2669,7 @@ class _ApartmentExplorationSession:
         return known / len(room_cells)
 
     def _build_map_payload(self) -> dict[str, Any]:
+        semantic_memory = self.semantic_observer.snapshot() if self.config.automatic_semantic_waypoints else {}
         occupancy_cells = []
         for cell, state in sorted(self._effective_known_cells().items()):
             item = {
@@ -2126,8 +2728,9 @@ class _ApartmentExplorationSession:
                         }
                     )
 
-        aggregated_semantics = _aggregate_semantic_updates(self.semantic_updates)
-        semantic_area_candidates.extend(aggregated_semantics)
+        if self.config.experimental_free_space_semantic_waypoints:
+            aggregated_semantics = _aggregate_semantic_updates(self.semantic_updates)
+            semantic_area_candidates.extend(aggregated_semantics)
 
         summary = (
             f"Agentic apartment exploration completed with coverage {self._coverage():.3f}, "
@@ -2146,7 +2749,7 @@ class _ApartmentExplorationSession:
             "trajectory": self.trajectory,
             "keyframes": self.keyframes,
             "regions": regions,
-            "named_places": [],
+            "named_places": _semantic_named_places_for_map(semantic_memory) if self.config.automatic_semantic_waypoints else [],
             "occupancy": {
                 "resolution": float(self.config.occupancy_resolution),
                 "bounds": self.scenario.bounds(),
@@ -2154,6 +2757,8 @@ class _ApartmentExplorationSession:
             },
             "frontiers": [record.to_dict() for record in self.frontier_memory.records.values()],
             "semantic_area_candidates": semantic_area_candidates,
+            "semantic_memory": semantic_memory,
+            "automatic_semantic_waypoints": self.config.automatic_semantic_waypoints,
             "artifacts": {
                 "layout_id": self.scenario.layout_id,
                 "decision_log": self.decision_log,
@@ -2232,12 +2837,12 @@ class _ApartmentExplorationSession:
 
 class RosExplorationSession:
     def __init__(self, config: SimExplorationConfig, backend: ExplorationBackend, task_id: str) -> None:
-        require_ros_nav2_runtime_dependencies()
         self.config = config
         self.backend = backend
         self.task_id = task_id
         self.policy = ExplorationLLMPolicy(config)
         self.frontier_memory = FrontierMemory(config.occupancy_resolution)
+        self.semantic_observer = SemanticWaypointObserver(config, scenario=None)
         self.manual_occupancy_edits = edits_from_payload({}, cell_type=GridCell)
         self.keyframes: list[dict[str, Any]] = []
         self.trajectory: list[dict[str, Any]] = []
@@ -2248,35 +2853,54 @@ class RosExplorationSession:
         self.control_steps = 0
         self.decision_index = 0
         self.nav2_goal_counter = 0
+        self.status = "not_started"
+        self.pending_prompt_payload: dict[str, Any] | None = None
+        self.pending_prompt_text: str | None = None
+        self.pending_candidate_records: list[FrontierRecord] = []
+        self.pending_decision: ExplorationDecision | None = None
+        self.pending_trace: dict[str, Any] | None = None
+        self.applied_memory_updates: list[dict[str, Any]] = []
+        self.last_error: str | None = None
+        self._lock = threading.RLock()
         self._last_pose: Pose2D | None = None
         self._owns_rclpy = False
-        if not rclpy.ok():
-            rclpy.init(args=None)
-            self._owns_rclpy = True
-        self.runtime = RosExplorationRuntime(
-            RosRuntimeConfig(
-                map_topic=config.ros_map_topic,
-                scan_topic=config.ros_scan_topic,
-                rgb_topic=config.ros_rgb_topic,
-                cmd_vel_topic=config.ros_cmd_vel_topic,
-                map_frame=config.ros_map_frame,
-                base_frame=config.ros_base_frame,
-                server_timeout_s=config.ros_server_timeout_s,
-                ready_timeout_s=config.ros_ready_timeout_s,
-                turn_scan_radians=math.tau,
-                turn_scan_timeout_s=config.ros_turn_scan_timeout_s,
-                turn_scan_settle_s=config.ros_turn_scan_settle_s,
-                manual_spin_angular_speed_rad_s=config.ros_manual_spin_angular_speed_rad_s,
-                manual_spin_publish_hz=config.ros_manual_spin_publish_hz,
-                allow_multiple_action_servers=config.ros_allow_multiple_action_servers,
+        if config.ros_adapter_url:
+            self.runtime = RemoteRosExplorationRuntime(
+                config.ros_adapter_url,
+                timeout_s=config.ros_adapter_timeout_s,
             )
-        )
+        else:
+            require_ros_nav2_runtime_dependencies()
+            if not rclpy.ok():
+                rclpy.init(args=None)
+                self._owns_rclpy = True
+            self.runtime = RosExplorationRuntime(
+                RosRuntimeConfig(
+                    map_topic=config.ros_map_topic,
+                    scan_topic=config.ros_scan_topic,
+                    rgb_topic=config.ros_rgb_topic,
+                    cmd_vel_topic=config.ros_cmd_vel_topic,
+                    map_frame=config.ros_map_frame,
+                    odom_frame=config.ros_odom_frame,
+                    base_frame=config.ros_base_frame,
+                    server_timeout_s=config.ros_server_timeout_s,
+                    ready_timeout_s=config.ros_ready_timeout_s,
+                    turn_scan_radians=math.tau,
+                    turn_scan_timeout_s=config.ros_turn_scan_timeout_s,
+                    turn_scan_settle_s=config.ros_turn_scan_settle_s,
+                    manual_spin_angular_speed_rad_s=config.ros_manual_spin_angular_speed_rad_s,
+                    manual_spin_publish_hz=config.ros_manual_spin_publish_hz,
+                    allow_multiple_action_servers=config.ros_allow_multiple_action_servers,
+                    publish_internal_navigation_map=config.ros_navigation_map_source == "fused_scan",
+                )
+            )
         self.nav2 = RosNav2NavigationModule(
             config,
             self.runtime,
             current_map=self._current_effective_map,
             should_cancel=self._pause_requested_or_canceled,
         )
+        self.scan_observation_index = self.runtime.scan_observation_count()
 
     def close(self) -> None:
         try:
@@ -2286,16 +2910,7 @@ class RosExplorationSession:
                 rclpy.shutdown()
 
     def run(self) -> dict[str, Any]:
-        self.runtime.spin_until_ready(timeout_s=self.config.ros_ready_timeout_s)
-        initial_pose = self._require_pose()
-        self._update_pose_history(initial_pose)
-        self.frontier_memory.remember_return_waypoint(
-            room_id=None,
-            pose=initial_pose,
-            step_index=0,
-            reason="initial_pose",
-        )
-        self._perform_turnaround_scan(reason="initial_turnaround_scan")
+        self._initialize_scan_state()
         self._publish_live_map("Initial ROS/Nav2 scan complete.")
 
         while self.decision_index < self.config.max_decisions:
@@ -2416,8 +3031,286 @@ class RosExplorationSession:
 
         return self._build_map_payload()
 
-    def _current_map(self) -> RosOccupancyMap | None:
+    def reset(self) -> dict[str, Any]:
+        with self._lock:
+            self.frontier_memory = FrontierMemory(self.config.occupancy_resolution)
+            self.semantic_observer = SemanticWaypointObserver(self.config, scenario=None)
+            self.manual_occupancy_edits = edits_from_payload({}, cell_type=GridCell)
+            self.keyframes = []
+            self.trajectory = []
+            self.decision_log = []
+            self.guardrail_events = []
+            self.semantic_updates = []
+            self.scan_known_cells = {}
+            self.scan_occupancy_evidence = {}
+            self.scan_range_edge_cells = set()
+            self.scan_observation_index = self.runtime.scan_observation_count()
+            if self.runtime.latest_map is not None:
+                self.scan_map_resolution = float(self.runtime.latest_map.resolution)
+            else:
+                self.scan_map_resolution = self.config.occupancy_resolution
+            self.total_distance_m = 0.0
+            self.control_steps = 0
+            self.decision_index = 0
+            self.nav2_goal_counter = 0
+            self.pending_prompt_payload = None
+            self.pending_prompt_text = None
+            self.pending_candidate_records = []
+            self.pending_decision = None
+            self.pending_trace = None
+            self.applied_memory_updates = []
+            self.last_error = None
+            self._last_pose = None
+            self.backend.resume_task(self.task_id)
+            self._initialize_scan_state()
+            self._prepare_decision_locked()
+            return self.snapshot()
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            pose = self.runtime.current_pose()
+            if pose is not None:
+                self._update_pose_history(pose)
+            return {
+                "status": self.status,
+                "session": self.config.session,
+                "coverage": round(self._coverage(self._require_effective_map()), 3),
+                "robot_pose": (pose or Pose2D(0.0, 0.0, 0.0)).to_dict(),
+                "prompt": self.pending_prompt_text,
+                "prompt_payload": self.pending_prompt_payload,
+                "candidate_frontiers": [record.to_dict() for record in self.pending_candidate_records],
+                "pending_decision": None if self.pending_decision is None else self.pending_decision.to_dict(),
+                "pending_trace": self.pending_trace,
+                "pending_target": self._pending_target(),
+                "applied_memory_updates": list(self.applied_memory_updates),
+                "last_error": self.last_error,
+                "map": self._build_map_payload(),
+            }
+
+    def call_llm(self) -> dict[str, Any]:
+        with self._lock:
+            self.last_error = None
+            task = self.backend.get_task(self.task_id)
+            if task and bool(task.get("paused", False)):
+                self.last_error = "Exploration is paused. Resume before calling the LLM."
+                return self.snapshot()
+            if self.pending_prompt_payload is None:
+                self._prepare_decision_locked()
+            assert self.pending_prompt_payload is not None
+            decision, trace = self.policy.decide(
+                prompt_payload=self.pending_prompt_payload,
+                frontiers=self.pending_candidate_records,
+                return_waypoints=list(self.frontier_memory.return_waypoints.values()),
+                coverage=self._coverage(self._require_effective_map()),
+                current_room_id=None,
+            )
+            decision = self._apply_finish_guardrail(decision, self.pending_candidate_records)
+            applied_memory_updates = self.frontier_memory.apply_model_memory_updates(
+                decision.memory_updates,
+                selected_frontier_id=decision.selected_frontier_id,
+            )
+            trace["applied_memory_updates"] = applied_memory_updates
+            self.pending_decision = decision
+            self.pending_trace = trace
+            self.applied_memory_updates = applied_memory_updates
+            self.status = "llm_response_ready"
+            self._push_progress_update(message="LLM frontier decision ready.", frontier_id=decision.selected_frontier_id)
+            return self.snapshot()
+
+    def apply_decision(self) -> dict[str, Any]:
+        with self._lock:
+            self.last_error = None
+            task = self.backend.get_task(self.task_id)
+            if task and bool(task.get("paused", False)):
+                self.last_error = "Exploration is paused. Resume before applying a decision."
+                return self.snapshot()
+            if self.pending_decision is None:
+                self.last_error = "No pending LLM decision. Click `Call LLM` first."
+                return self.snapshot()
+            decision = self.pending_decision
+            if decision.decision_type == "finish" or decision.exploration_complete:
+                self.status = "finished"
+                self.pending_decision = None
+                self._push_progress_update(message="LLM marked exploration finished.", frontier_id=None)
+                return self.snapshot()
+
+            if decision.selected_return_waypoint_id:
+                waypoint = self.frontier_memory.get_return_waypoint(decision.selected_return_waypoint_id)
+                if waypoint is not None:
+                    target_pose = waypoint["pose"]
+                    return_goal = self._make_nav2_goal(
+                        Pose2D(
+                            float(target_pose["x"]),
+                            float(target_pose["y"]),
+                            float(target_pose.get("yaw", 0.0)),
+                        ),
+                        goal_type="return_waypoint",
+                        reason=f"return_waypoint::{waypoint['waypoint_id']}",
+                    )
+                    return_result = self.nav2.navigate_to_pose(return_goal)
+                    self._consume_nav_result(return_result)
+                    if return_result.status != "succeeded":
+                        self.guardrail_events.append(
+                            {
+                                "type": "return_waypoint_failed",
+                                "waypoint_id": waypoint["waypoint_id"],
+                                "nav2_result": return_result.to_dict(),
+                            }
+                        )
+
+            if not decision.selected_frontier_id:
+                self.last_error = "The LLM decision did not select a frontier."
+                return self.snapshot()
+
+            record = self.frontier_memory.activate(decision.selected_frontier_id)
+            if record is None:
+                self.last_error = f"Selected frontier `{decision.selected_frontier_id}` no longer exists."
+                return self.snapshot()
+
+            self.status = "nav2_goal_active"
+            self._push_progress_update(message=f"Sending Nav2 goal for {record.frontier_id}.", frontier_id=record.frontier_id)
+            frontier_goal = self._make_nav2_goal(
+                record.nav_pose,
+                goal_type="frontier",
+                reason=f"frontier::{record.frontier_id}",
+            )
+            nav_result = self.nav2.navigate_to_pose(frontier_goal)
+            self._consume_nav_result(nav_result)
+            if nav_result.status != "succeeded":
+                _mark_frontier_unreachable_as_visited(self.frontier_memory, record.frontier_id, nav_result.reason)
+                self.guardrail_events.append(
+                    {
+                        "type": "nav2_frontier_marked_visited_after_failure",
+                        "frontier_id": record.frontier_id,
+                        "nav2_result": nav_result.to_dict(),
+                    }
+                )
+                self.status = "nav2_goal_failed"
+                self.pending_decision = None
+                self._push_progress_update(
+                    message=f"Marked {record.frontier_id} visited after Nav2 failed to reach it: {nav_result.reason}",
+                    frontier_id=record.frontier_id,
+                )
+                self._prepare_decision_locked()
+                return self.snapshot()
+
+            self._perform_turnaround_scan(reason=f"arrive_frontier::{record.frontier_id}")
+            self.frontier_memory.complete(record.frontier_id)
+            current_pose = self._require_pose()
+            self.frontier_memory.remember_return_waypoint(
+                room_id=None,
+                pose=current_pose,
+                step_index=self.decision_index,
+                reason=f"completed_frontier::{record.frontier_id}",
+            )
+            self.pending_decision = None
+            self.pending_trace = None
+            self.applied_memory_updates = []
+            self._push_progress_update(
+                message=f"Explored {record.frontier_id} from live ROS/Nav2 state.",
+                frontier_id=record.frontier_id,
+            )
+            self._prepare_decision_locked()
+            return self.snapshot()
+
+    def pause(self) -> dict[str, Any]:
+        self.backend.pause_task(self.task_id)
+        self.status = "paused"
+        return self.snapshot()
+
+    def resume(self) -> dict[str, Any]:
+        self.backend.resume_task(self.task_id)
+        if self.pending_decision is not None:
+            self.status = "llm_response_ready"
+        elif self.pending_prompt_payload is not None:
+            self.status = "waiting_for_llm"
+        return self.snapshot()
+
+    def update_occupancy_edits(self, *, mode: str, cells: list[dict[str, Any]]) -> dict[str, Any]:
+        with self._lock:
+            self.backend.update_occupancy_edits(task_id=self.task_id, mode=mode, cells=cells)
+            self._sync_manual_occupancy_edits()
+            self._publish_navigation_map()
+            self._prepare_decision_locked()
+            return self.snapshot()
+
+    def call_semantic_llm(self) -> dict[str, Any]:
+        with self._lock:
+            self.last_error = (
+                "Automatic semantic waypoints are disabled. Start with --automatic-semantic-waypoints "
+                "to enable the legacy semantic waypoint pipeline."
+            )
+            return self.snapshot()
+
+    def _initialize_scan_state(self) -> None:
+        self.runtime.spin_until_ready(timeout_s=self.config.ros_ready_timeout_s)
+        initial_pose = self._require_pose()
+        self._update_pose_history(initial_pose)
+        self.frontier_memory.remember_return_waypoint(
+            room_id=None,
+            pose=initial_pose,
+            step_index=0,
+            reason="initial_pose",
+        )
+        self._perform_turnaround_scan(reason="initial_turnaround_scan")
+
+    def _prepare_decision_locked(self) -> None:
+        if self._budget_exhausted():
+            self.status = "finished"
+            self.pending_prompt_payload = None
+            self.pending_prompt_text = None
+            self.pending_candidate_records = []
+            return
+        self.decision_index += 1
+        self._consume_runtime_scan_observations()
+        self._sync_manual_occupancy_edits()
+        occupancy_map = self._require_effective_map()
+        pose = self._require_pose()
+        self._update_pose_history(pose)
+        visible_candidates = self._detect_frontier_candidates(occupancy_map, pose)
+        self.frontier_memory.upsert_candidates(visible_candidates, step_index=self.decision_index)
+        candidate_records = self._refresh_candidate_paths()
+        prompt_payload = self._build_prompt_payload(occupancy_map, pose, candidate_records)
+        self.pending_candidate_records = candidate_records
+        self.pending_prompt_payload = prompt_payload
+        self.pending_prompt_text = build_exploration_policy_user_prompt(prompt_payload)
+        self.pending_decision = None
+        self.pending_trace = None
+        self.applied_memory_updates = []
+        if candidate_records:
+            self.status = "waiting_for_llm"
+        elif self._coverage(occupancy_map) >= self.config.finish_coverage_threshold:
+            self.status = "finished"
+        else:
+            self.status = "waiting_for_more_map_frontiers"
+            self.last_error = (
+                "No reachable frontier was detected yet on the live ROS map. "
+                "Let SLAM/Nav2 publish more map data or run Reset + Scan again."
+            )
+        self._push_progress_update(message="Waiting for LLM frontier decision.", frontier_id=None)
+
+    def _pending_target(self) -> dict[str, Any] | None:
+        if self.pending_decision is None or not self.pending_decision.selected_frontier_id:
+            return None
+        record = self.frontier_memory.records.get(self.pending_decision.selected_frontier_id)
+        if record is None:
+            return None
+        return {
+            "frontier_id": record.frontier_id,
+            "nav_pose": record.nav_pose.to_dict(),
+            "centroid_pose": record.centroid_pose.to_dict(),
+            "status": record.status,
+            "path_cost_m": record.path_cost_m,
+        }
+
+    def _current_ros_map(self) -> RosOccupancyMap | None:
         return self.runtime.latest_map
+
+    def _current_map(self) -> RosOccupancyMap | None:
+        self._consume_runtime_scan_observations()
+        if self.config.ros_navigation_map_source == "fused_scan":
+            return self._current_scan_fused_map() or self._current_ros_map()
+        return self._current_ros_map() or self._current_scan_fused_map()
 
     def _current_effective_map(self) -> EditableOccupancyMap | None:
         raw = self._current_map()
@@ -2433,6 +3326,119 @@ class RosExplorationSession:
 
     def _require_effective_map(self) -> EditableOccupancyMap:
         return EditableOccupancyMap(self._require_map(), self.manual_occupancy_edits)
+
+    def _scan_world_cell(self, x: float, y: float) -> GridCell:
+        resolution = max(float(self.scan_map_resolution), 1e-6)
+        return GridCell(int(math.floor(x / resolution)), int(math.floor(y / resolution)))
+
+    def _world_cell_center(self, cell: GridCell) -> tuple[float, float]:
+        resolution = max(float(self.scan_map_resolution), 1e-6)
+        return ((cell.x + 0.5) * resolution, (cell.y + 0.5) * resolution)
+
+    def _consume_runtime_scan_observations(self) -> None:
+        if self.runtime.latest_map is not None:
+            self.scan_map_resolution = float(self.runtime.latest_map.resolution)
+        observations, stop_index = self.runtime.drain_scan_observations(self.scan_observation_index)
+        if not observations:
+            return
+        for observation in observations:
+            self._integrate_scan_observation(observation)
+        self.scan_observation_index = stop_index
+        self._publish_navigation_map()
+
+    def _integrate_scan_observation(self, observation: dict[str, Any]) -> None:
+        pose = observation.get("pose")
+        if not isinstance(pose, Pose2D):
+            return
+        ranges = observation.get("ranges")
+        if not isinstance(ranges, tuple) or not ranges:
+            return
+        integrate_planar_scan(
+            pose=pose,
+            ranges=ranges,
+            angle_min=float(observation.get("angle_min", 0.0) or 0.0),
+            angle_increment=float(observation.get("angle_increment", 0.0) or 0.0),
+            range_min_m=float(observation.get("range_min", 0.05) or 0.05),
+            range_max_m=float(observation.get("range_max", self.config.sensor_range_m) or self.config.sensor_range_m),
+            resolution_m=self.scan_map_resolution,
+            cell_from_world=lambda x, y: self._scan_world_cell(x, y),
+            known_cells=self.scan_known_cells,
+            evidence_scores=self.scan_occupancy_evidence,
+            range_edge_cells=self.scan_range_edge_cells,
+            beam_stride=2,
+            config=ACTIVE_RGBD_SCAN_FUSION_CONFIG,
+        )
+
+    def _current_scan_fused_map(self) -> RosOccupancyMap | None:
+        if not self.scan_known_cells:
+            return None
+        resolution = max(float(self.scan_map_resolution), 1e-6)
+        world_cells = list(self.scan_known_cells)
+        min_x = min(cell.x for cell in world_cells) - 4
+        min_y = min(cell.y for cell in world_cells) - 4
+        max_x = max(cell.x for cell in world_cells) + 4
+        max_y = max(cell.y for cell in world_cells) + 4
+        raw_map = self._current_ros_map()
+        if raw_map is not None:
+            raw_min_x = int(math.floor(float(raw_map.origin_x) / resolution))
+            raw_min_y = int(math.floor(float(raw_map.origin_y) / resolution))
+            raw_max_x = raw_min_x + int(raw_map.width) - 1
+            raw_max_y = raw_min_y + int(raw_map.height) - 1
+            min_x = min(min_x, raw_min_x)
+            min_y = min(min_y, raw_min_y)
+            max_x = max(max_x, raw_max_x)
+            max_y = max(max_y, raw_max_y)
+        origin_x = min_x * resolution
+        origin_y = min_y * resolution
+        width = max_x - min_x + 1
+        height = max_y - min_y + 1
+        data = [-1] * (width * height)
+        fused_map = RosOccupancyMap(
+            resolution=resolution,
+            width=width,
+            height=height,
+            origin_x=origin_x,
+            origin_y=origin_y,
+            data=tuple(data),
+        )
+        for cell, state in self.scan_known_cells.items():
+            world_x, world_y = self._world_cell_center(cell)
+            cell_x, cell_y = fused_map.world_to_cell(world_x, world_y)
+            if not fused_map.in_bounds(cell_x, cell_y):
+                continue
+            data[cell_y * width + cell_x] = 100 if state == "occupied" else 0
+        return RosOccupancyMap(
+            resolution=resolution,
+            width=width,
+            height=height,
+            origin_x=origin_x,
+            origin_y=origin_y,
+            data=tuple(data),
+        )
+
+    def _publish_navigation_map(self) -> None:
+        if self.config.ros_navigation_map_source != "fused_scan":
+            return
+        raw_map = self._current_scan_fused_map() or self._current_ros_map()
+        if raw_map is None:
+            return
+        effective_map = EditableOccupancyMap(raw_map, self.manual_occupancy_edits)
+        self.runtime.publish_navigation_map(
+            _occupancy_map_like_to_ros_map(effective_map),
+            map_to_odom=Pose2D(0.0, 0.0, 0.0),
+        )
+
+    def _known_cells_from_occupancy_map(self, occupancy_map: RosOccupancyMap | None) -> dict[GridCell, str]:
+        if occupancy_map is None:
+            return {}
+        known: dict[GridCell, str] = {}
+        for y in range(occupancy_map.height):
+            for x in range(occupancy_map.width):
+                value = occupancy_map.value(x, y)
+                if value < 0:
+                    continue
+                known[GridCell(x, y)] = "free" if value == 0 else "occupied"
+        return known
 
     def _wait_until_task_active(self) -> bool:
         while True:
@@ -2460,9 +3466,18 @@ class RosExplorationSession:
 
     def _require_pose(self) -> Pose2D:
         pose = self.runtime.current_pose()
+        if pose is None and self.config.ros_navigation_map_source == "fused_scan":
+            pose = self.runtime.current_pose_in_frame(self.config.ros_odom_frame)
         if pose is None:
             raise RuntimeError(
-                f"Robot pose in `{self.config.ros_map_frame}` is not available from TF yet"
+                (
+                    f"Robot pose in `{self.config.ros_map_frame}` is not available from TF yet"
+                    if self.config.ros_navigation_map_source != "fused_scan"
+                    else (
+                        f"Robot pose is not available from TF yet in either `{self.config.ros_map_frame}` "
+                        f"or `{self.config.ros_odom_frame}`."
+                    )
+                )
             )
         return pose
 
@@ -2478,8 +3493,15 @@ class RosExplorationSession:
             reason=reason,
             should_cancel=self._pause_requested_or_canceled,
         )
+        observations = list(event.pop("observations", []))
         self.guardrail_events.append({"type": "turnaround_scan", "event": event})
         self.runtime.spin_for(0.25)
+        for observation in observations:
+            self._integrate_scan_observation(observation)
+        self.scan_observation_index = int(event.get("observation_stop_index", self.scan_observation_index))
+        event["selected_count"] = len(observations)
+        event["raw_count"] = len(observations)
+        self._publish_navigation_map()
         self._capture_keyframe(reason=reason)
         pose = self.runtime.current_pose()
         if pose is not None:
@@ -2506,6 +3528,16 @@ class RosExplorationSession:
             "thumbnail_data_url": self.runtime.latest_image_data_url or "",
         }
         self.keyframes.append(frame)
+        if self.config.automatic_semantic_waypoints:
+            self.semantic_observer.observe_keyframe(
+                frame=frame,
+                known_cells=self._known_cells_from_occupancy_map(self.runtime.latest_map),
+                robot_cell=GridCell(
+                    int(math.floor(pose.x / self.config.occupancy_resolution)),
+                    int(math.floor(pose.y / self.config.occupancy_resolution)),
+                ),
+                resolution=self.config.occupancy_resolution,
+            )
 
     def _update_pose_history(self, pose: Pose2D) -> None:
         if self._last_pose is not None:
@@ -2532,7 +3564,10 @@ class RosExplorationSession:
                 unknown_neighbors = {
                     neighbor
                     for neighbor in _neighbors4(cell)
-                    if occupancy_map.in_bounds(neighbor.x, neighbor.y) and occupancy_map.is_unknown(neighbor.x, neighbor.y)
+                    if (
+                        not occupancy_map.in_bounds(neighbor.x, neighbor.y)
+                        or occupancy_map.is_unknown(neighbor.x, neighbor.y)
+                    )
                 }
                 if unknown_neighbors and (len(unknown_neighbors) >= 1 or cell in range_edge_cells):
                     frontier_cells.add(cell)
@@ -2637,6 +3672,15 @@ class RosExplorationSession:
         return candidates
 
     def _range_edge_cells(self, occupancy_map: RosOccupancyMap, pose: Pose2D) -> set[GridCell]:
+        if self.scan_range_edge_cells:
+            result: set[GridCell] = set()
+            for cell in self.scan_range_edge_cells:
+                world_x, world_y = self._world_cell_center(cell)
+                cell_x, cell_y = occupancy_map.world_to_cell(world_x, world_y)
+                if occupancy_map.in_bounds(cell_x, cell_y):
+                    result.add(GridCell(cell_x, cell_y))
+            if result:
+                return result
         scan = self.runtime.latest_scan
         if scan is None or not getattr(scan, "ranges", None):
             return set()
@@ -2672,8 +3716,26 @@ class RosExplorationSession:
         pose: Pose2D,
     ) -> set[GridCell]:
         origin_cell = GridCell(*occupancy_map.world_to_cell(pose.x, pose.y))
-        if not occupancy_map.in_bounds(origin_cell.x, origin_cell.y) or not occupancy_map.is_free(origin_cell.x, origin_cell.y):
+        if not occupancy_map.in_bounds(origin_cell.x, origin_cell.y):
             return set()
+        if not occupancy_map.is_free(origin_cell.x, origin_cell.y):
+            replacement = self._nearest_free_cell(occupancy_map, origin_cell, max_radius_cells=8)
+            if replacement is None:
+                self.guardrail_events.append(
+                    {
+                        "type": "ros_pose_cell_not_free",
+                        "pose_cell": {"cell_x": origin_cell.x, "cell_y": origin_cell.y},
+                    }
+                )
+                return set()
+            self.guardrail_events.append(
+                {
+                    "type": "ros_pose_cell_snapped_to_nearest_free",
+                    "pose_cell": {"cell_x": origin_cell.x, "cell_y": origin_cell.y},
+                    "nearest_free_cell": {"cell_x": replacement.x, "cell_y": replacement.y},
+                }
+            )
+            origin_cell = replacement
         reachable: set[GridCell] = set()
         queue = deque([origin_cell])
         while queue:
@@ -2690,6 +3752,28 @@ class RosExplorationSession:
                     continue
                 queue.append(neighbor)
         return reachable
+
+    def _nearest_free_cell(
+        self,
+        occupancy_map: EditableOccupancyMap,
+        origin_cell: GridCell,
+        *,
+        max_radius_cells: int,
+    ) -> GridCell | None:
+        candidates: list[tuple[int, GridCell]] = []
+        for radius in range(1, max_radius_cells + 1):
+            for dx in range(-radius, radius + 1):
+                for dy in range(-radius, radius + 1):
+                    if max(abs(dx), abs(dy)) != radius:
+                        continue
+                    cell = GridCell(origin_cell.x + dx, origin_cell.y + dy)
+                    if not occupancy_map.in_bounds(cell.x, cell.y):
+                        continue
+                    if occupancy_map.is_free(cell.x, cell.y):
+                        candidates.append((_grid_distance_cells(origin_cell, cell), cell))
+            if candidates:
+                return min(candidates, key=lambda item: item[0])[1]
+        return None
 
     def _global_frontier_anchor_cell_near_record(
         self,
@@ -2891,13 +3975,15 @@ class RosExplorationSession:
         known_free = 0
         occupied = 0
         unknown = 0
-        for item in occupancy_map.data:
-            if item < 0:
-                unknown += 1
-            elif item == 0:
-                known_free += 1
-            else:
-                occupied += 1
+        for y in range(occupancy_map.height):
+            for x in range(occupancy_map.width):
+                item = occupancy_map.value(x, y)
+                if item < 0:
+                    unknown += 1
+                elif item == 0:
+                    known_free += 1
+                else:
+                    occupied += 1
         return {
             "mission": (
                 "Explore the live ManiSkill apartment through the ROS/Nav2 stack, keep frontier memory stable, "
@@ -3077,13 +4163,20 @@ class RosExplorationSession:
             self._update_pose_history(result.reached_pose)
         self.total_distance_m += max(result.travelled_distance_m, 0.0)
         self.runtime.spin_for(0.2)
+        self._consume_runtime_scan_observations()
 
-    def _coverage(self, occupancy_map: RosOccupancyMap) -> float:
-        known = sum(1 for item in occupancy_map.data if item >= 0)
-        return round(known / max(len(occupancy_map.data), 1), 6)
+    def _coverage(self, occupancy_map: RosOccupancyMap | EditableOccupancyMap) -> float:
+        known = 0
+        total = max(int(occupancy_map.width) * int(occupancy_map.height), 1)
+        for y in range(occupancy_map.height):
+            for x in range(occupancy_map.width):
+                if occupancy_map.value(x, y) >= 0:
+                    known += 1
+        return round(known / total, 6)
 
     def _build_map_payload(self) -> dict[str, Any]:
         occupancy_map = self._require_effective_map()
+        semantic_memory = self.semantic_observer.snapshot() if self.config.automatic_semantic_waypoints else {}
         occupancy_cells = []
         for y in range(occupancy_map.height):
             for x in range(occupancy_map.width):
@@ -3105,7 +4198,9 @@ class RosExplorationSession:
                         ),
                     }
                 )
-        semantic_area_candidates = _aggregate_semantic_updates(self.semantic_updates)
+        semantic_area_candidates = []
+        if self.config.experimental_free_space_semantic_waypoints:
+            semantic_area_candidates = _aggregate_semantic_updates(self.semantic_updates)
         summary = (
             f"ROS/Nav2 exploration completed with coverage {self._coverage(occupancy_map):.3f}, "
             f"{len(self.frontier_memory.records)} tracked frontiers, and {len(self.decision_log)} decisions."
@@ -3123,7 +4218,7 @@ class RosExplorationSession:
             "trajectory": self.trajectory,
             "keyframes": self.keyframes,
             "regions": [],
-            "named_places": [],
+            "named_places": _semantic_named_places_for_map(semantic_memory) if self.config.automatic_semantic_waypoints else [],
             "occupancy": {
                 "resolution": float(occupancy_map.resolution),
                 "bounds": occupancy_map.bounds(),
@@ -3131,6 +4226,8 @@ class RosExplorationSession:
             },
             "frontiers": [record.to_dict() for record in self.frontier_memory.records.values()],
             "semantic_area_candidates": semantic_area_candidates,
+            "semantic_memory": semantic_memory,
+            "automatic_semantic_waypoints": self.config.automatic_semantic_waypoints,
             "artifacts": {
                 "decision_log": self.decision_log,
                 "frontier_memory": self.frontier_memory.snapshot(),
@@ -3147,7 +4244,9 @@ class RosExplorationSession:
                     "map_topic": self.config.ros_map_topic,
                     "scan_topic": self.config.ros_scan_topic,
                     "rgb_topic": self.config.ros_rgb_topic,
+                    "navigation_map_source": self.config.ros_navigation_map_source,
                     "base_frame": self.config.ros_base_frame,
+                    "odom_frame": self.config.ros_odom_frame,
                     "map_frame": self.config.ros_map_frame,
                 },
                 "llm_policy": {
@@ -3286,19 +4385,45 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--nav2-controller-id", default="FollowPath")
     parser.add_argument("--nav2-behavior-tree", default="navigate_to_pose_w_replanning_and_recovery.xml")
     parser.add_argument("--nav2-recovery-enabled", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--ros-navigation-map-source", choices=("fused_scan", "external"), default="fused_scan")
     parser.add_argument("--ros-map-topic", default="/map")
     parser.add_argument("--ros-scan-topic", default="/scan")
     parser.add_argument("--ros-rgb-topic", default="/camera/head/image_raw")
     parser.add_argument("--ros-cmd-vel-topic", default="/cmd_vel")
     parser.add_argument("--ros-map-frame", default="map")
+    parser.add_argument("--ros-adapter-url", default=None)
+    parser.add_argument("--ros-adapter-timeout-s", type=float, default=30.0)
+    parser.add_argument("--ros-odom-frame", default="odom")
     parser.add_argument("--ros-base-frame", default="base_link")
     parser.add_argument("--ros-server-timeout-s", type=float, default=10.0)
     parser.add_argument("--ros-ready-timeout-s", type=float, default=20.0)
     parser.add_argument("--ros-turn-scan-timeout-s", type=float, default=45.0)
     parser.add_argument("--ros-turn-scan-settle-s", type=float, default=1.0)
-    parser.add_argument("--ros-manual-spin-angular-speed-rad-s", type=float, default=0.55)
-    parser.add_argument("--ros-manual-spin-publish-hz", type=float, default=10.0)
+    parser.add_argument("--ros-manual-spin-angular-speed-rad-s", type=float, default=0.25)
+    parser.add_argument("--ros-manual-spin-publish-hz", type=float, default=20.0)
+    parser.add_argument("--sim-motion-speed", choices=("normal", "faster", "fastest"), default="normal")
     parser.add_argument("--ros-allow-multiple-action-servers", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--semantic-waypoints-enabled", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--automatic-semantic-waypoints",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Show and enable the parked automatic semantic waypoint/VLM path. Manual regions are the default.",
+    )
+    parser.add_argument("--semantic-llm-provider", default=None)
+    parser.add_argument("--semantic-llm-model", default=None)
+    parser.add_argument("--semantic-llm-base-url", default=None)
+    parser.add_argument("--semantic-llm-api-key", default=None)
+    parser.add_argument("--semantic-vlm-async", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--experimental-free-space-semantic-waypoints",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Deprecated debugging path: allow the frontier policy to emit geometry/frontier-derived semantic "
+            "area candidates. Normal exploration keeps this disabled so semantic places come from RGB-D evidence."
+        ),
+    )
     return parser
 
 
@@ -3358,11 +4483,15 @@ def main(argv: list[str] | None = None) -> int:
             nav2_controller_id=args.nav2_controller_id,
             nav2_behavior_tree=args.nav2_behavior_tree,
             nav2_recovery_enabled=args.nav2_recovery_enabled,
+            ros_navigation_map_source=args.ros_navigation_map_source,
             ros_map_topic=args.ros_map_topic,
             ros_scan_topic=args.ros_scan_topic,
             ros_rgb_topic=args.ros_rgb_topic,
             ros_cmd_vel_topic=args.ros_cmd_vel_topic,
             ros_map_frame=args.ros_map_frame,
+            ros_adapter_url=args.ros_adapter_url,
+            ros_adapter_timeout_s=args.ros_adapter_timeout_s,
+            ros_odom_frame=args.ros_odom_frame,
             ros_base_frame=args.ros_base_frame,
             ros_server_timeout_s=args.ros_server_timeout_s,
             ros_ready_timeout_s=args.ros_ready_timeout_s,
@@ -3370,7 +4499,16 @@ def main(argv: list[str] | None = None) -> int:
             ros_turn_scan_settle_s=args.ros_turn_scan_settle_s,
             ros_manual_spin_angular_speed_rad_s=args.ros_manual_spin_angular_speed_rad_s,
             ros_manual_spin_publish_hz=args.ros_manual_spin_publish_hz,
+            sim_motion_speed=args.sim_motion_speed,
             ros_allow_multiple_action_servers=args.ros_allow_multiple_action_servers,
+            experimental_free_space_semantic_waypoints=args.experimental_free_space_semantic_waypoints,
+            semantic_waypoints_enabled=args.semantic_waypoints_enabled,
+            automatic_semantic_waypoints=args.automatic_semantic_waypoints,
+            semantic_llm_provider=args.semantic_llm_provider,
+            semantic_llm_model=args.semantic_llm_model,
+            semantic_llm_base_url=args.semantic_llm_base_url,
+            semantic_llm_api_key=args.semantic_llm_api_key,
+            semantic_vlm_async=args.semantic_vlm_async,
         ),
         backend,
     )
@@ -3793,8 +4931,79 @@ def _angle_difference(a: float, b: float) -> float:
     return abs(delta)
 
 
+def _unwrap_yaw_sequence(yaws: Iterable[float]) -> list[float]:
+    sequence = list(yaws)
+    if not sequence:
+        return []
+    unwrapped = [float(sequence[0])]
+    previous = float(sequence[0])
+    for value in sequence[1:]:
+        current = float(value)
+        delta = math.atan2(math.sin(current - previous), math.cos(current - previous))
+        unwrapped.append(unwrapped[-1] + delta)
+        previous = current
+    return unwrapped
+
+
+def _select_turnaround_scan_observations(
+    observations: list[dict[str, Any]],
+    *,
+    sample_count: int,
+) -> list[dict[str, Any]]:
+    if len(observations) <= sample_count:
+        return list(observations)
+    poses = [item.get("pose") for item in observations]
+    if not all(isinstance(pose, Pose2D) for pose in poses):
+        stride = max(len(observations) // max(sample_count, 1), 1)
+        return observations[::stride][:sample_count]
+    yaws = _unwrap_yaw_sequence([float(pose.yaw) for pose in poses if isinstance(pose, Pose2D)])
+    if len(yaws) != len(observations):
+        stride = max(len(observations) // max(sample_count, 1), 1)
+        return observations[::stride][:sample_count]
+    span = yaws[-1] - yaws[0]
+    if abs(span) < math.radians(45.0):
+        stride = max(len(observations) // max(sample_count, 1), 1)
+        return observations[::stride][:sample_count]
+    direction = 1.0 if span >= 0.0 else -1.0
+    usable_span = min(abs(span), math.tau)
+    start_yaw = yaws[0]
+    if sample_count <= 1:
+        targets = [start_yaw]
+    else:
+        targets = [
+            start_yaw + direction * (usable_span * index / (sample_count - 1))
+            for index in range(sample_count)
+        ]
+    chosen_indices: set[int] = set()
+    for target in targets:
+        best_index = min(
+            range(len(yaws)),
+            key=lambda index: (abs(yaws[index] - target), abs(index - len(yaws) // 2)),
+        )
+        chosen_indices.add(best_index)
+    if 0 not in chosen_indices:
+        chosen_indices.add(0)
+    if len(observations) - 1 not in chosen_indices:
+        chosen_indices.add(len(observations) - 1)
+    ordered = sorted(chosen_indices)
+    if len(ordered) > sample_count:
+        stride = max(len(ordered) / float(sample_count), 1.0)
+        compacted = [ordered[min(int(round(index * stride)), len(ordered) - 1)] for index in range(sample_count)]
+        ordered = sorted(set(compacted))
+    return [observations[index] for index in ordered]
+
+
 def _pose_distance_m(a: Pose2D, b: Pose2D) -> float:
     return math.hypot(a.x - b.x, a.y - b.y)
+
+
+def _goal_status_from_outcome(value: Any) -> int:
+    if isinstance(value, dict):
+        try:
+            return int(value.get("status", GoalStatus.STATUS_UNKNOWN))
+        except Exception:
+            return GoalStatus.STATUS_UNKNOWN
+    return int(getattr(value, "status", GoalStatus.STATUS_UNKNOWN))
 
 
 def _pose_from_mapping(value: Any) -> Pose2D | None:
@@ -3866,6 +5075,52 @@ def _dedupe_text(items: list[str]) -> list[str]:
         output.append(normalized)
         seen.add(normalized)
     return output
+
+
+def _frame_fallback_depth_m(frame: dict[str, Any]) -> float | None:
+    depths: list[float] = []
+    for key in ("depth_min_m", "depth_max_m"):
+        value = frame.get(key)
+        if value is None:
+            continue
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(parsed) and parsed > 0.0:
+            depths.append(parsed)
+    if len(depths) == 2:
+        return sum(depths) / 2.0
+    if depths:
+        return depths[0]
+    summary = frame.get("rgbd_summary")
+    if isinstance(summary, dict):
+        return _frame_fallback_depth_m(summary)
+    return None
+
+
+def _semantic_named_places_for_map(semantic_memory: dict[str, Any]) -> list[dict[str, Any]]:
+    places: list[dict[str, Any]] = []
+    for item in semantic_memory.get("named_places", []):
+        if not isinstance(item, dict):
+            continue
+        anchor_pose = item.get("anchor_pose")
+        if not isinstance(anchor_pose, dict):
+            continue
+        label = str(item.get("label") or item.get("place_id") or "").strip()
+        if not label:
+            continue
+        places.append(
+            {
+                "name": label,
+                "pose": anchor_pose,
+                "place_id": item.get("place_id"),
+                "confidence": item.get("confidence"),
+                "evidence": item.get("evidence", []),
+                "source": "semantic_memory",
+            }
+        )
+    return places
 
 
 def _aggregate_semantic_updates(items: list[dict[str, Any]]) -> list[dict[str, Any]]:

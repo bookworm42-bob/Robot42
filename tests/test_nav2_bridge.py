@@ -37,6 +37,7 @@ class Nav2BridgeTests(unittest.TestCase):
                 "--ros-base-yaw-offset-rad",
                 "3.14159",
                 "--no-publish-head-camera",
+                "--no-laser-fill-no-return",
             ]
         )
         self.assertEqual(args.env_id, "ReplicaCAD_SceneManipulation-v1")
@@ -52,6 +53,8 @@ class Nav2BridgeTests(unittest.TestCase):
         self.assertEqual(args.spawn_yaw, 1.57)
         self.assertEqual(args.ros_base_yaw_offset_rad, 3.14159)
         self.assertFalse(args.publish_head_camera)
+        self.assertEqual(args.scan_band_height_px, 12)
+        self.assertFalse(args.laser_fill_no_return)
 
     def test_depth_band_is_converted_into_laser_ranges(self) -> None:
         depth_mm = [[1000] * 5 for _ in range(7)]
@@ -65,8 +68,23 @@ class Nav2BridgeTests(unittest.TestCase):
         self.assertEqual(len(ranges), 5)
         self.assertEqual(len(angles), 5)
         self.assertTrue(all(value >= 1.0 for value in ranges[1:4]))
-        self.assertGreater(float(angles[0]), 0.0)
-        self.assertLess(float(angles[-1]), 0.0)
+        self.assertLess(float(angles[0]), 0.0)
+        self.assertGreater(float(angles[-1]), 0.0)
+        self.assertGreater(float(angles[1] - angles[0]), 0.0)
+
+    def test_depth_scan_fills_no_return_beams_for_clearing(self) -> None:
+        depth_mm = np.zeros((9, 5), dtype="int16")
+        depth_mm[:, 2] = 1000
+        ranges, _ = synthesize_scan_from_depth(
+            depth_mm=depth_mm,
+            horizontal_fov_rad=1.0,
+            band_height_px=5,
+            range_min_m=0.05,
+            range_max_m=4.0,
+        )
+        self.assertEqual(float(ranges[0]), 4.0)
+        self.assertLess(float(ranges[2]), 1.1)
+        self.assertEqual(float(ranges[-1]), 4.0)
 
     def test_nav2_params_are_patched_to_bridge_topics(self) -> None:
         base = {
@@ -124,7 +142,13 @@ class Nav2BridgeTests(unittest.TestCase):
 
         obstacle_scan = patched["global_costmap"]["global_costmap"]["ros__parameters"]["obstacle_layer"]["scan"]
         self.assertEqual(obstacle_scan["topic"], "/bridge/scan")
+        self.assertTrue(obstacle_scan["inf_is_valid"])
         self.assertEqual(patched["global_costmap"]["global_costmap"]["ros__parameters"]["robot_radius"], 0.3)
+        self.assertNotIn("inflation_layer", patched["global_costmap"]["global_costmap"]["ros__parameters"]["plugins"])
+        self.assertNotIn("inflation_layer", patched["global_costmap"]["global_costmap"]["ros__parameters"])
+        self.assertNotIn("inflation_layer", patched["local_costmap"]["local_costmap"]["ros__parameters"]["plugins"])
+        self.assertNotIn("inflation_layer", patched["local_costmap"]["local_costmap"]["ros__parameters"])
+        self.assertEqual(patched["global_costmap"]["global_costmap"]["ros__parameters"]["footprint_padding"], 0.0)
         self.assertEqual(patched["local_costmap"]["local_costmap"]["ros__parameters"]["global_frame"], "odom")
         self.assertEqual(
             patched["local_costmap"]["local_costmap"]["ros__parameters"]["voxel_layer"]["z_voxels"],
@@ -132,6 +156,7 @@ class Nav2BridgeTests(unittest.TestCase):
         )
         self.assertEqual(patched["bt_navigator"]["ros__parameters"]["odom_topic"], "/odom")
         self.assertEqual(patched["amcl"]["ros__parameters"]["base_frame_id"], "base_link")
+        self.assertFalse(patched["amcl"]["ros__parameters"]["tf_broadcast"])
         self.assertEqual(
             patched["controller_server"]["ros__parameters"]["FollowPath"]["max_vel_x"],
             0.65,

@@ -14,10 +14,12 @@ from xlerobot_playground.sim_exploration_backend import (
     GridCell,
     ManiSkillExplorationRunner,
     SimExplorationConfig,
+    _occupancy_map_like_to_ros_map,
+    _select_turnaround_scan_observations,
     _mark_frontier_unreachable_as_visited,
     build_parser,
 )
-from xlerobot_playground.interactive_exploration_playground import ManiSkillTeleportExplorationSession
+from xlerobot_playground.interactive_exploration_playground import InteractiveNoNav2ExplorationSession, ManiSkillTeleportExplorationSession
 from xlerobot_playground.interactive_exploration_playground import (
     _navigation_map_data_url,
     _resolve_manishkill_start_pose,
@@ -25,7 +27,24 @@ from xlerobot_playground.interactive_exploration_playground import (
     _zero_mobile_base_qvel,
     build_parser as build_interactive_playground_parser,
 )
-from xlerobot_playground.map_editing import ACTIVE_RGBD_SCAN_FUSION_CONFIG, merge_occupancy_observation
+from xlerobot_playground.interactive_react_ui import INTERACTIVE_REACT_HTML
+from xlerobot_playground.map_editing import (
+    ACTIVE_RGBD_SCAN_FUSION_CONFIG,
+    DEFAULT_OCCUPANCY_FUSION_CONFIG,
+    EditableOccupancyMap,
+    ManualOccupancyEdits,
+    merge_occupancy_observation,
+)
+from xlerobot_playground.ros_nav2_adapter import (
+    map_from_payload,
+    pose_from_payload,
+    scan_observation_from_payload,
+    serialize_map,
+    serialize_pose,
+    serialize_scan_observation,
+)
+from xlerobot_playground.ros_nav2_runtime import RosOccupancyMap
+from xlerobot_playground.scan_fusion import integrate_planar_scan
 
 
 class SimExplorationBackendTests(unittest.TestCase):
@@ -99,11 +118,23 @@ class SimExplorationBackendTests(unittest.TestCase):
                 "SmacPlanner2D",
                 "--nav2-controller-id",
                 "FollowPath",
+                "--ros-navigation-map-source",
+                "fused_scan",
+                "--ros-adapter-url",
+                "http://127.0.0.1:8891",
                 "--ros-map-topic",
                 "/map",
                 "--serve-review-ui",
                 "--visited-frontier-filter-radius-m",
                 "0.7",
+                "--no-semantic-waypoints-enabled",
+                "--semantic-llm-provider",
+                "ollama",
+                "--semantic-llm-model",
+                "gemma4:26b",
+                "--sim-motion-speed",
+                "faster",
+                "--automatic-semantic-waypoints",
             ]
         )
         self.assertEqual(args.session, "agentic_session")
@@ -114,9 +145,107 @@ class SimExplorationBackendTests(unittest.TestCase):
         self.assertEqual(args.nav2_mode, "ros")
         self.assertEqual(args.nav2_planner_id, "SmacPlanner2D")
         self.assertEqual(args.nav2_controller_id, "FollowPath")
+        self.assertEqual(args.ros_navigation_map_source, "fused_scan")
+        self.assertEqual(args.ros_adapter_url, "http://127.0.0.1:8891")
         self.assertEqual(args.ros_map_topic, "/map")
         self.assertTrue(args.serve_review_ui)
         self.assertEqual(args.visited_frontier_filter_radius_m, 0.7)
+        self.assertFalse(args.semantic_waypoints_enabled)
+        self.assertEqual(args.semantic_llm_provider, "ollama")
+        self.assertEqual(args.semantic_llm_model, "gemma4:26b")
+        self.assertEqual(args.sim_motion_speed, "faster")
+        self.assertTrue(args.automatic_semantic_waypoints)
+
+    def test_occupancy_map_like_to_ros_map_applies_manual_edits(self) -> None:
+        base_map = RosOccupancyMap(
+            resolution=0.5,
+            width=2,
+            height=2,
+            origin_x=0.0,
+            origin_y=0.0,
+            data=(0, -1, 100, 0),
+        )
+        edits = ManualOccupancyEdits(
+            blocked_cells={GridCell(0, 0)},
+            cleared_cells={GridCell(1, 0)},
+        )
+        editable = EditableOccupancyMap(base_map, edits)
+
+        converted = _occupancy_map_like_to_ros_map(editable)
+
+        self.assertEqual(converted.data, (100, 0, 100, 0))
+
+    def test_turnaround_scan_selection_prefers_even_yaw_coverage(self) -> None:
+        observations = [
+            {"pose": Pose2D(0.0, 0.0, index * (2.0 * 3.141592653589793 / 24.0))}
+            for index in range(24)
+        ]
+
+        selected = _select_turnaround_scan_observations(observations, sample_count=6)
+
+        self.assertGreaterEqual(len(selected), 6)
+        selected_yaws = [item["pose"].yaw for item in selected]
+        self.assertAlmostEqual(selected_yaws[0], 0.0)
+        self.assertGreater(selected_yaws[-1], 5.0)
+
+    def test_common_scan_fusion_integrates_hit_and_range_edge(self) -> None:
+        known_cells: dict[GridCell, str] = {}
+        evidence: dict[GridCell, float] = {}
+        range_edge_cells: set[GridCell] = set()
+        visited_cells: set[GridCell] = set()
+
+        summary = integrate_planar_scan(
+            pose=Pose2D(0.5, 0.5, 0.0),
+            ranges=(1.0, 2.0),
+            angle_min=0.0,
+            angle_increment=3.141592653589793 / 2.0,
+            range_min_m=0.05,
+            range_max_m=2.0,
+            resolution_m=0.5,
+            cell_from_world=lambda x, y: GridCell(int(x / 0.5), int(y / 0.5)),
+            known_cells=known_cells,
+            evidence_scores=evidence,
+            range_edge_cells=range_edge_cells,
+            visited_cells=visited_cells,
+            beam_stride=1,
+            config=DEFAULT_OCCUPANCY_FUSION_CONFIG,
+        )
+
+        self.assertEqual(summary.scan_beams, 2)
+        self.assertEqual(summary.integrated_beams, 2)
+        self.assertTrue(any(state == "occupied" for state in known_cells.values()))
+        self.assertTrue(range_edge_cells)
+        self.assertTrue(visited_cells)
+
+    def test_ros_adapter_serialization_round_trips_pose_map_and_scan(self) -> None:
+        pose = Pose2D(1.0, 2.0, 0.5)
+        occupancy_map = RosOccupancyMap(
+            resolution=0.25,
+            width=2,
+            height=2,
+            origin_x=-1.0,
+            origin_y=-2.0,
+            data=(0, -1, 100, 0),
+        )
+        observation = {
+            "frame_id": "laser",
+            "reference_frame": "odom",
+            "pose": pose,
+            "range_min": 0.05,
+            "range_max": 10.0,
+            "angle_min": -0.5,
+            "angle_increment": 0.1,
+            "ranges": (1.0, 2.0, 3.0),
+        }
+
+        self.assertEqual(pose_from_payload(serialize_pose(pose)), pose)
+        self.assertEqual(map_from_payload(serialize_map(occupancy_map)), occupancy_map)
+        round_tripped = scan_observation_from_payload(serialize_scan_observation(observation))
+        self.assertIsNotNone(round_tripped)
+        assert round_tripped is not None
+        self.assertEqual(round_tripped["pose"], pose)
+        self.assertEqual(round_tripped["reference_frame"], "odom")
+        self.assertEqual(round_tripped["ranges"], (1.0, 2.0, 3.0))
 
     def test_runner_builds_real_agentic_map_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -171,6 +300,9 @@ class SimExplorationBackendTests(unittest.TestCase):
             self.assertIn("nav2", artifacts)
             self.assertEqual(artifacts["nav2"]["module"], "simulated_nav2")
             self.assertTrue(artifacts["nav2"]["goals"])
+            self.assertIn("semantic_memory", current_map)
+            self.assertFalse(current_map["automatic_semantic_waypoints"])
+            self.assertEqual(current_map["semantic_memory"], {})
             self.assertTrue(Path(persist_path).exists())
 
             task = snapshot["active_task"]
@@ -178,6 +310,50 @@ class SimExplorationBackendTests(unittest.TestCase):
             assert task is not None
             self.assertEqual(task["state"], "succeeded")
             self.assertGreaterEqual(task["result"]["decision_count"], 1)
+
+    def test_interactive_manual_regions_create_navigation_memory(self) -> None:
+        session = InteractiveNoNav2ExplorationSession(
+            SimExplorationConfig(
+                repo_root="/tmp/XLeRobot",
+                persist_path="",
+                explorer_policy="heuristic",
+            )
+        )
+
+        before = session.snapshot()["map"]
+        self.assertFalse(before["automatic_semantic_waypoints"])
+        self.assertEqual(before["semantic_memory"], {})
+
+        free_cell = session.current_cell
+        snapshot = session.create_manual_region(
+            {
+                "label": "kitchen",
+                "description": "operator marked the kitchen standing area",
+                "cells": [{"cell_x": free_cell.x, "cell_y": free_cell.y}],
+            }
+        )
+        region = snapshot["map"]["regions"][0]
+        self.assertEqual(region["label"], "kitchen")
+        self.assertEqual(region["description"], "operator marked the kitchen standing area")
+        self.assertEqual(region["source"], "manual_region")
+        self.assertEqual(snapshot["map"]["named_places"][0]["source"], "manual_region")
+        self.assertEqual(snapshot["map"]["named_places"][0]["name"], "kitchen_center")
+
+        pose = free_cell.center_pose(session.config.occupancy_resolution).to_dict()
+        snapshot = session.add_manual_region_subwaypoint(
+            {
+                "region_id": region["region_id"],
+                "name": "counter_side",
+                "pose": pose,
+            }
+        )
+        waypoints = snapshot["map"]["regions"][0]["default_waypoints"]
+        self.assertEqual([waypoint["name"] for waypoint in waypoints], ["kitchen_center", "counter_side"])
+
+        disabled = session.call_semantic_llm()
+        self.assertEqual(disabled["map"]["semantic_memory"], {})
+        self.assertIn("Automatic semantic waypoints are disabled", disabled["last_error"])
+
 
     def test_manishkill_frontier_approach_pose_is_offset_to_known_side(self) -> None:
         session = ManiSkillTeleportExplorationSession.__new__(ManiSkillTeleportExplorationSession)
@@ -1139,8 +1315,15 @@ class SimExplorationBackendTests(unittest.TestCase):
                 "front_only",
                 "--scan-yaw-samples",
                 "1",
+                "--ros-navigation-map-source",
+                "fused_scan",
+                "--ros-adapter-url",
+                "http://127.0.0.1:8891",
                 "--visited-frontier-filter-radius-m",
                 "0.8",
+                "--sim-motion-speed",
+                "fastest",
+                "--automatic-semantic-waypoints",
             ]
         )
 
@@ -1148,7 +1331,18 @@ class SimExplorationBackendTests(unittest.TestCase):
         self.assertEqual(args.spawn_facing, "left")
         self.assertEqual(args.scan_mode, "front_only")
         self.assertEqual(args.scan_yaw_samples, 1)
+        self.assertEqual(args.ros_navigation_map_source, "fused_scan")
+        self.assertEqual(args.ros_adapter_url, "http://127.0.0.1:8891")
         self.assertEqual(args.visited_frontier_filter_radius_m, 0.8)
+        self.assertEqual(args.sim_motion_speed, "fastest")
+        self.assertTrue(args.automatic_semantic_waypoints)
+
+    def test_interactive_playground_ui_is_react_app(self) -> None:
+        self.assertIn("ReactDOM.createRoot", INTERACTIVE_REACT_HTML)
+        self.assertIn("React.createElement", INTERACTIVE_REACT_HTML)
+        self.assertIn("window.INTERACTIVE_UI_FLAVOR", INTERACTIVE_REACT_HTML)
+        self.assertIn("/api/region/create", INTERACTIVE_REACT_HTML)
+        self.assertIn("requestJson(path, payload || {})", INTERACTIVE_REACT_HTML)
 
     def test_resolve_manishkill_start_pose_rotates_default_spawn_in_place(self) -> None:
         pose = _resolve_manishkill_start_pose(

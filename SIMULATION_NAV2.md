@@ -1,6 +1,10 @@
 # ManiSkill + Nav2
 
-This repository now includes a ROS 2 bridge for the ManiSkill XLeRobot simulator so actual `slam_toolbox` and actual `Nav2` can drive low-level navigation instead of the in-repo surrogate planner.
+This repository now includes a ROS 2 bridge for the ManiSkill XLeRobot simulator and a separate ROS/Nav2 adapter service. The intended architecture is:
+
+- the playground/brain owns RGB-D map fusion, frontier exploration, and semantic memory
+- the adapter service owns ROS topic publication and Nav2 action calls
+- Nav2 consumes the brain-produced `/map` plus live obstacle observations
 
 ## What The Bridge Publishes
 
@@ -62,23 +66,28 @@ python /home/alin/Robot42/examples/xlerobot_nav2_bridge_playground.py \
   --render-mode human \
   --env-id SceneManipulation-v1 \
   --build-config-idx 0 \
-  --realtime-factor 0 \
-  --no-publish-head-camera \
+  --realtime-factor 1.0 \
+  --scan-band-height-px 12 \
+  --laser-fill-no-return \
   --max-episode-steps 1000
 ```
 
 Do not swap this to `ReplicaCAD_SceneManipulation-v1` for XLeRobot. In this repo, the XLeRobot-compatible local env is `SceneManipulation-v1`, and it already uses the ReplicaCAD scene builder internally.
 
-If the bridge feels slow, keep `--realtime-factor 0`. The default real-time sleep is helpful for demos, but it unnecessarily throttles Nav2 testing. Keeping head camera image topics off also reduces simulator overhead while still publishing `/scan`.
+Keep `--realtime-factor 1.0` for Nav2 exploration. Running the bridge with `--realtime-factor 0` can make simulated time advance faster than Nav2 can consume TF and sensor data, which produces partial or stale motion state. The bridge default uses a narrow center depth band and max-range no-return beams so the ROS-side scan geometry stays closer to the teleport playground's mapping behavior.
 
-### Terminal 2: slam_toolbox
+### Terminal 2: ROS/Nav2 adapter
 
 ```bash
 source /opt/ros/humble/setup.bash
-ros2 launch slam_toolbox online_async_launch.py \
-  use_sim_time:=true \
-  slam_params_file:=/home/alin/Robot42/artifacts/nav2/xlerobot_slam_toolbox.yaml
+source /home/alin/Robot42/.venv-maniskill/bin/activate
+python /home/alin/Robot42/examples/xlerobot_nav2_adapter_server.py \
+  --host 127.0.0.1 \
+  --port 8891 \
+  --publish-internal-navigation-map
 ```
+
+This service is the Ubuntu-side control boundary. The playground pushes fused maps to it over HTTP, and it republishes `/map`, drains live scan observations, and sends goals to Nav2.
 
 ### Terminal 3: Nav2
 
@@ -90,9 +99,40 @@ ros2 launch nav2_bringup navigation_launch.py \
   params_file:=/home/alin/Robot42/artifacts/nav2/xlerobot_nav2_params.yaml
 ```
 
-Run exactly one instance of this Nav2 launch. If you accidentally launch it twice, `compute_path_to_pose` and `navigate_to_pose` will each have two action servers and the goal client will produce unexpected-response warnings.
+### Terminal 4: exploration playground as brain
 
-### Terminal 4: send a real Nav2 goal
+```bash
+cd /home/alin/Robot42
+source /home/alin/Robot42/.venv-maniskill/bin/activate
+python /home/alin/Robot42/examples/xlerobot_exploration_playground.py \
+  --movement-mode ros \
+  --ui-flavor developer \
+  --explorer-policy llm \
+  --llm-provider ollama \
+  --llm-model gemma4:26b \
+  --llm-base-url http://localhost:11434 \
+  --ros-adapter-url http://127.0.0.1:8891 \
+  --ros-navigation-map-source fused_scan \
+  --sensor-range-m 10.0 \
+  --no-automatic-semantic-waypoints
+```
+
+The playground still owns map creation. The adapter is just the ROS/Nav2 service boundary.
+
+## Legacy SLAM Path
+
+If you explicitly want the older `slam_toolbox`-centric map path for comparison, you can still launch it separately:
+
+```bash
+source /opt/ros/humble/setup.bash
+ros2 launch slam_toolbox online_async_launch.py \
+  use_sim_time:=true \
+  slam_params_file:=/home/alin/Robot42/artifacts/nav2/xlerobot_slam_toolbox.yaml
+```
+
+Run exactly one instance of the Nav2 launch. If you accidentally launch it twice, `compute_path_to_pose` and `navigate_to_pose` will each have two action servers and the goal client will produce unexpected-response warnings.
+
+### Terminal 5: send a real Nav2 goal
 
 ```bash
 source /opt/ros/humble/setup.bash

@@ -72,6 +72,7 @@ class BridgeConfig:
     laser_min_range_m: float = 0.05
     laser_max_range_m: float = 10.0
     scan_band_height_px: int = 12
+    laser_fill_no_return: bool = True
     build_config_idx: int | None = None
     spawn_x: float | None = None
     spawn_y: float | None = None
@@ -269,6 +270,7 @@ def synthesize_scan_from_depth(
     band_height_px: int,
     range_min_m: float,
     range_max_m: float,
+    fill_no_return: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
     if depth_mm.ndim != 2:
         raise ValueError(f"Expected a 2D depth image, got shape {depth_mm.shape}")
@@ -279,16 +281,35 @@ def synthesize_scan_from_depth(
     row_start = max(0, center - band_half)
     row_stop = min(height, center + band_half)
     band = depth_mm[row_start:row_stop, :].astype(np.float32)
-    band[band <= 0.0] = np.nan
+    valid = np.isfinite(band) & (band > 0.0)
 
-    # Image columns increase left->right, but positive planar yaw is left of robot-forward.
-    # The leftmost image column must therefore become the most-positive scan angle.
-    angles = np.linspace(horizontal_fov_rad / 2.0, -horizontal_fov_rad / 2.0, width, dtype=np.float32)
-    median_depth_m = np.nanmedian(band, axis=0) / 1000.0
-    ranges = median_depth_m / np.maximum(np.cos(angles), 1e-3)
-    ranges = np.where(np.isnan(ranges), np.inf, ranges)
-    ranges = np.where(ranges < range_min_m, np.inf, ranges)
-    ranges = np.where(ranges > range_max_m, np.inf, ranges)
+    fx = width / (2.0 * math.tan(horizontal_fov_rad / 2.0))
+    cx = width / 2.0
+    image_columns = np.arange(width, dtype=np.float32)
+    image_angles = -np.arctan2((image_columns - cx) / max(fx, 1e-6), 1.0)
+
+    # ROS LaserScan consumers expect monotonically increasing angles. Image columns
+    # are left->right while positive planar yaw is left of robot-forward, so publish
+    # beam bins from image right to image left.
+    angles = np.linspace(-horizontal_fov_rad / 2.0, horizontal_fov_rad / 2.0, width, dtype=np.float32)
+    ranges = np.full(width, np.inf, dtype=np.float32)
+    for column in range(width):
+        column_depths_mm = band[:, column][valid[:, column]]
+        if column_depths_mm.size == 0:
+            continue
+        depth_m = column_depths_mm.astype(np.float32) / 1000.0
+        planar_range_m = depth_m / max(float(math.cos(float(image_angles[column]))), 1e-3)
+        usable = planar_range_m[
+            np.isfinite(planar_range_m)
+            & (planar_range_m >= range_min_m)
+            & (planar_range_m <= range_max_m)
+        ]
+        if usable.size == 0:
+            continue
+        scan_index = width - 1 - column
+        ranges[scan_index] = float(np.min(usable))
+    if fill_no_return:
+        ranges = np.where(np.isinf(ranges), range_max_m, ranges)
     return ranges.astype(np.float32), angles
 
 
@@ -566,6 +587,7 @@ class ManiSkillRosBridge(Node):
             band_height_px=self.config.scan_band_height_px,
             range_min_m=self.config.laser_min_range_m,
             range_max_m=self.config.laser_max_range_m,
+            fill_no_return=self.config.laser_fill_no_return,
         )
 
         seconds, nanoseconds, _ = self._make_header(self.config.head_laser_frame)
@@ -697,6 +719,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--laser-min-range-m", type=float, default=0.05)
     parser.add_argument("--laser-max-range-m", type=float, default=10.0)
     parser.add_argument("--scan-band-height-px", type=int, default=12)
+    parser.add_argument("--laser-fill-no-return", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--build-config-idx", type=int, default=None)
     parser.add_argument("--spawn-x", type=float, default=None)
     parser.add_argument("--spawn-y", type=float, default=None)
@@ -739,6 +762,7 @@ def main(argv: list[str] | None = None) -> int:
             laser_min_range_m=args.laser_min_range_m,
             laser_max_range_m=args.laser_max_range_m,
             scan_band_height_px=args.scan_band_height_px,
+            laser_fill_no_return=args.laser_fill_no_return,
             build_config_idx=args.build_config_idx,
             spawn_x=args.spawn_x,
             spawn_y=args.spawn_y,

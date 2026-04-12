@@ -16,7 +16,7 @@ from typing import Any
 
 import numpy as np
 
-from xlerobot_agent.exploration import Pose2D
+from xlerobot_agent.exploration import ExplorationBackend, ExplorationBackendConfig, Pose2D
 from xlerobot_agent.prompts import build_exploration_policy_user_prompt
 from xlerobot_playground.maniskill_ros_bridge import (
     HEAD_CAMERA_FOV_RAD,
@@ -34,6 +34,9 @@ from xlerobot_playground.map_editing import (
     overlay_known_cells,
     overlay_occupancy_payload,
 )
+from xlerobot_playground.scan_fusion import integrate_planar_scan
+from xlerobot_playground.interactive_react_ui import INTERACTIVE_REACT_HTML
+from xlerobot_playground.ros_nav2_router import RemoteNav2RouterClient
 from xlerobot_playground.sim_exploration_backend import (
     ExplorationDecision,
     ExplorationLLMPolicy,
@@ -41,6 +44,9 @@ from xlerobot_playground.sim_exploration_backend import (
     FrontierMemory,
     FrontierRecord,
     GridCell,
+    RosExplorationSession,
+    RosOccupancyMap,
+    SemanticWaypointObserver,
     SimExplorationConfig,
     _aggregate_semantic_updates,
     _build_simple_apartment,
@@ -54,6 +60,7 @@ from xlerobot_playground.sim_exploration_backend import (
     _pose_distance_m,
     _pose_from_mapping,
     _search_known_safe_path,
+    _semantic_named_places_for_map,
     _simulate_scan,
 )
 
@@ -71,6 +78,248 @@ STRICT_NAVIGATION_CLEARANCE_MARGIN_M = 0.08
 STRICT_NAVIGATION_KNOWN_FRACTION = 0.95
 STORED_FRONTIER_REVALIDATION_RADIUS_M = 1.0
 STORED_FRONTIER_REVISIT_APPROACH_RADIUS_M = 1.25
+SIM_MOTION_SPEED_PRESETS = {
+    "normal": {"linear_m_s": 0.30, "angular_multiplier": 1.0},
+    "faster": {"linear_m_s": 0.60, "angular_multiplier": 1.8},
+    "fastest": {"linear_m_s": 1.00, "angular_multiplier": 3.0},
+}
+
+
+def _manual_region_from_cells(
+    *,
+    region_id: str,
+    label: str,
+    description: str,
+    cells: list[dict[str, int]],
+    resolution: float,
+) -> dict[str, Any]:
+    unique = sorted({(int(item["cell_x"]), int(item["cell_y"])) for item in cells})
+    if not unique:
+        raise ValueError("region requires at least one selected free cell")
+    xs = [x for x, _ in unique]
+    ys = [y for _, y in unique]
+    centroid_x = sum((x + 0.5) * resolution for x, _ in unique) / len(unique)
+    centroid_y = sum((y + 0.5) * resolution for _, y in unique) / len(unique)
+    waypoint_cell = min(
+        unique,
+        key=lambda item: ((item[0] + 0.5) * resolution - centroid_x) ** 2
+        + ((item[1] + 0.5) * resolution - centroid_y) ** 2,
+    )
+    waypoint_x = (waypoint_cell[0] + 0.5) * resolution
+    waypoint_y = (waypoint_cell[1] + 0.5) * resolution
+    waypoint = {
+        "name": f"{label.strip().replace(' ', '_') or region_id}_center",
+        "x": round(waypoint_x, 3),
+        "y": round(waypoint_y, 3),
+        "yaw": 0.0,
+        "kind": "primary",
+    }
+    polygon = [
+        [min(xs) * resolution, min(ys) * resolution],
+        [(max(xs) + 1) * resolution, min(ys) * resolution],
+        [(max(xs) + 1) * resolution, (max(ys) + 1) * resolution],
+        [min(xs) * resolution, (max(ys) + 1) * resolution],
+    ]
+    return {
+        "region_id": region_id,
+        "label": label.strip() or region_id,
+        "description": description.strip(),
+        "confidence": 1.0,
+        "polygon_2d": [[round(float(x), 3), round(float(y), 3)] for x, y in polygon],
+        "centroid": {"x": round(centroid_x, 3), "y": round(centroid_y, 3)},
+        "selected_cells": [{"cell_x": x, "cell_y": y} for x, y in unique],
+        "adjacency": [],
+        "representative_keyframes": [],
+        "evidence": ["operator selected free-space region in UI"],
+        "default_waypoints": [waypoint],
+        "source": "manual_region",
+    }
+
+
+def _named_places_from_manual_regions(regions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    places: list[dict[str, Any]] = []
+    for region in regions:
+        for waypoint in region.get("default_waypoints", []):
+            if not isinstance(waypoint, dict) or not waypoint.get("name"):
+                continue
+            places.append(
+                {
+                    "name": str(waypoint["name"]),
+                    "pose": {
+                        "x": float(waypoint.get("x", 0.0)),
+                        "y": float(waypoint.get("y", 0.0)),
+                        "yaw": float(waypoint.get("yaw", 0.0)),
+                    },
+                    "region_id": region.get("region_id"),
+                    "source": "manual_region",
+                    "kind": waypoint.get("kind", "primary"),
+                }
+            )
+    return places
+
+
+class InteractiveRosNav2ExplorationSession(RosExplorationSession):
+    """Step-gated React playground session that executes motion through live ROS/Nav2."""
+
+    def __init__(self, config: SimExplorationConfig, backend: ExplorationBackend, task_id: str) -> None:
+        super().__init__(config, backend, task_id)
+        self.manual_regions: list[dict[str, Any]] = []
+
+    def reset(self) -> dict[str, Any]:
+        self.manual_regions = []
+        return super().reset()
+
+    def snapshot(self) -> dict[str, Any]:
+        if self.runtime.latest_map is None:
+            pose = self.runtime.current_pose()
+            if pose is None and self.config.ros_navigation_map_source == "fused_scan":
+                pose = self.runtime.current_pose_in_frame(self.config.ros_odom_frame)
+            robot_pose = (pose or Pose2D(0.0, 0.0, 0.0)).to_dict()
+            return {
+                "status": self.status,
+                "session": self.config.session,
+                "coverage": 0.0,
+                "robot_pose": robot_pose,
+                "prompt": self.pending_prompt_text,
+                "prompt_payload": self.pending_prompt_payload,
+                "candidate_frontiers": [],
+                "pending_decision": None,
+                "pending_trace": self.pending_trace,
+                "pending_target": None,
+                "applied_memory_updates": list(self.applied_memory_updates),
+                "last_error": self.last_error,
+                "map": {
+                    "map_id": self.config.session,
+                    "frame": self.config.ros_map_frame,
+                    "resolution": float(self.config.occupancy_resolution),
+                    "coverage": 0.0,
+                    "summary": "ROS/Nav2 exploration has not started yet. Click Start Explore to wait for ROS data and run the initial scan.",
+                    "approved": False,
+                    "created_at": time.time(),
+                    "source": self.config.source,
+                    "mode": "interactive_ros_nav2",
+                    "trajectory": self.trajectory,
+                    "keyframes": self.keyframes,
+                    "regions": list(self.manual_regions),
+                    "named_places": _named_places_from_manual_regions(self.manual_regions),
+                    "occupancy": {
+                        "resolution": float(self.config.occupancy_resolution),
+                        "bounds": {
+                            "min_x": 0.0,
+                            "min_y": 0.0,
+                            "max_x": 0.0,
+                            "max_y": 0.0,
+                        },
+                        "cells": [],
+                    },
+                    "frontiers": [],
+                    "remembered_frontiers": [],
+                    "semantic_area_candidates": [],
+                    "semantic_memory": {},
+                    "automatic_semantic_waypoints": self.config.automatic_semantic_waypoints,
+                    "artifacts": {
+                        "decision_log": self.decision_log,
+                        "frontier_memory": self.frontier_memory.snapshot(),
+                        "guardrail_events": self.guardrail_events,
+                        "navigation": {
+                            "mode": "ros_nav2",
+                            "control_steps": self.control_steps,
+                            "total_distance_m": round(self.total_distance_m, 3),
+                        },
+                        "ros_runtime": {
+                            "map_topic": self.config.ros_map_topic,
+                            "scan_topic": self.config.ros_scan_topic,
+                            "rgb_topic": self.config.ros_rgb_topic,
+                            "base_frame": self.config.ros_base_frame,
+                            "odom_frame": self.config.ros_odom_frame,
+                            "map_frame": self.config.ros_map_frame,
+                        },
+                    },
+                },
+            }
+        return super().snapshot()
+
+    def create_manual_region(self, payload: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            occupancy_map = self._require_effective_map()
+            cells = []
+            for item in payload.get("cells", []):
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    cell = GridCell(int(item.get("cell_x", -1)), int(item.get("cell_y", -1)))
+                except Exception:
+                    continue
+                if occupancy_map.in_bounds(cell.x, cell.y) and occupancy_map.is_free(cell.x, cell.y):
+                    cells.append({"cell_x": cell.x, "cell_y": cell.y})
+            if not cells:
+                self.last_error = "Region was not created because no selected cells are known free space."
+                return self.snapshot()
+            region = _manual_region_from_cells(
+                region_id=f"manual_region_{len(self.manual_regions) + 1:03d}",
+                label=str(payload.get("label", "")).strip() or f"region_{len(self.manual_regions) + 1}",
+                description=str(payload.get("description", "")).strip(),
+                cells=cells,
+                resolution=occupancy_map.resolution,
+            )
+            self.manual_regions.append(region)
+            self._push_progress_update(message=f"Added manual region `{region['label']}`.", frontier_id=None)
+            return self.snapshot()
+
+    def update_manual_region_waypoint(self, payload: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            region_id = str(payload.get("region_id", ""))
+            waypoint_name = str(payload.get("waypoint_name", ""))
+            pose = payload.get("pose", {})
+            region = next((item for item in self.manual_regions if item.get("region_id") == region_id), None)
+            if region is None or not isinstance(pose, dict):
+                self.last_error = "Could not update waypoint; region or pose was invalid."
+                return self.snapshot()
+            x = float(pose.get("x", 0.0))
+            y = float(pose.get("y", 0.0))
+            occupancy_map = self._require_effective_map()
+            cell_x, cell_y = occupancy_map.world_to_cell(x, y)
+            if not occupancy_map.in_bounds(cell_x, cell_y) or not occupancy_map.is_free(cell_x, cell_y):
+                self.last_error = "Waypoint was not moved because the target is not known free space."
+                return self.snapshot()
+            waypoint = next(
+                (item for item in region.get("default_waypoints", []) if item.get("name") == waypoint_name),
+                None,
+            )
+            if waypoint is None:
+                waypoint = {"name": waypoint_name or f"{region['label']}_waypoint", "kind": "subwaypoint"}
+                region.setdefault("default_waypoints", []).append(waypoint)
+            waypoint.update(
+                {
+                    "x": round(x, 3),
+                    "y": round(y, 3),
+                    "yaw": round(float(pose.get("yaw", 0.0)), 3),
+                }
+            )
+            self._push_progress_update(message=f"Updated waypoint `{waypoint['name']}`.", frontier_id=None)
+            return self.snapshot()
+
+    def add_manual_region_subwaypoint(self, payload: dict[str, Any]) -> dict[str, Any]:
+        payload = dict(payload)
+        payload["waypoint_name"] = str(payload.get("name", "")).strip() or "subwaypoint"
+        return self.update_manual_region_waypoint(payload)
+
+    def _build_map_payload(self) -> dict[str, Any]:
+        payload = super()._build_map_payload()
+        regions = list(getattr(self, "manual_regions", []))
+        semantic_places = payload.get("named_places", [])
+        payload["mode"] = "interactive_ros_nav2"
+        payload["regions"] = regions
+        payload["named_places"] = _named_places_from_manual_regions(regions) + semantic_places
+        pending_ids = {record.frontier_id for record in getattr(self, "pending_candidate_records", [])}
+        payload["frontiers"] = [record.to_dict() for record in getattr(self, "pending_candidate_records", [])]
+        payload["remembered_frontiers"] = [
+            record.to_dict()
+            for record in self.frontier_memory.records.values()
+            if record.frontier_id not in pending_ids and record.status == "stored"
+        ]
+        payload.setdefault("artifacts", {}).setdefault("navigation", {})["mode"] = "ros_nav2"
+        return payload
 
 
 @dataclass(frozen=True)
@@ -113,6 +362,7 @@ class InteractiveNoNav2ExplorationSession:
     def reset(self) -> dict[str, Any]:
         with self._lock:
             self.frontier_memory = FrontierMemory(self.config.occupancy_resolution)
+            self.semantic_observer = SemanticWaypointObserver(self.config, scenario=self.scenario)
             self.manual_occupancy_edits = ManualOccupancyEdits()
             self.current_cell = self.scenario.start_cell
             self.current_yaw = 0.0
@@ -123,6 +373,8 @@ class InteractiveNoNav2ExplorationSession:
                 self.current_cell.center_pose(self.scenario.resolution).to_dict()
             ]
             self.keyframes: list[dict[str, Any]] = []
+            self.semantic_processed_frame_count = 0
+            self.manual_regions: list[dict[str, Any]] = []
             self.room_frames: dict[str, list[str]] = {}
             self.room_objects_seen: dict[str, set[str]] = {room_id: set() for room_id in self.scenario.rooms}
             self.room_descriptions: dict[str, list[str]] = {room_id: [] for room_id in self.scenario.rooms}
@@ -150,6 +402,64 @@ class InteractiveNoNav2ExplorationSession:
             self._perform_scan(full_turnaround=True, capture_frame=True, reason="mock_initial_turnaround_scan")
             self._prepare_decision_locked()
             return self.snapshot()
+
+    def create_manual_region(self, payload: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            effective = self._effective_known_cells()
+            cells = [
+                item
+                for item in payload.get("cells", [])
+                if isinstance(item, dict)
+                and effective.get(GridCell(int(item.get("cell_x", -1)), int(item.get("cell_y", -1)))) == "free"
+            ]
+            if not cells:
+                self.last_error = "Region was not created because no selected cells are known free space."
+                return self.snapshot()
+            region = _manual_region_from_cells(
+                region_id=f"manual_region_{len(self.manual_regions) + 1:03d}",
+                label=str(payload.get("label", "")).strip() or f"region_{len(self.manual_regions) + 1}",
+                description=str(payload.get("description", "")).strip(),
+                cells=cells,
+                resolution=self.config.occupancy_resolution,
+            )
+            self.manual_regions.append(region)
+            return self.snapshot()
+
+    def update_manual_region_waypoint(self, payload: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            region_id = str(payload.get("region_id", ""))
+            waypoint_name = str(payload.get("waypoint_name", ""))
+            pose = payload.get("pose", {})
+            region = next((item for item in self.manual_regions if item.get("region_id") == region_id), None)
+            if region is None or not isinstance(pose, dict):
+                self.last_error = "Could not update waypoint; region or pose was invalid."
+                return self.snapshot()
+            x = float(pose.get("x", 0.0))
+            y = float(pose.get("y", 0.0))
+            cell = self.scenario.world_to_cell(x, y)
+            if self._effective_known_cells().get(cell) != "free":
+                self.last_error = "Waypoint was not moved because the target is not known free space."
+                return self.snapshot()
+            waypoint = next(
+                (item for item in region.get("default_waypoints", []) if item.get("name") == waypoint_name),
+                None,
+            )
+            if waypoint is None:
+                waypoint = {"name": waypoint_name or f"{region['label']}_waypoint", "kind": "subwaypoint"}
+                region.setdefault("default_waypoints", []).append(waypoint)
+            waypoint.update(
+                {
+                    "x": round(x, 3),
+                    "y": round(y, 3),
+                    "yaw": round(float(pose.get("yaw", 0.0)), 3),
+                }
+            )
+            return self.snapshot()
+
+    def add_manual_region_subwaypoint(self, payload: dict[str, Any]) -> dict[str, Any]:
+        payload = dict(payload)
+        payload["waypoint_name"] = str(payload.get("name", "")).strip() or "subwaypoint"
+        return self.update_manual_region_waypoint(payload)
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
@@ -196,6 +506,30 @@ class InteractiveNoNav2ExplorationSession:
             self.pending_trace = trace
             self.applied_memory_updates = applied_memory_updates
             self.status = "llm_response_ready"
+            return self.snapshot()
+
+    def call_semantic_llm(self) -> dict[str, Any]:
+        with self._lock:
+            self.last_error = None
+            if not self.config.automatic_semantic_waypoints:
+                self.last_error = (
+                    "Automatic semantic waypoints are disabled. Start with --automatic-semantic-waypoints "
+                    "to enable the legacy semantic waypoint pipeline."
+                )
+                return self.snapshot()
+            frames = self.keyframes[self.semantic_processed_frame_count :]
+            if not frames:
+                self.last_error = "No new spin keyframes are waiting for semantic waypoint processing."
+                return self.snapshot()
+            trace = self.semantic_observer.observe_keyframe_batch(
+                frames=json.loads(json.dumps(frames)),
+                known_cells=self._effective_known_cells(),
+                robot_cell=self.current_cell,
+                resolution=self.scenario.resolution,
+            )
+            self.semantic_processed_frame_count = len(self.keyframes)
+            self.status = "semantic_response_ready"
+            self.pending_trace = {"semantic_trace": trace}
             return self.snapshot()
 
     def apply_decision(self) -> dict[str, Any]:
@@ -678,7 +1012,11 @@ class InteractiveNoNav2ExplorationSession:
             elif cell in edits.cleared_cells:
                 item["manual_override"] = "cleared"
             occupancy_cells.append(item)
-        semantic_area_candidates = _aggregate_semantic_updates(self.semantic_updates)
+        semantic_area_candidates = []
+        if self.config.experimental_free_space_semantic_waypoints:
+            semantic_area_candidates = _aggregate_semantic_updates(self.semantic_updates)
+        semantic_memory = self.semantic_observer.snapshot() if self.config.automatic_semantic_waypoints else {}
+        regions = list(getattr(self, "manual_regions", []))
         return {
             "map_id": self.config.session,
             "frame": "map",
@@ -687,9 +1025,13 @@ class InteractiveNoNav2ExplorationSession:
             "mode": "interactive_no_nav2_llm_frontier",
             "trajectory": self.trajectory,
             "keyframes": self.keyframes,
-            "regions": [],
+            "regions": regions,
+            "named_places": _named_places_from_manual_regions(regions)
+            + (_semantic_named_places_for_map(semantic_memory) if self.config.automatic_semantic_waypoints else []),
             "frontiers": [record.to_dict() for record in self.frontier_memory.records.values()],
             "semantic_area_candidates": semantic_area_candidates,
+            "semantic_memory": semantic_memory,
+            "automatic_semantic_waypoints": self.config.automatic_semantic_waypoints,
             "occupancy": {
                 "resolution": float(self.scenario.resolution),
                 "bounds": self.scenario.bounds(),
@@ -750,6 +1092,7 @@ class ManiSkillTeleportExplorationSession:
         with self._lock:
             self._reset_environment()
             self.frontier_memory = FrontierMemory(self.config.occupancy_resolution)
+            self.semantic_observer = SemanticWaypointObserver(self.config, scenario=None)
             self.manual_occupancy_edits = ManualOccupancyEdits()
             self.known_cells: dict[GridCell, str] = {}
             self.occupancy_evidence: dict[GridCell, float] = {}
@@ -759,6 +1102,8 @@ class ManiSkillTeleportExplorationSession:
             self.latest_scan_range_edge_cells: set[GridCell] = set()
             self.trajectory: list[dict[str, Any]] = [self._current_pose().to_dict()]
             self.keyframes: list[dict[str, Any]] = []
+            self.semantic_processed_frame_count = 0
+            self.manual_regions: list[dict[str, Any]] = []
             self.decision_log: list[dict[str, Any]] = []
             self.semantic_updates: list[dict[str, Any]] = []
             self.guardrail_events: list[dict[str, Any]] = []
@@ -846,6 +1191,90 @@ class ManiSkillTeleportExplorationSession:
             self.applied_memory_updates = applied_memory_updates
             self.status = "llm_response_ready"
             return self.snapshot()
+
+    def call_semantic_llm(self) -> dict[str, Any]:
+        with self._lock:
+            self.last_error = None
+            if not self.config.automatic_semantic_waypoints:
+                self.last_error = (
+                    "Automatic semantic waypoints are disabled. Start with --automatic-semantic-waypoints "
+                    "to enable the legacy semantic waypoint pipeline."
+                )
+                return self.snapshot()
+            frames = self.keyframes[self.semantic_processed_frame_count :]
+            if not frames:
+                self.last_error = "No new spin keyframes are waiting for semantic waypoint processing."
+                return self.snapshot()
+            pose = self._current_pose()
+            semantic_known = self._effective_known_cells()
+            trace = self.semantic_observer.observe_keyframe_batch(
+                frames=json.loads(json.dumps(frames)),
+                known_cells=semantic_known,
+                robot_cell=self._world_to_cell(pose.x, pose.y),
+                resolution=self.config.occupancy_resolution,
+            )
+            self.semantic_processed_frame_count = len(self.keyframes)
+            self.status = "semantic_response_ready"
+            self.pending_trace = {"semantic_trace": trace}
+            return self.snapshot()
+
+    def create_manual_region(self, payload: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            effective = self._effective_known_cells()
+            cells = [
+                item
+                for item in payload.get("cells", [])
+                if isinstance(item, dict)
+                and effective.get(GridCell(int(item.get("cell_x", -1)), int(item.get("cell_y", -1)))) == "free"
+            ]
+            if not cells:
+                self.last_error = "Region was not created because no selected cells are known free space."
+                return self.snapshot()
+            region = _manual_region_from_cells(
+                region_id=f"manual_region_{len(self.manual_regions) + 1:03d}",
+                label=str(payload.get("label", "")).strip() or f"region_{len(self.manual_regions) + 1}",
+                description=str(payload.get("description", "")).strip(),
+                cells=cells,
+                resolution=self.config.occupancy_resolution,
+            )
+            self.manual_regions.append(region)
+            return self.snapshot()
+
+    def update_manual_region_waypoint(self, payload: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            region_id = str(payload.get("region_id", ""))
+            waypoint_name = str(payload.get("waypoint_name", ""))
+            pose = payload.get("pose", {})
+            region = next((item for item in self.manual_regions if item.get("region_id") == region_id), None)
+            if region is None or not isinstance(pose, dict):
+                self.last_error = "Could not update waypoint; region or pose was invalid."
+                return self.snapshot()
+            x = float(pose.get("x", 0.0))
+            y = float(pose.get("y", 0.0))
+            cell = self._world_to_cell(x, y)
+            if self._effective_known_cells().get(cell) != "free":
+                self.last_error = "Waypoint was not moved because the target is not known free space."
+                return self.snapshot()
+            waypoint = next(
+                (item for item in region.get("default_waypoints", []) if item.get("name") == waypoint_name),
+                None,
+            )
+            if waypoint is None:
+                waypoint = {"name": waypoint_name or f"{region['label']}_waypoint", "kind": "subwaypoint"}
+                region.setdefault("default_waypoints", []).append(waypoint)
+            waypoint.update(
+                {
+                    "x": round(x, 3),
+                    "y": round(y, 3),
+                    "yaw": round(float(pose.get("yaw", 0.0)), 3),
+                }
+            )
+            return self.snapshot()
+
+    def add_manual_region_subwaypoint(self, payload: dict[str, Any]) -> dict[str, Any]:
+        payload = dict(payload)
+        payload["waypoint_name"] = str(payload.get("name", "")).strip() or "subwaypoint"
+        return self.update_manual_region_waypoint(payload)
 
     def apply_decision(self) -> dict[str, Any]:
         with self._lock:
@@ -1280,7 +1709,12 @@ class ManiSkillTeleportExplorationSession:
             for index, yaw in enumerate(yaws):
                 scan_pose = Pose2D(original_pose.x, original_pose.y, _angle_wrap(yaw))
                 try:
-                    self._teleport_robot(scan_pose)
+                    self._move_to_scan_sample_pose(
+                        scan_pose,
+                        full_turnaround=full_turnaround,
+                        scan_reason=reason,
+                        yaw_sample_index=index,
+                    )
                 except Exception as exc:
                     self.guardrail_events.append(
                         {
@@ -1303,7 +1737,12 @@ class ManiSkillTeleportExplorationSession:
                     captured_any = True
             if full_turnaround:
                 try:
-                    self._teleport_robot(Pose2D(original_pose.x, original_pose.y, _angle_wrap(original_pose.yaw)))
+                    self._move_to_scan_sample_pose(
+                        Pose2D(original_pose.x, original_pose.y, _angle_wrap(original_pose.yaw)),
+                        full_turnaround=full_turnaround,
+                        scan_reason=reason,
+                        yaw_sample_index=sample_count,
+                    )
                 except Exception as exc:
                     self.guardrail_events.append(
                         {
@@ -1330,6 +1769,16 @@ class ManiSkillTeleportExplorationSession:
             self._active_scan_range_edge_cells = previous_active_scan_range_edge_cells
             self._active_scan_occupancy_evidence = previous_active_scan_occupancy_evidence
 
+    def _move_to_scan_sample_pose(
+        self,
+        pose: Pose2D,
+        *,
+        full_turnaround: bool,
+        scan_reason: str,
+        yaw_sample_index: int,
+    ) -> None:
+        self._teleport_robot(pose)
+
     def _integrate_depth_scan(self, head_data: dict[str, np.ndarray]) -> dict[str, Any]:
         depth = np.asarray(head_data.get("depth"))
         if depth.ndim == 3:
@@ -1345,78 +1794,48 @@ class ManiSkillTeleportExplorationSession:
         head_position = self._tensor_to_numpy(self.head_link.pose.p)
         head_quaternion = normalize_quaternion_wxyz(self._tensor_to_numpy(self.head_link.pose.q))
         laser_yaw = quaternion_to_yaw(head_quaternion)
-        origin_cell = self._world_to_cell(float(head_position[0]), float(head_position[1]))
         active_scan_cells = getattr(self, "_active_scan_cells", None)
         active_scan_known_cells = getattr(self, "_active_scan_known_cells", None)
         active_scan_range_edge_cells = getattr(self, "_active_scan_range_edge_cells", None)
         active_scan_occupancy_evidence = getattr(self, "_active_scan_occupancy_evidence", None)
-        if active_scan_cells is not None:
-            active_scan_cells.add(origin_cell)
-        if active_scan_known_cells is not None:
-            merge_occupancy_observation(
-                active_scan_known_cells,
-                origin_cell,
-                "free",
-                evidence_scores=active_scan_occupancy_evidence,
-                config=ACTIVE_RGBD_SCAN_FUSION_CONFIG,
-            )
-
-        resolution = self.config.occupancy_resolution
-        step_m = max(resolution * 0.5, 0.05)
         beam_stride = max(int(self.options.depth_beam_stride), 1)
-        point_count = 0
-        for index in range(0, len(ranges), beam_stride):
-            beam_range = float(ranges[index])
-            hit_obstacle = math.isfinite(beam_range) and beam_range < self.config.sensor_range_m * 0.98
-            ray_max_m = min(beam_range, self.config.sensor_range_m) if math.isfinite(beam_range) else self.config.sensor_range_m
-            if ray_max_m <= 0.05:
-                continue
-            angle = laser_yaw + float(angles[index])
-            last_free: GridCell | None = None
-            samples = max(1, int(ray_max_m / step_m))
-            for sample_index in range(1, samples + 1):
-                distance_m = min(sample_index * step_m, ray_max_m)
-                cell = self._world_to_cell(
-                    float(head_position[0]) + math.cos(angle) * distance_m,
-                    float(head_position[1]) + math.sin(angle) * distance_m,
-                )
-                if active_scan_cells is not None:
-                    active_scan_cells.add(cell)
-                if hit_obstacle and sample_index == samples and cell != origin_cell:
-                    if active_scan_known_cells is not None:
-                        merge_occupancy_observation(
-                            active_scan_known_cells,
-                            cell,
-                            "occupied",
-                            evidence_scores=active_scan_occupancy_evidence,
-                            config=ACTIVE_RGBD_SCAN_FUSION_CONFIG,
-                        )
-                    point_count += 1
-                else:
-                    if active_scan_known_cells is not None:
-                        merge_occupancy_observation(
-                            active_scan_known_cells,
-                            cell,
-                            "free",
-                            evidence_scores=active_scan_occupancy_evidence,
-                            config=ACTIVE_RGBD_SCAN_FUSION_CONFIG,
-                        )
-                    last_free = cell
-                    point_count += 1
-            if not hit_obstacle and last_free is not None:
-                if active_scan_range_edge_cells is not None:
-                    active_scan_range_edge_cells.add(last_free)
+        summary = integrate_planar_scan(
+            pose=Pose2D(float(head_position[0]), float(head_position[1]), laser_yaw),
+            ranges=tuple(float(item) for item in ranges),
+            angle_min=float(angles[0]) if len(angles) else -HEAD_CAMERA_FOV_RAD / 2.0,
+            angle_increment=float(angles[1] - angles[0]) if len(angles) > 1 else 0.0,
+            range_min_m=0.05,
+            range_max_m=self.config.sensor_range_m,
+            resolution_m=self.config.occupancy_resolution,
+            cell_from_world=lambda x, y: self._world_to_cell(x, y),
+            known_cells=active_scan_known_cells,
+            evidence_scores=active_scan_occupancy_evidence,
+            range_edge_cells=active_scan_range_edge_cells,
+            visited_cells=active_scan_cells,
+            beam_stride=beam_stride,
+            config=ACTIVE_RGBD_SCAN_FUSION_CONFIG,
+        )
+        self._latest_scan_observation = {
+            "frame_id": "maniskill_head_scan",
+            "reference_frame": "maniskill_world",
+            "pose": Pose2D(float(head_position[0]), float(head_position[1]), laser_yaw),
+            "range_min": 0.05,
+            "range_max": float(self.config.sensor_range_m),
+            "angle_min": float(angles[0]) if len(angles) else -HEAD_CAMERA_FOV_RAD / 2.0,
+            "angle_increment": float(angles[1] - angles[0]) if len(angles) > 1 else 0.0,
+            "ranges": tuple(float(item) for item in ranges),
+        }
 
-        summary = _depth_summary(depth_for_scan, max_range_m=self.config.sensor_range_m)
-        summary.update(
+        depth_summary = _depth_summary(depth_for_scan, max_range_m=self.config.sensor_range_m)
+        depth_summary.update(
             {
-                "point_count": point_count,
-                "scan_beams": int(len(ranges)),
-                "integrated_beams": int(math.ceil(len(ranges) / beam_stride)),
+                "point_count": summary.point_count,
+                "scan_beams": summary.scan_beams,
+                "integrated_beams": summary.integrated_beams,
                 "source": "maniskill_xlerobot_head_rgbd",
             }
         )
-        return summary
+        return depth_summary
 
     def _merge_latest_scan_into_global(self) -> None:
         if not hasattr(self, "occupancy_evidence"):
@@ -2355,7 +2774,11 @@ class ManiSkillTeleportExplorationSession:
             elif cell in edits.cleared_cells:
                 item["manual_override"] = "cleared"
             occupancy_cells.append(item)
-        semantic_area_candidates = _aggregate_semantic_updates(self.semantic_updates)
+        semantic_area_candidates = []
+        if self.config.experimental_free_space_semantic_waypoints:
+            semantic_area_candidates = _aggregate_semantic_updates(self.semantic_updates)
+        semantic_memory = self.semantic_observer.snapshot() if self.config.automatic_semantic_waypoints else {}
+        regions = list(getattr(self, "manual_regions", []))
         pending_ids = {record.frontier_id for record in self.pending_candidate_records}
         remembered_frontiers = [
             record.to_dict()
@@ -2374,10 +2797,14 @@ class ManiSkillTeleportExplorationSession:
             ),
             "trajectory": self.trajectory,
             "keyframes": self.keyframes,
-            "regions": [],
+            "regions": regions,
+            "named_places": _named_places_from_manual_regions(regions)
+            + (_semantic_named_places_for_map(semantic_memory) if self.config.automatic_semantic_waypoints else []),
             "frontiers": [record.to_dict() for record in self.pending_candidate_records],
             "remembered_frontiers": remembered_frontiers,
             "semantic_area_candidates": semantic_area_candidates,
+            "semantic_memory": semantic_memory,
+            "automatic_semantic_waypoints": self.config.automatic_semantic_waypoints,
             "occupancy": {
                 "resolution": float(resolution),
                 "bounds": self._map_bounds(),
@@ -2417,6 +2844,371 @@ class ManiSkillTeleportExplorationSession:
                 },
             },
         }
+
+
+class ManiSkillNav2RouterExplorationSession(ManiSkillTeleportExplorationSession):
+    """ManiSkill-backed brain session that asks a remote ROS/Nav2 router to validate paths."""
+
+    def __init__(self, config: SimExplorationConfig, options: ManiSkillInteractiveOptions) -> None:
+        if not config.ros_adapter_url:
+            raise RuntimeError("`--ros-adapter-url` is required for the ManiSkill + Nav2 router flow.")
+        self.router = RemoteNav2RouterClient(config.ros_adapter_url, timeout_s=config.ros_adapter_timeout_s)
+        super().__init__(config, options)
+
+    def reset(self) -> dict[str, Any]:
+        snapshot = super().reset()
+        self._publish_router_state()
+        return snapshot
+
+    def apply_decision(self) -> dict[str, Any]:
+        with self._lock:
+            self.last_error = None
+            if self.paused:
+                self.last_error = "Exploration is paused. Resume before applying a decision."
+                return self.snapshot()
+            if self.pending_decision is None:
+                self.last_error = "No pending LLM decision. Click `Call LLM` first."
+                return self.snapshot()
+            decision = self.pending_decision
+            if decision.decision_type == "finish" or decision.exploration_complete:
+                self.status = "finished"
+                self._log_decision("finish_without_motion")
+                self.pending_decision = None
+                return self.snapshot()
+            if not decision.selected_frontier_id:
+                self.last_error = "The LLM decision did not select a frontier."
+                return self.snapshot()
+            record = self.frontier_memory.activate(decision.selected_frontier_id)
+            if record is None:
+                self.last_error = f"Selected frontier `{decision.selected_frontier_id}` no longer exists."
+                return self.snapshot()
+
+            start_pose = self._current_pose()
+            current_cell = self._world_to_cell(start_pose.x, start_pose.y)
+            reachable_safe_cells = self._reachable_safe_navigation_cells(current_cell)
+            target_pose, rejection_reason = self._resolve_physically_valid_target_pose(
+                record=record,
+                start_pose=start_pose,
+                reachable_safe_cells=reachable_safe_cells,
+            )
+            if target_pose is None:
+                if self._is_close_enough_to_complete_frontier(start_pose, record):
+                    record.evidence = _dedupe_text(
+                        record.evidence
+                        + [
+                            "frontier marked completed from the current pose because the exact projected approach pose was not physically valid, but the robot was already close enough to observe the frontier boundary"
+                        ]
+                    )
+                    self.last_error = (
+                        f"`{record.frontier_id}` was marked completed from the current pose; "
+                        f"no collision-free target was found nearby ({rejection_reason or 'unknown reason'})."
+                    )
+                    return self._complete_active_frontier_locked(
+                        record=record,
+                        decision=decision,
+                        event_type="router_close_enough_completed",
+                    )
+                self.frontier_memory.fail(
+                    record.frontier_id,
+                    f"no physically valid target near frontier: {rejection_reason or 'unknown reason'}",
+                )
+                self.last_error = (
+                    f"Router move rejected `{record.frontier_id}` because no nearby collision-free target pose "
+                    f"could be found ({rejection_reason or 'unknown reason'})."
+                )
+                self._log_decision("router_target_invalid")
+                self._prepare_decision_locked()
+                return self.snapshot()
+
+            try:
+                self._publish_router_state(required=True)
+                status, path_poses, status_label = self.router.compute_path(
+                    goal_pose=target_pose,
+                    planner_id=self.config.nav2_planner_id,
+                )
+                self._validate_router_path(path_poses, start_pose=start_pose, target_pose=target_pose)
+            except Exception as exc:
+                record.status = "stored"
+                self.frontier_memory.active_frontier_id = None
+                self.last_error = f"Nav2 router failed to plan `{record.frontier_id}`: {exc}"
+                self._log_decision("router_planner_failed")
+                self._prepare_decision_locked()
+                return self.snapshot()
+            if status_label != "succeeded" or not path_poses:
+                self.frontier_memory.fail(
+                    record.frontier_id,
+                    f"router compute_path returned `{status_label}` with {len(path_poses)} poses",
+                )
+                self.last_error = (
+                    f"Nav2 router rejected `{record.frontier_id}` with status `{status_label}` "
+                    f"and {len(path_poses)} path poses."
+                )
+                self._log_decision("router_planner_rejected")
+                self._prepare_decision_locked()
+                return self.snapshot()
+
+            try:
+                travelled_distance_m = self._execute_router_path(path_poses, final_pose=target_pose)
+            except Exception as exc:
+                self.frontier_memory.fail(record.frontier_id, f"router movement failed: {exc}")
+                self.last_error = f"Router movement failed for `{record.frontier_id}`: {exc}"
+                self._log_decision("router_move_failed")
+                self._prepare_decision_locked()
+                return self.snapshot()
+
+            reached_pose = self._current_pose()
+            self.total_distance_m += travelled_distance_m
+            self.trajectory.append(reached_pose.to_dict())
+            try:
+                self._perform_scan(
+                    full_turnaround=self._scan_uses_turnaround(),
+                    capture_frame=True,
+                    reason=self._scan_reason(f"router_arrive_frontier::{record.frontier_id}"),
+                )
+            except Exception as exc:
+                self.guardrail_events.append(
+                    {
+                        "type": "arrival_scan_failed_after_router_move",
+                        "frontier_id": record.frontier_id,
+                        "reason": str(exc),
+                    }
+                )
+                record.evidence = _dedupe_text(
+                    record.evidence
+                    + [f"arrival scan failed after router-approved movement; frontier still marked completed: {exc}"]
+                )
+                self.last_error = f"Arrival scan failed for `{record.frontier_id}`, but the frontier was reached: {exc}"
+            return self._complete_active_frontier_locked(
+                record=record,
+                decision=decision,
+                event_type="router_path_applied",
+            )
+
+    def _validate_router_path(
+        self,
+        path_poses: list[Pose2D],
+        *,
+        start_pose: Pose2D,
+        target_pose: Pose2D,
+    ) -> None:
+        if not path_poses:
+            raise RuntimeError("Nav2 returned an empty path.")
+        start_error_m = _pose_distance_m(path_poses[0], start_pose)
+        end_error_m = _pose_distance_m(path_poses[-1], target_pose)
+        tolerance_m = max(self.config.occupancy_resolution * 2.0, 0.50)
+        if start_error_m > tolerance_m:
+            raise RuntimeError(
+                "Nav2 path starts too far from the current simulator pose "
+                f"({start_error_m:.2f} m). The router likely planned from stale pose state."
+            )
+        if end_error_m > tolerance_m:
+            raise RuntimeError(
+                "Nav2 path ends too far from the requested frontier target "
+                f"({end_error_m:.2f} m)."
+            )
+
+    def _execute_router_path(self, path_poses: list[Pose2D], *, final_pose: Pose2D) -> float:
+        if not path_poses:
+            self._teleport_robot(final_pose)
+            self.control_steps += 1
+            return 0.0
+        waypoints = [self._current_pose()] + list(path_poses)
+        if _pose_distance_m(waypoints[-1], final_pose) > max(self.config.occupancy_resolution, 0.10):
+            waypoints.append(final_pose)
+        else:
+            waypoints[-1] = final_pose
+
+        travelled_distance_m = 0.0
+        pose_publish_stride = 5
+        for waypoint in waypoints[1:]:
+            current = self._current_pose()
+            dx = waypoint.x - current.x
+            dy = waypoint.y - current.y
+            distance = math.hypot(dx, dy)
+            if distance > 1e-4:
+                segment_yaw = math.atan2(dy, dx)
+                self._rotate_in_place(segment_yaw, publish_stride=pose_publish_stride)
+                travelled_distance_m += self._drive_straight_to(
+                    Pose2D(waypoint.x, waypoint.y, segment_yaw),
+                    publish_stride=pose_publish_stride,
+                )
+        self._rotate_in_place(final_pose.yaw, publish_stride=pose_publish_stride)
+        self._publish_router_state()
+        return travelled_distance_m
+
+    def _rotate_in_place(self, target_yaw: float, *, publish_stride: int) -> None:
+        current = self._current_pose()
+        yaw_delta = _angle_wrap(target_yaw - current.yaw)
+        if abs(yaw_delta) <= 1e-3:
+            return
+        angular_speed = self._sim_motion_angular_speed_rad_s()
+        publish_hz = max(float(self.config.ros_manual_spin_publish_hz), 1.0)
+        step_s = 1.0 / publish_hz
+        step_yaw = angular_speed * step_s
+        steps = max(int(math.ceil(abs(yaw_delta) / max(step_yaw, 1e-6))), 1)
+        for step in range(1, steps + 1):
+            fraction = step / steps
+            pose = Pose2D(current.x, current.y, _angle_wrap(current.yaw + yaw_delta * fraction))
+            self._teleport_robot(pose)
+            self.control_steps += 1
+            if step % publish_stride == 0 or step == steps:
+                self._publish_router_state()
+            self._sleep_after_motion_step(step_s)
+
+    def _drive_straight_to(self, target_pose: Pose2D, *, publish_stride: int) -> float:
+        current = self._current_pose()
+        dx = target_pose.x - current.x
+        dy = target_pose.y - current.y
+        distance = math.hypot(dx, dy)
+        if distance <= 1e-4:
+            return 0.0
+        linear_speed_m_s = self._sim_motion_linear_speed_m_s()
+        publish_hz = max(float(self.config.ros_manual_spin_publish_hz), 1.0)
+        step_s = 1.0 / publish_hz
+        step_distance = max(linear_speed_m_s * step_s, 0.01)
+        steps = max(int(math.ceil(distance / step_distance)), 1)
+        travelled_distance_m = 0.0
+        previous = current
+        for step in range(1, steps + 1):
+            fraction = step / steps
+            pose = Pose2D(
+                current.x + dx * fraction,
+                current.y + dy * fraction,
+                target_pose.yaw,
+            )
+            self._teleport_robot(pose)
+            self.control_steps += 1
+            travelled_distance_m += _pose_distance_m(previous, pose)
+            previous = pose
+            if step % publish_stride == 0 or step == steps:
+                self.trajectory.append(pose.to_dict())
+                self._publish_router_state()
+            self._sleep_after_motion_step(step_s)
+        return travelled_distance_m
+
+    def _sleep_after_motion_step(self, step_s: float) -> None:
+        if self.options.render_mode == "human":
+            time.sleep(max(step_s, 0.0))
+        elif self.config.realtime_sleep_s > 0:
+            time.sleep(self.config.realtime_sleep_s)
+
+    def _sim_motion_speed_preset(self) -> dict[str, float]:
+        return SIM_MOTION_SPEED_PRESETS.get(self.config.sim_motion_speed, SIM_MOTION_SPEED_PRESETS["normal"])
+
+    def _sim_motion_linear_speed_m_s(self) -> float:
+        return max(float(self._sim_motion_speed_preset()["linear_m_s"]), 0.05)
+
+    def _sim_motion_angular_speed_rad_s(self) -> float:
+        multiplier = float(self._sim_motion_speed_preset()["angular_multiplier"])
+        return max(float(self.config.ros_manual_spin_angular_speed_rad_s) * multiplier, 0.05)
+
+    def _perform_scan(self, *, full_turnaround: bool, capture_frame: bool, reason: str) -> None:
+        super()._perform_scan(full_turnaround=full_turnaround, capture_frame=capture_frame, reason=reason)
+        self._publish_router_state()
+
+    def _move_to_scan_sample_pose(
+        self,
+        pose: Pose2D,
+        *,
+        full_turnaround: bool,
+        scan_reason: str,
+        yaw_sample_index: int,
+    ) -> None:
+        if not full_turnaround:
+            self._teleport_robot(pose)
+            return
+        current = self._current_pose()
+        yaw_delta = _angle_wrap(pose.yaw - current.yaw)
+        angular_speed = self._sim_motion_angular_speed_rad_s()
+        publish_hz = max(float(self.config.ros_manual_spin_publish_hz), 1.0)
+        step_s = 1.0 / publish_hz
+        step_yaw = angular_speed * step_s
+        steps = max(int(math.ceil(abs(yaw_delta) / max(step_yaw, 1e-6))), 1)
+        for step in range(1, steps + 1):
+            fraction = step / steps
+            intermediate = Pose2D(
+                pose.x,
+                pose.y,
+                _angle_wrap(current.yaw + yaw_delta * fraction),
+            )
+            self._teleport_robot(intermediate)
+            if step < steps:
+                time.sleep(step_s)
+
+    def _publish_router_state(self, *, required: bool = False) -> None:
+        try:
+            self.router.update_state(
+                occupancy_map=self._router_navigation_map(),
+                pose=self._current_pose(),
+                scan_observation=getattr(self, "_latest_scan_observation", None),
+                image_data_url=None,
+            )
+        except Exception as exc:
+            self.last_error = f"Nav2 router state update failed: {exc}"
+            self.guardrail_events.append(
+                {
+                    "type": "nav2_router_state_update_failed",
+                    "reason": str(exc),
+                }
+            )
+            if required:
+                raise
+
+    def _router_navigation_map(self) -> RosOccupancyMap:
+        effective_known = self._effective_known_cells()
+        resolution = float(self.config.occupancy_resolution)
+        if not effective_known:
+            pose = self._current_pose()
+            base_x = int(math.floor(pose.x / resolution))
+            base_y = int(math.floor(pose.y / resolution))
+            return RosOccupancyMap(
+                resolution=resolution,
+                width=1,
+                height=1,
+                origin_x=base_x * resolution,
+                origin_y=base_y * resolution,
+                data=(0,),
+            )
+        min_x = min(cell.x for cell in effective_known) - 2
+        min_y = min(cell.y for cell in effective_known) - 2
+        max_x = max(cell.x for cell in effective_known) + 2
+        max_y = max(cell.y for cell in effective_known) + 2
+        width = max_x - min_x + 1
+        height = max_y - min_y + 1
+        data = [-1] * (width * height)
+        for cell, state in effective_known.items():
+            local_x = cell.x - min_x
+            local_y = cell.y - min_y
+            data[local_y * width + local_x] = 0 if state == "free" else 100
+        return RosOccupancyMap(
+            resolution=resolution,
+            width=width,
+            height=height,
+            origin_x=min_x * resolution,
+            origin_y=min_y * resolution,
+            data=tuple(data),
+        )
+
+    def _build_map_payload(self) -> dict[str, Any]:
+        payload = super()._build_map_payload()
+        payload["mode"] = "interactive_manishkill_rgbd_nav2_router"
+        payload["summary"] = (
+            "Interactive playground using ManiSkill as the robot brain, with fused RGB-D mapping kept local "
+            "and Nav2 path approval routed through the external ROS adapter."
+        )
+        artifacts = payload.setdefault("artifacts", {})
+        artifacts["navigation"] = {
+            "mode": "maniskill_brain_with_nav2_router",
+            "control_steps": self.control_steps,
+            "total_distance_m": round(self.total_distance_m, 3),
+            "router_url": self.config.ros_adapter_url,
+            "sim_motion_speed": self.config.sim_motion_speed,
+        }
+        try:
+            artifacts["nav2_router"] = self.router.snapshot()
+        except Exception as exc:
+            artifacts["nav2_router"] = {"status": "unavailable", "error": str(exc)}
+        return payload
 
 
 def _depth_image_to_millimeters(depth: np.ndarray) -> np.ndarray:
@@ -2753,12 +3545,16 @@ INTERACTIVE_HTML = """<!doctype html>
             <button class="secondary" id="pause">Pause</button>
             <button class="secondary" id="resume">Resume</button>
             <button class="primary" id="call">Call LLM</button>
+            <button class="primary" id="call-semantic" style="display:none;">Call Semantic LLM</button>
             <button class="primary" id="apply">Move To Selected Frontier</button>
           </div>
           <div class="buttons" style="margin-top:10px;">
             <button class="secondary" id="edit-block">Draw Wall</button>
             <button class="secondary" id="edit-clear">Erase Wall</button>
             <button class="secondary" id="edit-reset">Reset Cell</button>
+            <button class="secondary" id="region-add">Add Region</button>
+            <button class="primary" id="region-done">Done Region</button>
+            <button class="secondary" id="subwaypoint-add">Add Subwaypoint</button>
           </div>
           <p class="muted">No Nav2 is used here. Movement is direct synthetic pose update or ManiSkill teleport to the selected frontier, followed by another 360 scan. Map edits support click-and-drag painting.</p>
           <div id="error" class="error"></div>
@@ -2770,6 +3566,14 @@ INTERACTIVE_HTML = """<!doctype html>
         <section class="panel">
           <div class="eyebrow">Frontier Information</div>
           <div id="frontiers" class="frontier-list"></div>
+        </section>
+        <section class="panel">
+          <div class="eyebrow">Navigation Memory</div>
+          <div id="manual-regions" class="frontier-list"></div>
+        </section>
+        <section class="panel" id="semantic-panel" style="display:none;">
+          <div class="eyebrow">Automatic Semantic Places</div>
+          <div id="semantic" class="frontier-list"></div>
         </section>
         <section class="panel">
           <div class="eyebrow">Recent RGB-D Views</div>
@@ -2800,6 +3604,10 @@ INTERACTIVE_HTML = """<!doctype html>
     let paintFlushTimer = null;
     let lastPaintedCellKey = null;
     let currentOccupancyCellStates = new Map();
+    let regionMode = null;
+    let selectedRegionCells = new Map();
+    let pendingSubwaypoint = null;
+    let draggingWaypoint = null;
 
     function esc(v) {
       return String(v ?? '').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;');
@@ -2859,6 +3667,20 @@ INTERACTIVE_HTML = """<!doctype html>
       cell.key = `${cell.cell_x}:${cell.cell_y}`;
       return cell;
     }
+    function cellCenterPose(map, cell) {
+      const resolution = map.occupancy?.resolution || 0.25;
+      return {
+        x: (cell.cell_x + 0.5) * resolution,
+        y: (cell.cell_y + 0.5) * resolution,
+        yaw: 0
+      };
+    }
+    function selectRegionCell(cell) {
+      const state = currentOccupancyCellStates.get(cell.key);
+      if (!state || state.state !== 'free') return;
+      selectedRegionCells.set(cell.key, {cell_x: cell.cell_x, cell_y: cell.cell_y});
+      renderMap();
+    }
     function shouldPaintCell(cell) {
       if (mapEditMode !== 'clear') return true;
       const state = currentOccupancyCellStates.get(cell.key);
@@ -2889,6 +3711,7 @@ INTERACTIVE_HTML = """<!doctype html>
         ['Pose', `${Number(pose.x || 0).toFixed(2)}, ${Number(pose.y || 0).toFixed(2)}`],
         ['Frontiers', (state.candidate_frontiers || []).length],
         ['Stored Memory', (state.map?.remembered_frontiers || []).length],
+        ['Manual Regions', (state.map?.regions || []).length],
         ['Pending', state.pending_target?.frontier_id || 'none'],
         ['Provider', state.map?.artifacts?.llm_policy?.provider || 'unknown'],
         ['Edit Mode', mapEditMode]
@@ -2914,6 +3737,38 @@ INTERACTIVE_HTML = """<!doctype html>
           <div class="muted">${esc(f.frame_id)} · ${esc(f.description)}</div>
         </div>
       `).join('');
+    }
+    function renderSemantic() {
+      const visible = !!state.map?.automatic_semantic_waypoints;
+      document.getElementById('semantic-panel').style.display = visible ? '' : 'none';
+      document.getElementById('call-semantic').style.display = visible ? '' : 'none';
+      if (!visible) return;
+      const memory = state.map?.semantic_memory || {};
+      const places = memory.named_places || [];
+      const anchors = memory.anchors || [];
+      const traces = memory.traces || [];
+      const anchorById = new Map(anchors.map((a) => [a.anchor_id, a]));
+      document.getElementById('semantic').innerHTML = places.map((place) => {
+        const primaryAnchor = (place.source_anchor_ids || []).map((id) => anchorById.get(id)).find(Boolean);
+        const reachability = primaryAnchor?.reachability_status || 'unknown';
+        const pose = place.anchor_pose || {};
+        return `<div class="frontier">
+          <strong>${esc(place.label)}</strong> · ${esc(place.status)} · ${esc(Number(place.confidence || 0).toFixed(2))}<br>
+          anchor ${esc(Number(pose.x || 0).toFixed(2))}, ${esc(Number(pose.y || 0).toFixed(2))} · ${esc(reachability)}<br>
+          <span class="muted">${esc((place.evidence || []).slice(0, 2).join(' | '))}</span>
+        </div>`;
+      }).join('') || `<div class="muted">No semantic places yet. ${traces.length ? esc(traces[traces.length - 1].status || '') : ''}</div>`;
+    }
+    function renderManualRegions() {
+      const regions = state.map?.regions || [];
+      document.getElementById('manual-regions').innerHTML = regions.map((region) => {
+        const waypoints = region.default_waypoints || [];
+        return `<div class="frontier">
+          <strong>${esc(region.label)}</strong> · ${esc(region.region_id)}<br>
+          <span class="muted">${esc(region.description || '')}</span><br>
+          ${(waypoints || []).map((wp) => `<span>${esc(wp.name)} (${Number(wp.x || 0).toFixed(2)}, ${Number(wp.y || 0).toFixed(2)})</span>`).join('<br>')}
+        </div>`;
+      }).join('') || '<div class="muted">No manual regions yet. Click Add Region, select free cells, then Done Region.</div>';
     }
     function renderMap() {
       const svg = document.getElementById('map');
@@ -2960,6 +3815,43 @@ INTERACTIVE_HTML = """<!doctype html>
                 <circle cx="${p.x}" cy="${p.y}" r="5" fill="#647067" opacity=".32"><title>${esc(f.frontier_id)} stored memory approach</title></circle>
                 <text x="${p.x + 8}" y="${p.y + 14}" font-size="11" fill="#647067" opacity=".7">${esc(f.frontier_id)} memory</text>`;
       }).join('');
+      const manualRegionCells = (map.regions || []).map((region, idx) => {
+        const color = ['#2563eb', '#0891b2', '#9333ea', '#db2777', '#0f766e'][idx % 5];
+        return (region.selected_cells || []).map((cell) => {
+          const x = Number(cell.cell_x) * res;
+          const y = Number(cell.cell_y) * res;
+          const p = project({x, y});
+          const p2 = project({x: x + res, y: y + res});
+          return `<rect x="${p.x}" y="${p2.y}" width="${Math.max(2, p2.x-p.x)}" height="${Math.max(2, p.y-p2.y)}" fill="${color}" opacity=".28"><title>${esc(region.label)}</title></rect>`;
+        }).join('');
+      }).join('');
+      const selectedCells = Array.from(selectedRegionCells.values()).map((cell) => {
+        const x = Number(cell.cell_x) * res;
+        const y = Number(cell.cell_y) * res;
+        const p = project({x, y});
+        const p2 = project({x: x + res, y: y + res});
+        return `<rect x="${p.x}" y="${p2.y}" width="${Math.max(2, p2.x-p.x)}" height="${Math.max(2, p.y-p2.y)}" fill="#f59e0b" opacity=".46"/>`;
+      }).join('');
+      const manualWaypoints = (map.regions || []).map((region) => (region.default_waypoints || []).map((wp) => {
+        const p = project(wp);
+        const primary = (wp.kind || 'primary') === 'primary';
+        return `<g data-region-id="${esc(region.region_id)}" data-waypoint-name="${esc(wp.name)}" class="manual-waypoint">
+          <circle cx="${p.x}" cy="${p.y}" r="${primary ? 8 : 6}" fill="${primary ? '#1d4ed8' : '#0e7490'}"><title>${esc(region.label)} · ${esc(wp.name)}</title></circle>
+          <text x="${p.x + 10}" y="${p.y + 4}" font-size="12" fill="#1e3a8a" font-weight="800">${esc(wp.name)}</text>
+        </g>`;
+      }).join('')).join('');
+      const semanticMemory = map.automatic_semantic_waypoints ? (map.semantic_memory || {}) : {};
+      const evidencePoints = (semanticMemory.evidence || []).map((ev) => {
+        const p = project(ev.evidence_pose || {x:0,y:0});
+        return `<circle cx="${p.x}" cy="${p.y}" r="5" fill="#7c3aed" opacity=".72"><title>${esc(ev.label_hint)} evidence: ${esc((ev.evidence || []).join(' | '))}</title></circle>`;
+      }).join('');
+      const semanticPlaces = (semanticMemory.named_places || []).map((place) => {
+        const anchor = project(place.anchor_pose || {x:0,y:0});
+        const evidence = place.evidence_pose ? project(place.evidence_pose) : null;
+        return `${evidence ? `<line x1="${evidence.x}" y1="${evidence.y}" x2="${anchor.x}" y2="${anchor.y}" stroke="#7c3aed" stroke-width="1.6" stroke-dasharray="3 5" opacity=".58"/>` : ''}
+                <rect x="${anchor.x - 7}" y="${anchor.y - 7}" width="14" height="14" rx="3" fill="#7c3aed" opacity=".9"><title>${esc(place.label)} semantic anchor</title></rect>
+                <text x="${anchor.x + 10}" y="${anchor.y + 4}" font-size="12" fill="#4c1d95" font-weight="800">${esc(place.label)}</text>`;
+      }).join('');
       const robot = project(state.robot_pose || {x:0,y:0});
       const robotYaw = Number(state.robot_pose?.yaw || 0);
       const headingWorld = {
@@ -2969,7 +3861,12 @@ INTERACTIVE_HTML = """<!doctype html>
       const heading = project(headingWorld);
       svg.innerHTML = `<rect width="1000" height="760" fill="rgba(255,255,255,.92)"/>${cells}
         <polyline points="${traj}" fill="none" stroke="#4f772d" stroke-width="4" stroke-linecap="round"/>
+        ${manualRegionCells}
+        ${selectedCells}
         ${remembered}
+        ${manualWaypoints}
+        ${evidencePoints}
+        ${semanticPlaces}
         ${frontiers}
         <circle cx="${robot.x}" cy="${robot.y}" r="13" fill="#a52820"/>
         <line x1="${robot.x}" y1="${robot.y}" x2="${heading.x}" y2="${heading.y}" stroke="#6d0f0a" stroke-width="5" stroke-linecap="round"/>
@@ -2977,6 +3874,19 @@ INTERACTIVE_HTML = """<!doctype html>
         <text x="${robot.x + 14}" y="${robot.y - 12}" fill="#a52820" font-weight="800">robot</text>`;
       svg.onpointerdown = (event) => {
         event.preventDefault();
+        if (regionMode === 'select') {
+          const cell = cellFromMapEvent(map, event);
+          selectRegionCell(cell);
+          isPaintingMap = true;
+          return;
+        }
+        if (pendingSubwaypoint) {
+          const cell = cellFromMapEvent(map, event);
+          const pose = cellCenterPose(map, cell);
+          post('/api/region/subwaypoint', {region_id: pendingSubwaypoint.region_id, name: pendingSubwaypoint.name, pose});
+          pendingSubwaypoint = null;
+          return;
+        }
         isPaintingMap = true;
         lastPaintedCellKey = null;
         const cell = cellFromMapEvent(map, event);
@@ -2986,6 +3896,10 @@ INTERACTIVE_HTML = """<!doctype html>
       svg.onpointermove = (event) => {
         if (!isPaintingMap) return;
         event.preventDefault();
+        if (regionMode === 'select') {
+          selectRegionCell(cellFromMapEvent(map, event));
+          return;
+        }
         const cell = cellFromMapEvent(map, event);
         if (cell.key === lastPaintedCellKey) return;
         lastPaintedCellKey = cell.key;
@@ -2996,12 +3910,39 @@ INTERACTIVE_HTML = """<!doctype html>
         event.preventDefault();
         isPaintingMap = false;
         lastPaintedCellKey = null;
+        if (regionMode === 'select') return;
         await flushPaintCells();
       };
       svg.onpointerleave = async () => {
         if (!isPaintingMap) return;
         isPaintingMap = false;
         lastPaintedCellKey = null;
+        if (regionMode === 'select') return;
+        await flushPaintCells();
+      };
+      for (const element of svg.querySelectorAll('.manual-waypoint')) {
+        element.onpointerdown = (event) => {
+          event.stopPropagation();
+          draggingWaypoint = {
+            region_id: element.getAttribute('data-region-id'),
+            waypoint_name: element.getAttribute('data-waypoint-name')
+          };
+        };
+      }
+      svg.onpointerup = async (event) => {
+        if (draggingWaypoint) {
+          const cell = cellFromMapEvent(map, event);
+          const pose = cellCenterPose(map, cell);
+          const payload = {...draggingWaypoint, pose};
+          draggingWaypoint = null;
+          await post('/api/region/waypoint', payload);
+          return;
+        }
+        if (!isPaintingMap) return;
+        event.preventDefault();
+        isPaintingMap = false;
+        lastPaintedCellKey = null;
+        if (regionMode === 'select') return;
         await flushPaintCells();
       };
     }
@@ -3014,6 +3955,8 @@ INTERACTIVE_HTML = """<!doctype html>
     function render() {
       renderStats();
       renderFrontiers();
+      renderManualRegions();
+      renderSemantic();
       renderThumbs();
       renderMap();
       renderPromptAndResponse();
@@ -3022,10 +3965,42 @@ INTERACTIVE_HTML = """<!doctype html>
     document.getElementById('pause').onclick = () => post('/api/pause');
     document.getElementById('resume').onclick = () => post('/api/resume');
     document.getElementById('call').onclick = () => post('/api/call_llm');
+    document.getElementById('call-semantic').onclick = () => post('/api/call_semantic_llm');
     document.getElementById('apply').onclick = () => post('/api/apply_decision');
     document.getElementById('edit-block').onclick = () => { mapEditMode = 'block'; renderStats(); };
     document.getElementById('edit-clear').onclick = () => { mapEditMode = 'clear'; renderStats(); };
     document.getElementById('edit-reset').onclick = () => { mapEditMode = 'reset'; renderStats(); };
+    document.getElementById('region-add').onclick = () => {
+      regionMode = 'select';
+      selectedRegionCells = new Map();
+      document.getElementById('error').textContent = 'Select free cells for the region, then click Done Region.';
+      renderMap();
+    };
+    document.getElementById('region-done').onclick = async () => {
+      if (!selectedRegionCells.size) {
+        document.getElementById('error').textContent = 'Select at least one free cell before finishing the region.';
+        return;
+      }
+      const label = prompt('Region name');
+      if (!label) return;
+      const description = prompt('Region description') || '';
+      const cells = Array.from(selectedRegionCells.values());
+      regionMode = null;
+      selectedRegionCells = new Map();
+      await post('/api/region/create', {label, description, cells});
+    };
+    document.getElementById('subwaypoint-add').onclick = () => {
+      const regions = state.map?.regions || [];
+      if (!regions.length) {
+        document.getElementById('error').textContent = 'Create a region before adding subwaypoints.';
+        return;
+      }
+      const region_id = prompt(`Region id for subwaypoint:\n${regions.map((r) => `${r.region_id}: ${r.label}`).join('\n')}`);
+      if (!region_id) return;
+      const name = prompt('Subwaypoint name') || 'subwaypoint';
+      pendingSubwaypoint = {region_id, name};
+      document.getElementById('error').textContent = 'Click a free map cell to place the subwaypoint.';
+    };
     refresh();
     setInterval(refresh, 1000);
   </script>
@@ -3058,8 +4033,7 @@ class InteractiveExplorationServer:
 
     def serve_forever(self) -> None:
         session = self.session
-        developer_attr = "" if self.ui_flavor == "developer" else 'style="display:none;"'
-        html = INTERACTIVE_HTML.replace("__DEVELOPER_PANEL_ATTR__", developer_attr)
+        html = INTERACTIVE_REACT_HTML.replace("__UI_FLAVOR__", self.ui_flavor)
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:
@@ -3084,14 +4058,23 @@ class InteractiveExplorationServer:
                 if self.path == "/api/call_llm":
                     self._send_json(session.call_llm())
                     return
+                if self.path == "/api/call_semantic_llm":
+                    self._send_json(session.call_semantic_llm())
+                    return
                 if self.path == "/api/apply_decision":
                     self._send_json(session.apply_decision())
                     return
+                if self.path == "/api/region/create":
+                    self._send_json(session.create_manual_region(self._read_json()))
+                    return
+                if self.path == "/api/region/waypoint":
+                    self._send_json(session.update_manual_region_waypoint(self._read_json()))
+                    return
+                if self.path == "/api/region/subwaypoint":
+                    self._send_json(session.add_manual_region_subwaypoint(self._read_json()))
+                    return
                 if self.path == "/api/map/edit":
-                    length = int(self.headers.get("Content-Length", "0"))
-                    payload = {}
-                    if length:
-                        payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                    payload = self._read_json()
                     self._send_json(
                         session.update_occupancy_edits(
                             mode=str(payload.get("mode", "block")),
@@ -3103,6 +4086,12 @@ class InteractiveExplorationServer:
 
             def log_message(self, format: str, *args: Any) -> None:
                 return
+
+            def _read_json(self) -> dict[str, Any]:
+                length = int(self.headers.get("Content-Length", "0"))
+                if not length:
+                    return {}
+                return json.loads(self.rfile.read(length).decode("utf-8"))
 
             def _send_html(self, content: str) -> None:
                 encoded = content.encode("utf-8")
@@ -3135,9 +4124,9 @@ class InteractiveExplorationServer:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run a no-Nav2 web playground for inspecting LLM frontier exploration prompts and decisions."
+        description="Run a web playground for inspecting LLM frontier exploration prompts and decisions."
     )
-    parser.add_argument("--backend", choices=("synthetic", "maniskill"), default="synthetic")
+    parser.add_argument("--backend", choices=("synthetic", "maniskill", "ros"), default="synthetic")
     parser.add_argument("--repo-root", default=str(Path.home() / "XLeRobot"))
     parser.add_argument("--session", default="interactive_llm_frontier")
     parser.add_argument("--area", default="apartment")
@@ -3190,10 +4179,55 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--llm-temperature", type=float, default=0.1)
     parser.add_argument("--llm-max-tokens", type=int, default=1200)
     parser.add_argument("--llm-reasoning-effort", default=None)
+    parser.add_argument("--semantic-waypoints-enabled", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--automatic-semantic-waypoints", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--semantic-llm-provider", default=None)
+    parser.add_argument("--semantic-llm-model", default=None)
+    parser.add_argument("--semantic-llm-base-url", default=None)
+    parser.add_argument("--semantic-llm-api-key", default=None)
+    parser.add_argument("--semantic-vlm-async", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--nav2-planner-id", default="GridBased")
+    parser.add_argument("--nav2-controller-id", default="FollowPath")
+    parser.add_argument("--nav2-behavior-tree", default="navigate_to_pose_w_replanning_and_recovery.xml")
+    parser.add_argument("--nav2-recovery-enabled", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--ros-navigation-map-source", choices=("fused_scan", "external"), default="fused_scan")
+    parser.add_argument("--ros-map-topic", default="/map")
+    parser.add_argument("--ros-scan-topic", default="/scan")
+    parser.add_argument("--ros-rgb-topic", default="/camera/head/image_raw")
+    parser.add_argument("--ros-cmd-vel-topic", default="/cmd_vel")
+    parser.add_argument("--ros-map-frame", default="map")
+    parser.add_argument("--ros-adapter-url", default=None)
+    parser.add_argument("--ros-adapter-timeout-s", type=float, default=30.0)
+    parser.add_argument(
+        "--ros-odom-frame",
+        default="odom",
+        help=(
+            "Accepted for command compatibility. The interactive playground uses TF from map to base_link; "
+            "set odom in the bridge/Nav2 launch files."
+        ),
+    )
+    parser.add_argument("--ros-base-frame", default="base_link")
+    parser.add_argument("--ros-server-timeout-s", type=float, default=10.0)
+    parser.add_argument("--ros-ready-timeout-s", type=float, default=20.0)
+    parser.add_argument("--ros-turn-scan-timeout-s", type=float, default=45.0)
+    parser.add_argument("--ros-turn-scan-settle-s", type=float, default=1.0)
+    parser.add_argument("--ros-manual-spin-angular-speed-rad-s", type=float, default=0.25)
+    parser.add_argument("--ros-manual-spin-publish-hz", type=float, default=20.0)
+    parser.add_argument("--sim-motion-speed", choices=("normal", "faster", "fastest"), default="normal")
+    parser.add_argument("--ros-allow-multiple-action-servers", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8781)
     parser.add_argument("--open-browser", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--ui-flavor", choices=("user", "developer"), default="developer")
+    parser.add_argument(
+        "--experimental-free-space-semantic-waypoints",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Deprecated debugging path: render frontier-policy semantic area candidates. "
+            "Normal runs keep semantic waypointing passive and RGB-D evidence grounded."
+        ),
+    )
     return parser
 
 
@@ -3228,10 +4262,84 @@ def main(argv: list[str] | None = None) -> int:
         llm_temperature=args.llm_temperature,
         llm_max_tokens=args.llm_max_tokens,
         llm_reasoning_effort=args.llm_reasoning_effort,
-        nav2_mode="simulated",
+        nav2_mode="ros" if args.backend == "ros" else "simulated",
+        nav2_planner_id=args.nav2_planner_id,
+        nav2_controller_id=args.nav2_controller_id,
+        nav2_behavior_tree=args.nav2_behavior_tree,
+        nav2_recovery_enabled=args.nav2_recovery_enabled,
+        ros_navigation_map_source=args.ros_navigation_map_source,
+        ros_map_topic=args.ros_map_topic,
+        ros_scan_topic=args.ros_scan_topic,
+        ros_rgb_topic=args.ros_rgb_topic,
+        ros_cmd_vel_topic=args.ros_cmd_vel_topic,
+        ros_map_frame=args.ros_map_frame,
+        ros_adapter_url=args.ros_adapter_url,
+        ros_adapter_timeout_s=args.ros_adapter_timeout_s,
+        ros_odom_frame=args.ros_odom_frame,
+        ros_base_frame=args.ros_base_frame,
+        ros_server_timeout_s=args.ros_server_timeout_s,
+        ros_ready_timeout_s=args.ros_ready_timeout_s,
+        ros_turn_scan_timeout_s=args.ros_turn_scan_timeout_s,
+        ros_turn_scan_settle_s=args.ros_turn_scan_settle_s,
+        ros_manual_spin_angular_speed_rad_s=args.ros_manual_spin_angular_speed_rad_s,
+        ros_manual_spin_publish_hz=args.ros_manual_spin_publish_hz,
+        sim_motion_speed=args.sim_motion_speed,
+        ros_allow_multiple_action_servers=args.ros_allow_multiple_action_servers,
         realtime_sleep_s=0.0,
+        experimental_free_space_semantic_waypoints=args.experimental_free_space_semantic_waypoints,
+        semantic_waypoints_enabled=args.semantic_waypoints_enabled,
+        automatic_semantic_waypoints=args.automatic_semantic_waypoints,
+        semantic_llm_provider=args.semantic_llm_provider,
+        semantic_llm_model=args.semantic_llm_model,
+        semantic_llm_base_url=args.semantic_llm_base_url,
+        semantic_llm_api_key=args.semantic_llm_api_key,
+        semantic_vlm_async=args.semantic_vlm_async,
     )
-    if args.backend == "maniskill":
+    if args.backend == "ros":
+        if args.ros_adapter_url:
+            session = ManiSkillNav2RouterExplorationSession(
+                config,
+                ManiSkillInteractiveOptions(
+                    repo_root=args.repo_root,
+                    env_id=args.env_id,
+                    robot_uid=args.robot_uid,
+                    display_yaw_offset_deg=args.display_yaw_offset_deg,
+                    control_mode=args.control_mode,
+                    render_mode=None if args.render_mode == "none" else args.render_mode,
+                    shader=args.shader,
+                    sim_backend=args.sim_backend,
+                    num_envs=args.num_envs,
+                    force_reload=args.force_reload,
+                    build_config_idx=args.build_config_idx,
+                    spawn_x=args.spawn_x,
+                    spawn_y=args.spawn_y,
+                    spawn_yaw=args.spawn_yaw,
+                    spawn_facing=args.spawn_facing,
+                    scan_mode=args.scan_mode,
+                    scan_yaw_samples=args.scan_yaw_samples,
+                    depth_beam_stride=args.depth_beam_stride,
+                    teleport_z=args.teleport_z,
+                    teleport_settle_steps=args.teleport_settle_steps,
+                    max_frontiers=args.max_frontiers,
+                ),
+            )
+        else:
+            backend = ExplorationBackend(
+                ExplorationBackendConfig(
+                    mode="ros",
+                    persist_path=None,
+                    occupancy_resolution=args.occupancy_resolution,
+                )
+            )
+            task = backend.begin_external_task(
+                tool_id="explore",
+                area=args.area,
+                session=args.session,
+                source=args.source,
+                message="Starting interactive ROS/Nav2 frontier exploration.",
+            )
+            session = InteractiveRosNav2ExplorationSession(config, backend, str(task["task_id"]))
+    elif args.backend == "maniskill":
         session = ManiSkillTeleportExplorationSession(
             config,
             ManiSkillInteractiveOptions(
@@ -3269,7 +4377,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.open_browser:
         webbrowser.open(server.url)
     try:
-        if args.backend == "maniskill":
+        if callable(getattr(session, "pump_viewer", None)):
             server_thread = server.serve_in_background()
             print("Pumping the ManiSkill/SAPIEN viewer on the main thread to keep the window responsive.")
             while server_thread.is_alive():

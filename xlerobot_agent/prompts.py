@@ -115,7 +115,7 @@ def build_exploration_policy_system_prompt() -> str:
         "The deterministic stack owns occupancy mapping, frontier bookkeeping, safety checks, navigation, and scanning. "
         "You must reason about semantic coverage, spatial coverage, recent RGB visual input, and whether the remaining frontier memory still contains useful work. "
         "Return JSON only with keys: decision_type, selected_frontier_id, selected_return_waypoint_id, "
-        "frontier_ids_to_store, memory_updates, exploration_complete, reasoning_summary, semantic_updates. "
+        "frontier_ids_to_store, memory_updates, exploration_complete, reasoning_summary. "
         "`decision_type` must be one of `explore_frontier`, `revisit_frontier`, or `finish`. "
         "Only use frontier ids and return waypoint ids that already exist in the prompt. "
         "Do not invent raw coordinates. Operate strictly on the provided frontier information objects. "
@@ -135,8 +135,9 @@ def build_exploration_policy_system_prompt() -> str:
         "shows them as revalidated. "
         "Set `exploration_complete` to true only when credible exploration opportunities are exhausted. "
         "If there are still reachable stored or candidate frontiers, prefer continuing exploration rather than finishing. "
-        "`semantic_updates` must be a list of objects with keys: label, kind, target_id, confidence, evidence. "
-        "Use `kind` values such as `region_label`, `sub_area`, or `room_hint`."
+        "Do not create semantic labels, named places, semantic waypoints, or semantic anchor updates in this response. "
+        "Semantic named places are produced by a separate RGB-D evidence projection pipeline with its own prompt, "
+        "schema, memory, and lifecycle."
     )
 
 
@@ -210,6 +211,12 @@ def build_exploration_policy_user_prompt(payload: dict[str, Any]) -> str:
         "",
         "Guardrails:",
         json.dumps(payload.get("guardrails", {}), indent=2, sort_keys=True),
+        "",
+        "Out Of Scope:",
+        (
+            "Semantic labels, named places, semantic waypoints, and semantic anchor updates are not part of this "
+            "frontier policy response. They are handled by a separate passive RGB-D visual evidence pipeline."
+        ),
         "",
         "ASCII Occupancy Map:",
         "Legend: ? unknown, . free, # occupied, R robot, F active/stored frontier, V visited/completed frontier.",

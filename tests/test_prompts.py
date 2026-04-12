@@ -7,6 +7,7 @@ from xlerobot_agent.prompts import (
     build_skill_selection_system_prompt,
     build_subgoal_planning_system_prompt,
 )
+from xlerobot_agent.semantic_prompts import build_semantic_evidence_extraction_system_prompt
 
 
 class PromptExamplesTests(unittest.TestCase):
@@ -44,6 +45,9 @@ class PromptExamplesTests(unittest.TestCase):
         self.assertIn("nearest useful region", prompt)
         self.assertIn("2x farther", prompt)
         self.assertIn("avoid zig-zagging", prompt)
+        self.assertIn("Do not create semantic labels", prompt)
+        self.assertIn("separate RGB-D evidence projection pipeline", prompt)
+        self.assertNotIn("semantic_updates", prompt)
 
     def test_exploration_policy_user_prompt_includes_ascii_map_and_guardrails(self) -> None:
         prompt = build_exploration_policy_user_prompt(
@@ -92,6 +96,9 @@ class PromptExamplesTests(unittest.TestCase):
         self.assertIn("finish_requires_frontier_exhaustion", prompt)
         self.assertIn("RF", prompt)
         self.assertIn("veto", prompt)
+        self.assertIn("Out Of Scope:", prompt)
+        self.assertIn("not part of this frontier policy response", prompt)
+        self.assertNotIn("semantic_updates", prompt)
 
     def test_exploration_policy_user_prompt_compacts_frontier_memory_details(self) -> None:
         prompt = build_exploration_policy_user_prompt(
@@ -146,6 +153,12 @@ class PromptExamplesTests(unittest.TestCase):
         self.assertIn("attached_as_multimodal_image", prompt)
         self.assertIn("base64_bytes", prompt)
         self.assertNotIn("a" * 64, prompt)
+
+    def test_semantic_evidence_prompt_forbids_invented_coordinates(self) -> None:
+        prompt = build_semantic_evidence_extraction_system_prompt()
+        self.assertIn("Return pixel regions", prompt)
+        self.assertIn("Do not return map coordinates", prompt)
+        self.assertIn("deterministic RGB-D projection", prompt)
 
 
 if __name__ == "__main__":

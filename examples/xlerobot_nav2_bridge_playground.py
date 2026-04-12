@@ -43,6 +43,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--laser-min-range-m", type=float, default=0.05)
     parser.add_argument("--laser-max-range-m", type=float, default=10.0)
     parser.add_argument("--scan-band-height-px", type=int, default=12)
+    parser.add_argument("--laser-fill-no-return", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--build-config-idx", type=int, default=None)
     parser.add_argument("--spawn-x", type=float, default=None)
     parser.add_argument("--spawn-y", type=float, default=None)
@@ -101,6 +102,7 @@ def main(argv: list[str] | None = None) -> int:
         str(args.laser_max_range_m),
         "--scan-band-height-px",
         str(args.scan_band_height_px),
+        f"--{'laser-fill-no-return' if args.laser_fill_no_return else 'no-laser-fill-no-return'}",
         "--realtime-factor",
         str(args.realtime_factor),
         f"--{'publish-head-camera' if args.publish_head_camera else 'no-publish-head-camera'}",
