@@ -107,6 +107,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ros-manual-spin-publish-hz", type=float, default=20.0)
     parser.add_argument("--sim-motion-speed", choices=("normal", "faster", "fastest"), default="normal")
     parser.add_argument("--ros-allow-multiple-action-servers", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--use-keyboard-controls",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable arrow key controls for manual robot teleoperation.",
+    )
+    parser.add_argument(
+        "--keyboard-speed",
+        choices=("slow", "normal", "fast"),
+        default="normal",
+        help="Speed profile for keyboard movement.",
+    )
     return parser
 
 
@@ -223,6 +235,9 @@ def main(argv: list[str] | None = None) -> int:
             "--sim-motion-speed",
             args.sim_motion_speed,
             f"--{'ros-allow-multiple-action-servers' if args.ros_allow_multiple_action_servers else 'no-ros-allow-multiple-action-servers'}",
+            f"--{'use-keyboard-controls' if args.use_keyboard_controls else 'no-use-keyboard-controls'}",
+            "--keyboard-speed",
+            args.keyboard_speed,
         ]
         if args.display_yaw_offset_deg is not None:
             interactive_args.extend(["--display-yaw-offset-deg", str(args.display_yaw_offset_deg)])

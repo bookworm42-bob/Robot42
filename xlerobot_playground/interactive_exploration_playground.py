@@ -65,8 +65,8 @@ from xlerobot_playground.sim_exploration_backend import (
 )
 
 
-XLEROBOT_IKEA_CART_FOOTPRINT_LENGTH_M = 0.3913
-XLEROBOT_IKEA_CART_FOOTPRINT_WIDTH_M = 0.459
+XLEROBOT_IKEA_CART_FOOTPRINT_LENGTH_M = 0.35
+XLEROBOT_IKEA_CART_FOOTPRINT_WIDTH_M = 0.45
 XLEROBOT_IKEA_CART_FOOTPRINT_RADIUS_M = math.hypot(
     XLEROBOT_IKEA_CART_FOOTPRINT_LENGTH_M / 2.0,
     XLEROBOT_IKEA_CART_FOOTPRINT_WIDTH_M / 2.0,
@@ -74,6 +74,7 @@ XLEROBOT_IKEA_CART_FOOTPRINT_RADIUS_M = math.hypot(
 XLEROBOT_IKEA_CART_CLEARANCE_PADDING_M = 0.06
 BASE_TELEPORT_POSITION_TOLERANCE_M = 0.08
 BASE_TELEPORT_YAW_TOLERANCE_RAD = 0.15
+XLEROBOT_CAMERA_TO_BASE_OFFSET_M = 0.09
 STRICT_NAVIGATION_CLEARANCE_MARGIN_M = 0.08
 STRICT_NAVIGATION_KNOWN_FRACTION = 0.95
 STORED_FRONTIER_REVALIDATION_RADIUS_M = 1.0
@@ -83,9 +84,14 @@ SIM_MOTION_SPEED_PRESETS = {
     "faster": {"linear_m_s": 0.60, "angular_multiplier": 1.8},
     "fastest": {"linear_m_s": 1.00, "angular_multiplier": 3.0},
 }
-LOCAL_PATH_GUARD_LOOKAHEAD_M = 0.6
+LOCAL_PATH_GUARD_LOOKAHEAD_M = 0.15
 LOCAL_PATH_GUARD_PADDING_M = 0.0
 LOCAL_PATH_GUARD_MAX_REPLANS = 4
+KEYBOARD_SPEED_PROFILES = {
+    "slow": {"base_forward": 0.05, "base_turn": 0.02},
+    "normal": {"base_forward": 0.1, "base_turn": 0.05},
+    "fast": {"base_forward": 0.3, "base_turn": 0.1},
+}
 
 
 class Nav2LocalPathBlocked(RuntimeError):
@@ -126,9 +132,9 @@ def _local_scan_path_blocker(
     range_max = float(observation.get("range_max", 0.0) or 0.0)
     half_length_m = max(robot_length_m * 0.5 + safety_padding_m, 0.05)
     half_width_m = max(robot_width_m * 0.5 + safety_padding_m, 0.05)
-    center_lookahead_m = min(max(lookahead_m, robot_length_m), segment_distance_m)
-    sweep_forward_min_m = -half_length_m
-    sweep_forward_max_m = center_lookahead_m + half_length_m
+    forward_limit_m = lookahead_m + half_length_m  # robot half + lookahead
+    sweep_forward_min_m = 0.0
+    sweep_forward_max_m = forward_limit_m
     closest: dict[str, Any] | None = None
     for index, raw_range in enumerate(ranges):
         try:
@@ -161,9 +167,9 @@ def _local_scan_path_blocker(
                 "lateral_distance_m": round(lateral_m, 3),
                 "point": {"x": round(point_x, 3), "y": round(point_y, 3)},
                 "half_length_m": round(half_length_m, 3),
-                "half_width_m": round(half_width_m, 3),
-                "lookahead_m": round(center_lookahead_m, 3),
-            }
+                    "half_width_m": round(half_width_m, 3),
+                }
+    
     return closest
 
 
@@ -427,6 +433,8 @@ class ManiSkillInteractiveOptions:
     teleport_z: float | None
     teleport_settle_steps: int
     max_frontiers: int
+    use_keyboard_controls: bool
+    keyboard_speed: str
 
 
 class InteractiveNoNav2ExplorationSession:
@@ -1153,6 +1161,12 @@ class ManiSkillTeleportExplorationSession:
         display_offset_deg = 0.0 if options.display_yaw_offset_deg is None else float(options.display_yaw_offset_deg)
         self._display_yaw_offset_rad = math.radians(display_offset_deg)
         self._initialize_environment()
+        self._keyboard_control_active = False
+        if self.options.use_keyboard_controls:
+            import pygame
+            pygame.init()
+            pygame.display.set_mode((200, 100))
+            self._keyboard_control_active = True
         self.reset()
 
     def close(self) -> None:
@@ -1166,9 +1180,90 @@ class ManiSkillTeleportExplorationSession:
         if not self._lock.acquire(blocking=False):
             return
         try:
+            if self._keyboard_control_active:
+                self._poll_keyboard_controls()
+                self.env.step(self.action)
             self.env.render()
         finally:
             self._lock.release()
+
+    def _poll_keyboard_controls(self) -> None:
+        import pygame
+        pygame.event.pump()
+        keys = pygame.key.get_pressed()
+        speed = KEYBOARD_SPEED_PROFILES[self.options.keyboard_speed]
+
+        forward = 0.0
+        turn = 0.0
+        head_tilt_delta = 0.0
+        
+        if keys[pygame.K_UP]:
+            forward = speed["base_forward"]
+        elif keys[pygame.K_DOWN]:
+            forward = -speed["base_forward"]
+        if keys[pygame.K_LEFT]:
+            turn = speed["base_turn"]
+        elif keys[pygame.K_RIGHT]:
+            turn = -speed["base_turn"]
+        
+        HEAD_TILT_STEP = 0.1
+        
+        head_tilt_delta = 0.0
+        if keys[pygame.K_f]:
+            head_tilt_delta = -HEAD_TILT_STEP  # F = up (negative)
+        elif keys[pygame.K_v]:
+            head_tilt_delta = HEAD_TILT_STEP   # V = down (positive)
+
+        if head_tilt_delta != 0.0:
+            self.action[15] = head_tilt_delta
+        
+        if forward != 0.0 or turn != 0.0:
+            current_pose = self._current_pose()
+            target_pose = Pose2D(
+                current_pose.x + forward * math.cos(current_pose.yaw),
+                current_pose.y + forward * math.sin(current_pose.yaw),
+                current_pose.yaw + turn,
+            )
+            if self._check_keyboard_collision(current_pose, target_pose):
+                return
+            print(f"KEYBOARD: forward={forward}, turn={turn}")
+            self.action[0] = forward
+            self.action[1] = turn
+        else:
+            self.action[0] = 0.0
+            self.action[1] = 0.0
+        
+        if head_tilt_delta == 0.0:
+            self.action[15] = 0.0
+
+    def _check_keyboard_collision(self, current_pose: Pose2D, target_pose: Pose2D) -> bool:
+        head_data = self._capture_head_camera()
+        observation, _ = self._build_scan_observation_from_head_data(head_data)
+        
+        dx = target_pose.x - current_pose.x
+        dy = target_pose.y - current_pose.y
+        segment_distance = math.hypot(dx, dy)
+        
+        if segment_distance < 0.01:
+            return False
+        
+        sensor_pose = observation.get("pose") if observation else None
+        if sensor_pose is None:
+            return False
+        
+        blocker = _local_scan_path_blocker(
+            observation,
+            current_pose=sensor_pose,
+            target_pose=target_pose,
+            robot_length_m=XLEROBOT_IKEA_CART_FOOTPRINT_LENGTH_M,
+            robot_width_m=XLEROBOT_IKEA_CART_FOOTPRINT_WIDTH_M,
+            lookahead_m=LOCAL_PATH_GUARD_LOOKAHEAD_M,
+            safety_padding_m=XLEROBOT_IKEA_CART_CLEARANCE_PADDING_M,
+        )
+        if blocker is not None:
+            print(f"COLLISION: {blocker.get('reason', 'unknown')}")
+            return True
+        return False
 
     def reset(self) -> dict[str, Any]:
         with self._lock:
@@ -3084,6 +3179,9 @@ class ManiSkillNav2RouterExplorationSession(ManiSkillTeleportExplorationSession)
         if len(poses) < 2:
             return None
         resolution = max(float(self.config.occupancy_resolution), 1e-6)
+        effective = self._effective_known_cells()
+        
+        # Check for static occupied cells (these block the path)
         for segment_index, (start, end) in enumerate(zip(poses, poses[1:])):
             dx = end.x - start.x
             dy = end.y - start.y
@@ -3094,7 +3192,7 @@ class ManiSkillNav2RouterExplorationSession(ManiSkillTeleportExplorationSession)
                 x = start.x + dx * fraction
                 y = start.y + dy * fraction
                 cell = self._world_to_cell(x, y)
-                if self._navigation_planning_cell_state(cell) == "occupied":
+                if effective.get(cell) == "occupied":
                     return {
                         "segment_index": segment_index,
                         "sample_index": sample_index,
@@ -3272,6 +3370,9 @@ class ManiSkillNav2RouterExplorationSession(ManiSkillTeleportExplorationSession)
             observation = self._publish_navigation_only_observation()
             blocker = self._local_path_blocker_from_observation(observation, target_pose=target_pose)
             if blocker is not None:
+                print(f"NAV2 COLLISION: {blocker.get('reason', 'unknown')}")
+                print(f"  obstacle_point=({blocker.get('point', {}).get('x', 0):.3f}, {blocker.get('point', {}).get('y', 0):.3f})")
+                print(f"  forward_distance={blocker.get('forward_distance_m', 0):.3f}m, lateral={blocker.get('lateral_distance_m', 0):.3f}m")
                 raise Nav2LocalPathBlocked(blocker, travelled_distance_m=travelled_distance_m)
             fraction = step / steps
             pose = Pose2D(
@@ -3336,29 +3437,16 @@ class ManiSkillNav2RouterExplorationSession(ManiSkillTeleportExplorationSession)
         *,
         target_pose: Pose2D,
     ) -> dict[str, Any] | None:
+        sensor_pose = observation.get("pose") if observation else None
+        if sensor_pose is None:
+            return None
         blocker = _local_scan_path_blocker(
             observation,
-            current_pose=self._current_pose(),
+            current_pose=sensor_pose,
             target_pose=target_pose,
             robot_length_m=XLEROBOT_IKEA_CART_FOOTPRINT_LENGTH_M,
             robot_width_m=XLEROBOT_IKEA_CART_FOOTPRINT_WIDTH_M,
         )
-        if blocker is None:
-            return None
-        point = blocker.get("point")
-        if isinstance(point, dict):
-            try:
-                cell = self._world_to_cell(float(point["x"]), float(point["y"]))
-            except Exception:
-                cell = None
-            if cell is not None and self._is_known_static_obstacle_near(cell):
-                self.guardrail_events.append(
-                    {
-                        "type": "local_path_guard_ignored_known_static_obstacle",
-                        "blocker": blocker,
-                    }
-                )
-                return None
         return blocker
 
     def _is_known_static_obstacle_near(self, cell: GridCell) -> bool:
@@ -3380,6 +3468,13 @@ class ManiSkillNav2RouterExplorationSession(ManiSkillTeleportExplorationSession)
             return
         cells = getattr(self, "_transient_navigation_obstacle_cells", set())
         cells.add(center)
+        # Add surrounding cells for inflation (robot needs space to navigate around)
+        resolution = self.config.occupancy_resolution
+        inflation_radius_cells = 2  # ~0.5m around obstacle
+        for dx in range(-inflation_radius_cells, inflation_radius_cells + 1):
+            for dy in range(-inflation_radius_cells, inflation_radius_cells + 1):
+                if abs(dx) + abs(dy) <= inflation_radius_cells:
+                    cells.add(GridCell(center.x + dx, center.y + dy))
         self._transient_navigation_obstacle_cells = cells
 
     def _move_to_scan_sample_pose(
@@ -3412,9 +3507,10 @@ class ManiSkillNav2RouterExplorationSession(ManiSkillTeleportExplorationSession)
                 time.sleep(step_s)
 
     def _publish_router_state(self, *, required: bool = False) -> None:
+        nav_map = self._router_navigation_map()
         try:
             self.router.update_state(
-                occupancy_map=self._router_navigation_map(),
+                occupancy_map=nav_map,
                 pose=self._current_pose(),
                 scan_observation=getattr(self, "_latest_scan_observation", None),
                 image_data_url=None,
@@ -4511,6 +4607,18 @@ def build_parser() -> argparse.ArgumentParser:
             "Normal runs keep semantic waypointing passive and RGB-D evidence grounded."
         ),
     )
+    parser.add_argument(
+        "--use-keyboard-controls",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable arrow key controls for manual robot teleoperation.",
+    )
+    parser.add_argument(
+        "--keyboard-speed",
+        choices=("slow", "normal", "fast"),
+        default="normal",
+        help="Speed profile for keyboard movement.",
+    )
     return parser
 
 
@@ -4577,6 +4685,8 @@ def main(argv: list[str] | None = None) -> int:
         semantic_llm_base_url=args.semantic_llm_base_url,
         semantic_llm_api_key=args.semantic_llm_api_key,
         semantic_vlm_async=args.semantic_vlm_async,
+        use_keyboard_controls=args.use_keyboard_controls,
+        keyboard_speed=args.keyboard_speed,
     )
     if args.backend == "ros":
         if args.ros_adapter_url:
@@ -4604,6 +4714,8 @@ def main(argv: list[str] | None = None) -> int:
                     teleport_z=args.teleport_z,
                     teleport_settle_steps=args.teleport_settle_steps,
                     max_frontiers=args.max_frontiers,
+                    use_keyboard_controls=args.use_keyboard_controls,
+                    keyboard_speed=args.keyboard_speed,
                 ),
             )
         else:
@@ -4647,6 +4759,8 @@ def main(argv: list[str] | None = None) -> int:
                 teleport_z=args.teleport_z,
                 teleport_settle_steps=args.teleport_settle_steps,
                 max_frontiers=args.max_frontiers,
+                use_keyboard_controls=args.use_keyboard_controls,
+                keyboard_speed=args.keyboard_speed,
             ),
         )
     else:

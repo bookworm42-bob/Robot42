@@ -139,6 +139,8 @@ class SimExplorationConfig:
     semantic_llm_base_url: str | None = None
     semantic_llm_api_key: str | None = None
     semantic_vlm_async: bool = True
+    use_keyboard_controls: bool = False
+    keyboard_speed: str = "normal"
 
 
 @dataclass(frozen=True, order=True)

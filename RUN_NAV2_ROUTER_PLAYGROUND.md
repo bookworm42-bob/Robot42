@@ -52,9 +52,11 @@ python examples/xlerobot_exploration_playground.py \
   --ros-adapter-url http://127.0.0.1:8891 \
   --ros-navigation-map-source fused_scan \
   --sensor-range-m 10.0 \
-  --sim-motion-speed normal \
+  --sim-motion-speed fastest \
   --ros-manual-spin-angular-speed-rad-s 0.25 \
-  --no-automatic-semantic-waypoints
+  --no-automatic-semantic-waypoints \
+  --use-keyboard-controls \
+  --keyboard-speed fast
 ```
 
 The UI should open at:

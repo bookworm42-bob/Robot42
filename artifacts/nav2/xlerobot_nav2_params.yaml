@@ -226,6 +226,7 @@ global_costmap:
       static_layer:
         plugin: nav2_costmap_2d::StaticLayer
         map_subscribe_transient_local: true
+        subscribe_to_updates: true
       always_send_full_costmap: true
       footprint: '[[0.1956, 0.2295], [0.1956, -0.2295], [-0.1956, -0.2295], [-0.1956,
         0.2295]]'
