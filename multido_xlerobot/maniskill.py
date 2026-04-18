@@ -9,7 +9,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
-from .bootstrap import DEFAULT_XLEROBOT_FORK_ROOT
+from .bootstrap import resolve_xlerobot_repo_root
 
 
 class XLeRobotManiSkillError(RuntimeError):
@@ -26,11 +26,11 @@ class XLeRobotManiSkillBootstrapResult:
 
 
 def bootstrap_xlerobot_maniskill(
-    repo_root: str | Path = DEFAULT_XLEROBOT_FORK_ROOT,
+    repo_root: str | Path | None = None,
     *,
     force_reload: bool = False,
 ) -> XLeRobotManiSkillBootstrapResult:
-    root = Path(repo_root).expanduser().resolve()
+    root = resolve_xlerobot_repo_root(repo_root)
     sim_root = root / "simulation" / "Maniskill"
     assets_root = sim_root / "assets" / "xlerobot"
     agent_file = sim_root / "agents" / "xlerobot" / "xlerobot.py"
@@ -95,7 +95,7 @@ def bootstrap_xlerobot_maniskill(
 
 def run_keyboard_play_demo(
     *,
-    repo_root: str | Path = DEFAULT_XLEROBOT_FORK_ROOT,
+    repo_root: str | Path | None = None,
     demo: str = "ee_keyboard",
     env_id: str = "SceneManipulation-v1",
     robot_uid: str = "xlerobot",
@@ -117,8 +117,11 @@ def run_keyboard_play_demo(
     speed_profile: str | None = None,
     force_reload: bool = False,
 ) -> Any:
-    bootstrap_xlerobot_maniskill(repo_root, force_reload=force_reload)
-    demo_module = _load_demo_module(Path(repo_root).expanduser().resolve(), demo)
+    root = resolve_xlerobot_repo_root(repo_root)
+    bootstrap_xlerobot_maniskill(root, force_reload=force_reload)
+    if demo == "vr":
+        _prepare_vr_monitor_module(root, force_reload=force_reload)
+    demo_module = _load_demo_module(root, demo, force_reload=force_reload)
 
     args = demo_module.Args()
     args.env_id = env_id
@@ -166,7 +169,7 @@ def build_cli_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--repo-root",
-        default=str(DEFAULT_XLEROBOT_FORK_ROOT),
+        default=str(resolve_xlerobot_repo_root()),
         help="Path to the local xlerobot_forked repository.",
     )
     parser.add_argument(
@@ -420,7 +423,29 @@ def _patch_replicacad_scene_builder() -> None:
     builder_cls._xlerobot_patched = True
 
 
-def _load_demo_module(repo_root: Path, demo: str) -> ModuleType:
+def _prepare_vr_monitor_module(repo_root: Path, *, force_reload: bool) -> ModuleType:
+    examples_pkg_name = "mani_skill.examples"
+    examples_pkg = sys.modules.get(examples_pkg_name)
+    if examples_pkg is None:
+        examples_pkg = ModuleType(examples_pkg_name)
+        examples_pkg.__path__ = []
+        sys.modules[examples_pkg_name] = examples_pkg
+        mani_skill_pkg = sys.modules.get("mani_skill")
+        if mani_skill_pkg is not None:
+            setattr(mani_skill_pkg, "examples", examples_pkg)
+
+    module = _load_module(
+        f"{examples_pkg_name}.vr_monitor",
+        repo_root / "simulation" / "Maniskill" / "examples" / "vr_monitor.py",
+        force_reload=force_reload,
+    )
+    if hasattr(module, "XLEVR_PATH"):
+        module.XLEVR_PATH = str((repo_root / "XLeVR").resolve())
+    setattr(examples_pkg, "vr_monitor", module)
+    return module
+
+
+def _load_demo_module(repo_root: Path, demo: str, *, force_reload: bool) -> ModuleType:
     mapping = {
         "ee_keyboard": repo_root
         / "simulation"
@@ -452,7 +477,7 @@ def _load_demo_module(repo_root: Path, demo: str) -> ModuleType:
     return _load_module(
         f"multido_xlerobot._sim.demo_{demo}",
         file_path,
-        force_reload=False,
+        force_reload=force_reload,
     )
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,8 +14,8 @@ from .types import XLeRobotPaths
 
 def _default_repo_root() -> Path:
     candidates = [
+        Path.home() / "xlerobot_forked",
         Path.home() / "XLeRobot",
-        Path("/Users/alin/xlerobot_forked"),
     ]
     for candidate in candidates:
         if candidate.exists():
@@ -23,6 +24,11 @@ def _default_repo_root() -> Path:
 
 
 DEFAULT_XLEROBOT_FORK_ROOT = _default_repo_root()
+
+
+def resolve_xlerobot_repo_root(repo_root: str | Path | None = None) -> Path:
+    root = repo_root or os.environ.get("XLEROBOT_FORKED_ROOT") or DEFAULT_XLEROBOT_FORK_ROOT
+    return Path(root).expanduser().resolve()
 
 
 class XLeRobotBootstrapError(RuntimeError):
@@ -40,11 +46,11 @@ class XLeRobotBootstrapResult:
 
 
 def bootstrap_xlerobot(
-    repo_root: str | Path = DEFAULT_XLEROBOT_FORK_ROOT,
+    repo_root: str | Path | None = None,
     *,
     force_reload: bool = False,
 ) -> XLeRobotBootstrapResult:
-    paths = XLeRobotPaths.from_repo_root(repo_root)
+    paths = XLeRobotPaths.from_repo_root(resolve_xlerobot_repo_root(repo_root))
     _validate_paths(paths)
     _ensure_lerobot_installed()
     _install_compatibility_aliases()

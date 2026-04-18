@@ -10,6 +10,7 @@ from typing import Any
 
 import numpy as np
 
+from multido_xlerobot.bootstrap import resolve_xlerobot_repo_root
 from multido_xlerobot.maniskill import bootstrap_xlerobot_maniskill
 
 IMPORT_ERROR: Exception | None = None
@@ -695,7 +696,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Nav2 and slam_toolbox can consume directly."
         )
     )
-    parser.add_argument("--repo-root", default=str(Path.home() / "XLeRobot"))
+    parser.add_argument("--repo-root", default=str(resolve_xlerobot_repo_root()))
     parser.add_argument("--env-id", default="SceneManipulation-v1")
     parser.add_argument("--robot-uid", default="xlerobot")
     parser.add_argument("--control-mode", default="pd_joint_delta_pos_dual_arm")

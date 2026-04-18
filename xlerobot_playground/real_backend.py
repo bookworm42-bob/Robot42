@@ -2,14 +2,19 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import ssl
+import threading
+import subprocess
+import sys
 import time
+import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
 from typing import Any
 
 from multido_xlerobot import XLeRobotInterface
-from multido_xlerobot.bootstrap import bootstrap_xlerobot
+from multido_xlerobot.bootstrap import bootstrap_xlerobot, resolve_xlerobot_repo_root
 
 
 @dataclass(frozen=True)
@@ -24,6 +29,22 @@ class RecordingSession:
     dataset: Any
     task: str
     active: bool = False
+
+
+@dataclass(frozen=True)
+class OrbbecRgbConfig:
+    enabled: bool
+    launch_capture: bool
+    capture_bin: Path
+    output_dir: Path
+    width: int
+    height: int
+    fps: int
+    timeout_ms: int
+
+
+_VR_CAMERA_FRAMES: dict[str, tuple[bytes, int, int, float]] = {}
+_VR_CAMERA_FRAMES_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -67,7 +88,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _add_shared_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--repo-root", default=str(Path.home() / "XLeRobot"))
+    parser.add_argument("--repo-root", default=str(resolve_xlerobot_repo_root()))
+    parser.add_argument("--robot-kind", choices=("xlerobot", "xlerobot_2wheels"), default="xlerobot")
     parser.add_argument("--port1", default="/dev/ttyACM0")
     parser.add_argument("--port2", default="/dev/ttyACM1")
     parser.add_argument("--fps", type=int, default=30)
@@ -86,6 +108,26 @@ def _add_shared_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--camera-fps", type=int, default=30)
     parser.add_argument("--use-degrees", action="store_true")
     parser.add_argument("--xlevr-path", default=None)
+    parser.add_argument(
+        "--orbbec-rgb-vr",
+        action="store_true",
+        help="Show the Orbbec Gemini 2 RGB stream in the Quest/XLeVR scene.",
+    )
+    parser.add_argument(
+        "--orbbec-capture-bin",
+        default=None,
+        help="Path to the native orbbec_rgb_test binary.",
+    )
+    parser.add_argument(
+        "--orbbec-no-launch",
+        action="store_true",
+        help="Serve the Quest overlay from an already-running Orbbec RGB sidecar.",
+    )
+    parser.add_argument("--orbbec-output-dir", default="artifacts/orbbec_rgb")
+    parser.add_argument("--orbbec-width", type=int, default=640)
+    parser.add_argument("--orbbec-height", type=int, default=480)
+    parser.add_argument("--orbbec-fps", type=int, default=30)
+    parser.add_argument("--orbbec-timeout-ms", type=int, default=1000)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -93,7 +135,10 @@ def main(argv: list[str] | None = None) -> int:
     bootstrap_xlerobot(args.repo_root)
 
     interface = XLeRobotInterface(args.repo_root)
-    config_cls, robot_cls = interface.robot_classes()
+    if args.robot_kind == "xlerobot_2wheels":
+        config_cls, robot_cls = interface.robot_2wheels_classes()
+    else:
+        config_cls, robot_cls = interface.robot_classes()
     robot_config = config_cls(
         port1=args.port1,
         port2=args.port2,
@@ -139,6 +184,19 @@ def main(argv: list[str] | None = None) -> int:
         stop_key=getattr(args, "stop_key", "]"),
         quit_key=getattr(args, "quit_key", "\\"),
         xlevr_path=args.xlevr_path,
+        orbbec_rgb=OrbbecRgbConfig(
+            enabled=args.orbbec_rgb_vr,
+            launch_capture=not args.orbbec_no_launch,
+            capture_bin=Path(
+                args.orbbec_capture_bin
+                or Path(__file__).resolve().parents[1] / "build" / "orbbec_rgb_test" / "orbbec_rgb_test"
+            ).expanduser().resolve(),
+            output_dir=Path(args.orbbec_output_dir).expanduser().resolve(),
+            width=args.orbbec_width,
+            height=args.orbbec_height,
+            fps=args.orbbec_fps,
+            timeout_ms=args.orbbec_timeout_ms,
+        ),
     )
 
 
@@ -190,6 +248,376 @@ def _parse_camera_spec(raw_spec: str) -> CameraSpec:
     name, remainder = raw_spec.split("=", 1)
     driver, source = remainder.split(":", 1)
     return CameraSpec(name=name.strip(), driver=driver.strip(), source=source.strip())
+
+
+def _start_orbbec_rgb_sidecar(config: OrbbecRgbConfig) -> subprocess.Popen[bytes] | None:
+    if not config.enabled or not config.launch_capture:
+        return None
+    capture_bin = config.capture_bin.resolve()
+    if not capture_bin.exists():
+        raise FileNotFoundError(
+            f"Orbbec RGB capture binary not found: {capture_bin}. "
+            "Build it with `cmake -S tools/orbbec_rgb_test -B build/orbbec_rgb_test "
+            "-DORBBEC_SDK_ROOT=/Users/alin/orbbec/sdk && cmake --build build/orbbec_rgb_test`."
+        )
+
+    output_dir = config.output_dir.resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        str(capture_bin),
+        "--frames",
+        "0",
+        "--latest-only",
+        "--output-dir",
+        str(output_dir),
+        "--width",
+        str(config.width),
+        "--height",
+        str(config.height),
+        "--fps",
+        str(config.fps),
+        "--timeout-ms",
+        str(config.timeout_ms),
+        "--log-every",
+        str(max(1, config.fps)),
+    ]
+    print(f"Starting Orbbec RGB sidecar: {' '.join(cmd)}")
+    return subprocess.Popen(cmd)
+
+
+def _stop_orbbec_rgb_sidecar(process: subprocess.Popen[bytes] | None) -> None:
+    if process is None or process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=3)
+
+
+def _install_orbbec_vr_overlay(vr_teleop: Any, output_dir: Path, *, include_orbbec: bool) -> bool:
+    monitor = getattr(vr_teleop, "vr_monitor", None)
+    if monitor is None:
+        return False
+    handler_cls = getattr(sys.modules.get(monitor.__class__.__module__), "SimpleAPIHandler", None)
+    if handler_cls is None:
+        return False
+    if getattr(handler_cls, "_orbbec_overlay_installed", False):
+        handler_cls.orbbec_output_dir = output_dir.resolve()
+        handler_cls.orbbec_overlay_include_orbbec = include_orbbec
+        return True
+
+    original_do_get = handler_cls.do_GET
+    original_serve_file = handler_cls.serve_file
+    handler_cls.orbbec_output_dir = output_dir.resolve()
+    handler_cls.orbbec_overlay_include_orbbec = include_orbbec
+
+    def do_GET(self):
+        if self.path.startswith("/orbbec/latest.ppm"):
+            return _serve_orbbec_file(self, "latest.ppm", "image/x-portable-pixmap")
+        if self.path.startswith("/orbbec/latest.json"):
+            return _serve_orbbec_file(self, "latest.json", "application/json")
+        if self.path.startswith("/vr-camera/"):
+            return _serve_vr_camera_file(self)
+        return original_do_get(self)
+
+    def serve_file(self, filename, content_type):
+        if filename == "web-ui/vr_app.js":
+            try:
+                web_root = getattr(self.server, "web_root_path", None)
+                root = Path(web_root) if web_root else Path.cwd()
+                js_path = root / filename
+                content = js_path.read_text()
+                content += "\n\n" + _orbbec_vr_overlay_js(
+                    include_orbbec=getattr(handler_cls, "orbbec_overlay_include_orbbec", True)
+                )
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(content.encode("utf-8"))
+                return
+            except Exception as exc:
+                print(f"Error injecting Orbbec VR overlay: {exc}")
+        return original_serve_file(self, filename, content_type)
+
+    handler_cls.do_GET = do_GET
+    handler_cls.serve_file = serve_file
+    handler_cls._orbbec_overlay_installed = True
+    return True
+
+
+def _publish_vr_camera_frames(obs: dict[str, Any]) -> None:
+    try:
+        import numpy as np
+    except Exception:
+        return
+
+    frames: dict[str, tuple[bytes, int, int, float]] = {}
+    for name, value in obs.items():
+        if name not in {"left_wrist", "right_wrist"}:
+            continue
+        array = np.asarray(value)
+        if array.ndim != 3 or array.shape[2] < 3:
+            continue
+        if array.dtype != np.uint8:
+            array = np.clip(array, 0, 255).astype(np.uint8)
+        rgb = np.ascontiguousarray(array[:, :, :3])
+        height, width = rgb.shape[:2]
+        header = f"P6\n{width} {height}\n255\n".encode("ascii")
+        frames[name] = (header + rgb.tobytes(), width, height, time.time())
+
+    if frames:
+        with _VR_CAMERA_FRAMES_LOCK:
+            _VR_CAMERA_FRAMES.update(frames)
+
+
+def _get_robot_observation(robot: Any, *, use_camera: bool = True) -> dict[str, Any]:
+    try:
+        return robot.get_observation(use_camera=use_camera)
+    except TypeError:
+        return robot.get_observation()
+
+
+def _serve_vr_camera_file(handler: Any) -> None:
+    parsed = urllib.parse.urlparse(handler.path)
+    rel = parsed.path.removeprefix("/vr-camera/")
+    name, suffix = Path(rel).stem, Path(rel).suffix
+    if not name or suffix not in {".ppm", ".json"}:
+        handler.send_error(404, "Unknown VR camera endpoint")
+        return
+
+    with _VR_CAMERA_FRAMES_LOCK:
+        frame = _VR_CAMERA_FRAMES.get(name)
+    if frame is None:
+        handler.send_error(404, f"VR camera frame not ready: {name}")
+        return
+
+    ppm, width, height, captured_at = frame
+    if suffix == ".json":
+        payload = (
+            f'{{"name":"{name}","width":{width},"height":{height},'
+            f'"captured_at":{captured_at:.6f}}}'
+        ).encode("utf-8")
+        content_type = "application/json"
+        content = payload
+    else:
+        content_type = "image/x-portable-pixmap"
+        content = ppm
+
+    try:
+        handler.send_response(200)
+        handler.send_header("Content-Type", content_type)
+        handler.send_header("Content-Length", str(len(content)))
+        handler.send_header("Cache-Control", "no-store")
+        handler.end_headers()
+        handler.wfile.write(content)
+    except (BrokenPipeError, ConnectionResetError, ssl.SSLError):
+        return
+    except Exception as exc:
+        print(f"Error serving VR camera frame {name}: {exc}")
+        handler.send_error(500, "Could not serve VR camera frame")
+
+
+def _serve_orbbec_file(handler: Any, filename: str, content_type: str) -> None:
+    output_dir = getattr(handler.__class__, "orbbec_output_dir", None)
+    if output_dir is None:
+        handler.send_error(404, "Orbbec RGB output directory is not configured")
+        return
+    path = Path(output_dir) / filename
+    if not path.exists():
+        handler.send_error(404, f"Orbbec RGB frame not ready: {filename}")
+        return
+    try:
+        content = path.read_bytes()
+        handler.send_response(200)
+        handler.send_header("Content-Type", content_type)
+        handler.send_header("Content-Length", str(len(content)))
+        handler.send_header("Cache-Control", "no-store")
+        handler.end_headers()
+        handler.wfile.write(content)
+    except (BrokenPipeError, ConnectionResetError, ssl.SSLError):
+        return
+    except Exception as exc:
+        print(f"Error serving Orbbec RGB file {path}: {exc}")
+        handler.send_error(500, "Could not serve Orbbec RGB frame")
+
+
+def _orbbec_vr_overlay_js(*, include_orbbec: bool) -> str:
+    return r"""
+(function () {
+  const FEEDS = [
+    {
+      name: 'orbbec',
+      url: '/orbbec/latest.ppm',
+      canvasId: 'orbbec-rgb-canvas',
+      width: 0.8,
+      height: 0.6,
+      position: [0, -0.18, -1.05],
+      markerPosition: [-0.42, 0.32, -1.04],
+      logName: 'Orbbec RGB'
+    },
+    {
+      name: 'left_wrist',
+      url: '/vr-camera/left_wrist.ppm',
+      canvasId: 'left-wrist-rgb-canvas',
+      width: 0.32,
+      height: 0.24,
+      position: [-0.17, -0.56, -1.02],
+      markerPosition: [-0.34, -0.42, -1.01],
+      logName: 'Left wrist'
+    },
+    {
+      name: 'right_wrist',
+      url: '/vr-camera/right_wrist.ppm',
+      canvasId: 'right-wrist-rgb-canvas',
+      width: 0.32,
+      height: 0.24,
+      position: [0.17, -0.56, -1.02],
+      markerPosition: [0.0, -0.42, -1.01],
+      logName: 'Right wrist'
+    }
+  ];
+  const INCLUDE_ORBBEC = __INCLUDE_ORBBEC__;
+  const ACTIVE_FEEDS = FEEDS.filter(feed => INCLUDE_ORBBEC || feed.name !== 'orbbec');
+  const overlays = new Map();
+  let lastStatusLog = 0;
+
+  function ensurePanel(feed) {
+    const headset = document.querySelector('#headset');
+    if (!headset || !headset.object3D || typeof THREE === 'undefined') return null;
+
+    let canvas = document.getElementById(feed.canvasId);
+    if (!canvas) {
+      canvas = document.createElement('canvas');
+      canvas.id = feed.canvasId;
+      canvas.width = 640;
+      canvas.height = 480;
+      canvas.style.display = 'none';
+      document.body.appendChild(canvas);
+    }
+
+    if (!overlays.has(feed.name)) {
+      const texture = new THREE.CanvasTexture(canvas);
+      texture.minFilter = THREE.LinearFilter;
+      texture.magFilter = THREE.LinearFilter;
+      texture.generateMipmaps = false;
+      if ('SRGBColorSpace' in THREE) texture.colorSpace = THREE.SRGBColorSpace;
+
+      const material = new THREE.MeshBasicMaterial({
+        map: texture,
+        side: THREE.DoubleSide,
+        toneMapped: false
+      });
+      const mesh = new THREE.Mesh(new THREE.PlaneGeometry(feed.width, feed.height), material);
+      mesh.name = `${feed.name}-rgb-three-overlay`;
+      mesh.position.set(feed.position[0], feed.position[1], feed.position[2]);
+      mesh.renderOrder = 999;
+      headset.object3D.add(mesh);
+
+      const marker = new THREE.Mesh(
+        new THREE.PlaneGeometry(feed.width * 0.1, feed.width * 0.1),
+        new THREE.MeshBasicMaterial({ color: 0x00ff00, side: THREE.DoubleSide })
+      );
+      marker.name = `${feed.name}-rgb-marker`;
+      marker.position.set(feed.markerPosition[0], feed.markerPosition[1], feed.markerPosition[2]);
+      marker.renderOrder = 1000;
+      headset.object3D.add(marker);
+
+      overlays.set(feed.name, { canvas, texture, mesh, marker });
+      console.log(`[${feed.logName}] Three.js headset overlay created`);
+    }
+
+    return overlays.get(feed.name);
+  }
+
+  function parsePpm(buffer) {
+    const bytes = new Uint8Array(buffer);
+    let offset = 0;
+
+    function skipWhitespaceAndComments() {
+      while (offset < bytes.length) {
+        const c = bytes[offset];
+        if (c === 35) {
+          while (offset < bytes.length && bytes[offset] !== 10) offset++;
+        } else if (c === 9 || c === 10 || c === 13 || c === 32) {
+          offset++;
+        } else {
+          break;
+        }
+      }
+    }
+
+    function token() {
+      skipWhitespaceAndComments();
+      const start = offset;
+      while (offset < bytes.length) {
+        const c = bytes[offset];
+        if (c === 9 || c === 10 || c === 13 || c === 32 || c === 35) break;
+        offset++;
+      }
+      return new TextDecoder('ascii').decode(bytes.slice(start, offset));
+    }
+
+    const magic = token();
+    const width = Number(token());
+    const height = Number(token());
+    const max = Number(token());
+    skipWhitespaceAndComments();
+    if (magic !== 'P6' || !width || !height || max !== 255) {
+      throw new Error('Unsupported PPM header');
+    }
+    return { width, height, rgb: bytes.slice(offset, offset + width * height * 3) };
+  }
+
+  async function updateFrame(feed) {
+    const nodes = ensurePanel(feed);
+    if (!nodes) return;
+    try {
+      const response = await fetch(`${feed.url}?t=${Date.now()}`, { cache: 'no-store' });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const frame = parsePpm(await response.arrayBuffer());
+      const { canvas, texture, marker } = nodes;
+      canvas.width = frame.width;
+      canvas.height = frame.height;
+      const ctx = canvas.getContext('2d');
+      const image = ctx.createImageData(frame.width, frame.height);
+      for (let src = 0, dst = 0; src < frame.rgb.length; src += 3, dst += 4) {
+        image.data[dst] = frame.rgb[src];
+        image.data[dst + 1] = frame.rgb[src + 1];
+        image.data[dst + 2] = frame.rgb[src + 2];
+        image.data[dst + 3] = 255;
+      }
+      ctx.putImageData(image, 0, 0);
+      texture.image = canvas;
+      texture.needsUpdate = true;
+      if (marker) marker.material.color.setHex(0x00ff00);
+      if (Date.now() - lastStatusLog > 3000) {
+        console.log(`[${feed.logName}] Updated ${frame.width}x${frame.height}`);
+        lastStatusLog = Date.now();
+      }
+    } catch (error) {
+      if (nodes.marker) nodes.marker.material.color.setHex(0xff0000);
+      if (Date.now() - lastStatusLog > 3000) {
+        console.warn(`[${feed.logName}] Waiting for frame`, error);
+        lastStatusLog = Date.now();
+      }
+    }
+  }
+
+  function start() {
+    setInterval(() => ACTIVE_FEEDS.forEach(updateFrame), 33);
+    ACTIVE_FEEDS.forEach(updateFrame);
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', start);
+  } else {
+    start();
+  }
+})();
+""".replace("__INCLUDE_ORBBEC__", "true" if include_orbbec else "false")
 
 
 def _run_keyboard_backend(
@@ -314,6 +742,7 @@ def _run_vr_backend(
     stop_key: str,
     quit_key: str,
     xlevr_path: str | None,
+    orbbec_rgb: OrbbecRgbConfig,
 ) -> int:
     from lerobot.teleoperators.keyboard.configuration_keyboard import KeyboardTeleopConfig
     from lerobot.teleoperators.keyboard.teleop_keyboard import KeyboardTeleop
@@ -324,6 +753,7 @@ def _run_vr_backend(
     hotkeys = KeyboardTeleop(KeyboardTeleopConfig())
     previous_pressed_keys: set[str] = set()
 
+    orbbec_process = _start_orbbec_rgb_sidecar(orbbec_rgb)
     robot.connect()
     init_rerun(session_name="xlerobot_real_vr_playground")
     hotkeys.connect()
@@ -333,6 +763,17 @@ def _run_vr_backend(
         vr_overrides["xlevr_path"] = xlevr_path
     vr_teleop = interface.make_vr_teleop(**vr_overrides)
     vr_teleop.connect(robot=robot)
+    installed = _install_orbbec_vr_overlay(
+        vr_teleop,
+        orbbec_rgb.output_dir,
+        include_orbbec=orbbec_rgb.enabled,
+    )
+    if installed:
+        if orbbec_rgb.enabled:
+            print("Orbbec RGB VR overlay enabled. Reload the Quest page if it was already open.")
+        print("VR arm camera panels enabled for camera names: left_wrist and right_wrist.")
+    elif orbbec_rgb.enabled:
+        print("Orbbec RGB sidecar is running, but the XLeVR web overlay could not be installed.")
     vr_teleop.send_feedback()
     robot.send_action(vr_teleop.move_to_zero_position(robot))
     _print_recording_guide(
@@ -371,7 +812,7 @@ def _run_vr_backend(
                 if vr_decision.quit_session:
                     break
 
-            obs = robot.get_observation()
+            obs = _get_robot_observation(robot, use_camera=False)
             if vr_decision.reset_robot:
                 action = vr_teleop.move_to_zero_position(robot)
             else:
@@ -380,7 +821,8 @@ def _run_vr_backend(
                 sent_action = robot.send_action(action)
             else:
                 sent_action = {}
-            obs = robot.get_observation()
+            obs = _get_robot_observation(robot, use_camera=True)
+            _publish_vr_camera_frames(obs)
             log_rerun_data(obs, sent_action)
             _record_frame_if_needed(recording, obs, sent_action)
 
@@ -388,6 +830,7 @@ def _run_vr_backend(
             precise_sleep(max(0.0, 1 / fps - dt_s))
     finally:
         _finalize_recording(recording)
+        _stop_orbbec_rgb_sidecar(orbbec_process)
         try:
             robot.disconnect()
         finally:

@@ -37,6 +37,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--port1", default="/dev/ttyACM0")
     parser.add_argument("--port2", default="/dev/ttyACM1")
+    parser.add_argument("--robot-kind", choices=("xlerobot", "xlerobot_2wheels"), default="xlerobot")
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--camera", action="append", default=[])
     parser.add_argument("--camera-width", type=int, default=640)
@@ -44,6 +45,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--camera-fps", type=int, default=30)
     parser.add_argument("--use-degrees", action="store_true")
     parser.add_argument("--xlevr-path", default=None)
+    parser.add_argument("--orbbec-rgb-vr", action="store_true")
+    parser.add_argument("--orbbec-capture-bin", default=None)
+    parser.add_argument("--orbbec-no-launch", action="store_true")
+    parser.add_argument("--orbbec-output-dir", default="artifacts/orbbec_rgb")
+    parser.add_argument("--orbbec-width", type=int, default=640)
+    parser.add_argument("--orbbec-height", type=int, default=480)
+    parser.add_argument("--orbbec-fps", type=int, default=30)
+    parser.add_argument("--orbbec-timeout-ms", type=int, default=1000)
     return parser
 
 
@@ -96,6 +105,8 @@ def main(argv: list[str] | None = None) -> int:
         args.port1,
         "--port2",
         args.port2,
+        "--robot-kind",
+        args.robot_kind,
         "--fps",
         str(args.fps),
         "--camera-width",
@@ -111,6 +122,26 @@ def main(argv: list[str] | None = None) -> int:
         backend_args.append("--use-degrees")
     if args.xlevr_path is not None:
         backend_args.extend(["--xlevr-path", args.xlevr_path])
+    if args.orbbec_rgb_vr:
+        backend_args.append("--orbbec-rgb-vr")
+    if args.orbbec_capture_bin is not None:
+        backend_args.extend(["--orbbec-capture-bin", args.orbbec_capture_bin])
+    if args.orbbec_no_launch:
+        backend_args.append("--orbbec-no-launch")
+    backend_args.extend(
+        [
+            "--orbbec-output-dir",
+            args.orbbec_output_dir,
+            "--orbbec-width",
+            str(args.orbbec_width),
+            "--orbbec-height",
+            str(args.orbbec_height),
+            "--orbbec-fps",
+            str(args.orbbec_fps),
+            "--orbbec-timeout-ms",
+            str(args.orbbec_timeout_ms),
+        ]
+    )
 
     return exec_python_module(
         "xlerobot_playground.real_backend",

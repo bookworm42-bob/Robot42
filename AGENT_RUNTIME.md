@@ -13,15 +13,15 @@ The runtime does four things:
 
 ## Main Files
 
-- [xlerobot_agent/runtime.py](/Users/alin/multido/xlerobot_agent/runtime.py)
+- [xlerobot_agent/runtime.py](/Users/alin/Robot42/xlerobot_agent/runtime.py)
   - simple top-level runtime
-- [xlerobot_agent/scoring.py](/Users/alin/multido/xlerobot_agent/scoring.py)
+- [xlerobot_agent/scoring.py](/Users/alin/Robot42/xlerobot_agent/scoring.py)
   - prompt planner, place discovery, subgoal planning, skill scoring
-- [xlerobot_agent/voice.py](/Users/alin/multido/xlerobot_agent/voice.py)
+- [xlerobot_agent/voice.py](/Users/alin/Robot42/xlerobot_agent/voice.py)
   - wake word and mock voice pipeline
-- [xlerobot_agent/integration.py](/Users/alin/multido/xlerobot_agent/integration.py)
+- [xlerobot_agent/integration.py](/Users/alin/Robot42/xlerobot_agent/integration.py)
   - startup switch between skill-only navigation and delegated navigation
-- [multido_xlerobot/interface.py](/Users/alin/multido/multido_xlerobot/interface.py)
+- [multido_xlerobot/interface.py](/Users/alin/Robot42/multido_xlerobot/interface.py)
   - XLeRobot fork integration boundary
 
 ## What Is Real
@@ -44,5 +44,5 @@ The runtime does four things:
 
 ## Examples
 
-- [use_xlerobot_agent.py](/Users/alin/multido/examples/use_xlerobot_agent.py)
-- [run_mock_voice_agent.py](/Users/alin/multido/examples/run_mock_voice_agent.py)
+- [use_xlerobot_agent.py](/Users/alin/Robot42/examples/use_xlerobot_agent.py)
+- [run_mock_voice_agent.py](/Users/alin/Robot42/examples/run_mock_voice_agent.py)

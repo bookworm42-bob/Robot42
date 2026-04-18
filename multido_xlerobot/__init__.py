@@ -4,7 +4,12 @@ This package does not copy XLeRobot code. It bootstraps a forked XLeRobot repo
 into the installed `lerobot` namespace and exposes a stable facade on top.
 """
 
-from .bootstrap import XLeRobotBootstrapError, XLeRobotBootstrapResult, bootstrap_xlerobot
+from .bootstrap import (
+    XLeRobotBootstrapError,
+    XLeRobotBootstrapResult,
+    bootstrap_xlerobot,
+    resolve_xlerobot_repo_root,
+)
 from .interface import XLeRobotInterface
 from .types import XLeRobotPaths
 
@@ -14,6 +19,7 @@ __all__ = [
     "XLeRobotInterface",
     "XLeRobotPaths",
     "bootstrap_xlerobot",
+    "resolve_xlerobot_repo_root",
     "XLeRobotManiSkillBootstrapResult",
     "XLeRobotManiSkillError",
     "bootstrap_xlerobot_maniskill",

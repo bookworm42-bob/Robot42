@@ -16,6 +16,7 @@ from typing import Any
 
 import numpy as np
 
+from multido_xlerobot.bootstrap import resolve_xlerobot_repo_root
 from xlerobot_agent.exploration import ExplorationBackend, ExplorationBackendConfig, Pose2D
 from xlerobot_agent.prompts import build_exploration_policy_user_prompt
 from xlerobot_playground.maniskill_ros_bridge import (
@@ -4677,7 +4678,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Run Robot Exploration Mode for autonomous frontier exploration."
     )
     parser.add_argument("--backend", choices=("synthetic", "maniskill", "ros"), default="synthetic")
-    parser.add_argument("--repo-root", default=str(Path.home() / "XLeRobot"))
+    parser.add_argument("--repo-root", default=str(resolve_xlerobot_repo_root()))
     parser.add_argument("--session", default="robot_exploration")
     parser.add_argument("--area", default="apartment")
     parser.add_argument("--source", default="operator")

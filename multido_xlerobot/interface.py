@@ -1,15 +1,15 @@
 from __future__ import annotations
 
-import os
 from pathlib import Path
+import sys
 from types import ModuleType
 from typing import Any
 
 from .bootstrap import (
-    DEFAULT_XLEROBOT_FORK_ROOT,
     XLeRobotBootstrapError,
     XLeRobotBootstrapResult,
     bootstrap_xlerobot,
+    resolve_xlerobot_repo_root,
 )
 
 
@@ -22,8 +22,7 @@ class XLeRobotInterface:
         *,
         force_reload: bool = False,
     ) -> None:
-        root = repo_root or os.environ.get("XLEROBOT_FORKED_ROOT") or DEFAULT_XLEROBOT_FORK_ROOT
-        self.repo_root = Path(root).expanduser().resolve()
+        self.repo_root = resolve_xlerobot_repo_root(repo_root)
         self.force_reload = force_reload
         self._bootstrap_result: XLeRobotBootstrapResult | None = None
 
@@ -96,15 +95,18 @@ class XLeRobotInterface:
 
     def make_vr_config(self, **overrides: Any) -> Any:
         config_cls, _ = self.vr_classes()
-        if "xlevr_path" not in overrides:
-            overrides["xlevr_path"] = str(self.paths.xlevr_root)
+        self._prepare_vr_overrides(overrides)
         return config_cls(**overrides)
 
     def make_vr_teleop(self, **config_overrides: Any) -> Any:
         config_cls, teleop_cls = self.vr_classes()
-        if "xlevr_path" not in config_overrides:
-            config_overrides["xlevr_path"] = str(self.paths.xlevr_root)
+        self._prepare_vr_overrides(config_overrides)
         return teleop_cls(config_cls(**config_overrides))
+
+    def _prepare_vr_overrides(self, overrides: dict[str, Any]) -> None:
+        xlevr_path = Path(overrides.get("xlevr_path") or self.paths.xlevr_root).expanduser().resolve()
+        overrides["xlevr_path"] = str(xlevr_path)
+        _patch_imported_vr_monitor_path(self.bootstrap().vr_module.__name__, xlevr_path)
 
     def summary(self) -> dict[str, str]:
         result = self.bootstrap()
@@ -129,3 +131,12 @@ class XLeRobotInterface:
             "environment where `lerobot` is installed, then point this adapter to "
             "your XLeRobot fork with XLEROBOT_FORKED_ROOT or repo_root=..."
         )
+
+
+def _patch_imported_vr_monitor_path(vr_module_name: str, xlevr_path: str | Path) -> bool:
+    """Point the fork's imported VR monitor module at the selected XLeVR checkout."""
+    monitor_module = sys.modules.get(f"{vr_module_name}.vr_monitor")
+    if monitor_module is None or not hasattr(monitor_module, "XLEVR_PATH"):
+        return False
+    monitor_module.XLEVR_PATH = str(Path(xlevr_path).expanduser().resolve())
+    return True

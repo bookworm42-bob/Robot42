@@ -1,6 +1,7 @@
 # XLeRobot Integration
 
 This repo integrates with the fork at `/Users/alin/xlerobot_forked` through the local package `multido_xlerobot`.
+Keep that fork synced with the upstream/current XLeRobot checkout, then let Robot42 consume `xlerobot_forked`.
 
 The adapter does not copy XLeRobot code. Instead it:
 
@@ -47,3 +48,5 @@ The XLeRobot fork is currently structured as an extension to `lerobot`, not as a
 2. a Python environment with `lerobot` already installed
 
 If `lerobot` is missing, bootstrap will fail with a clear error message.
+
+Set `XLEROBOT_FORKED_ROOT` only if the local fork moves. Otherwise the default resolver prefers `~/xlerobot_forked`.

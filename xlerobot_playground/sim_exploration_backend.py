@@ -12,6 +12,7 @@ import time
 from typing import Any, Callable, Iterable
 import webbrowser
 
+from multido_xlerobot.bootstrap import resolve_xlerobot_repo_root
 from xlerobot_agent.exploration import ExplorationBackend, ExplorationBackendConfig, Pose2D
 from xlerobot_agent.exploration_ui import ExplorationReviewServer, LocalExplorationUIController
 from xlerobot_agent.llm import AgentLLMRouter, AgentModelSuite, ModelConfig
@@ -4328,7 +4329,7 @@ def build_parser() -> argparse.ArgumentParser:
             "occupancy mapping, and an optional LLM frontier-selection policy."
         )
     )
-    parser.add_argument("--repo-root", default=str(Path.home() / "XLeRobot"))
+    parser.add_argument("--repo-root", default=str(resolve_xlerobot_repo_root()))
     parser.add_argument("--persist-path", default="./artifacts/xlerobot_exploration_map.json")
     parser.add_argument("--area", default="apartment")
     parser.add_argument("--session", default="house_v1")

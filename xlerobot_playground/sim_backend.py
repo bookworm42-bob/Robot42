@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 
+from multido_xlerobot.bootstrap import resolve_xlerobot_repo_root
 from multido_xlerobot.maniskill import run_keyboard_play_demo
 
 
@@ -29,7 +29,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _add_shared_sim_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--repo-root", default=str(Path.home() / "XLeRobot"))
+    parser.add_argument("--repo-root", default=str(resolve_xlerobot_repo_root()))
     parser.add_argument("--env-id", default="SceneManipulation-v1")
     parser.add_argument("--robot-uid", default="xlerobot")
     parser.add_argument("--control-mode", default=None)

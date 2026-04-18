@@ -16,7 +16,7 @@ package.
 ## One-Time Setup
 
 ```bash
-cd /Users/alin/multido
+cd /Users/alin/Robot42
 ./scripts/setup_xlerobot_maniskill_env.sh
 ```
 
@@ -35,7 +35,7 @@ environment with a compatible SAPIEN build.
 ## Sanity Check
 
 ```bash
-cd /Users/alin/multido
+cd /Users/alin/Robot42
 ./scripts/run_xlerobot_maniskill_play.sh --check
 ```
 
@@ -49,14 +49,14 @@ Expected output includes:
 Default dual-arm end-effector keyboard control:
 
 ```bash
-cd /Users/alin/multido
+cd /Users/alin/Robot42
 ./scripts/run_xlerobot_maniskill_play.sh
 ```
 
 Equivalent direct command:
 
 ```bash
-cd /Users/alin/multido
+cd /Users/alin/Robot42
 .venv-maniskill/bin/python -m multido_xlerobot.maniskill --demo ee_keyboard
 ```
 

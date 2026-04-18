@@ -5,14 +5,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+from multido_xlerobot.bootstrap import resolve_xlerobot_repo_root
+
 
 def resolve_repo_root(explicit_repo_root: str | None = None) -> Path:
-    if explicit_repo_root:
-        return Path(explicit_repo_root).expanduser().resolve()
-    candidate = Path.home() / "XLeRobot"
-    if candidate.exists():
-        return candidate
-    return Path("/Users/alin/xlerobot_forked")
+    return resolve_xlerobot_repo_root(explicit_repo_root)
 
 
 def default_sim_python_bin(repo_root: Path) -> Path:
@@ -39,4 +36,3 @@ def exec_python_module(
     command = [str(Path(python_bin).expanduser()), "-m", module, *argv]
     completed = subprocess.run(command, cwd=cwd, env=env)
     return completed.returncode
-
