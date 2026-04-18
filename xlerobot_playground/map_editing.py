@@ -125,7 +125,7 @@ ACTIVE_RGBD_SCAN_FUSION_CONFIG = OccupancyFusionConfig(
     occupied_observation_weight=1.0,
     free_observation_weight=-0.35,
     occupied_enter_threshold=2.0,
-    occupied_exit_threshold=0.25,
+    occupied_exit_threshold=0.05,
     min_score=-3.0,
     max_score=5.0,
 )

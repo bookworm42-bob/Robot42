@@ -4,6 +4,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import numpy as np
+
 from xlerobot_agent.exploration import ExplorationBackend, ExplorationBackendConfig, Pose2D
 from xlerobot_playground.sim_exploration_backend import (
     ExplorationDecision,
@@ -20,9 +22,11 @@ from xlerobot_playground.sim_exploration_backend import (
     build_parser,
 )
 from xlerobot_playground.interactive_exploration_playground import (
+    HumanAssistanceRequired,
     InteractiveNoNav2ExplorationSession,
     ManiSkillNav2RouterExplorationSession,
     ManiSkillTeleportExplorationSession,
+    Nav2LocalPathBlocked,
 )
 from xlerobot_playground.interactive_exploration_playground import (
     _local_scan_path_blocker,
@@ -60,7 +64,7 @@ class SimExplorationBackendTests(unittest.TestCase):
             "range_max": 10.0,
             "angle_min": -0.2,
             "angle_increment": 0.1,
-            "ranges": (10.0, 10.0, 0.55, 10.0, 10.0),
+            "ranges": (10.0, 10.0, 0.4, 10.0, 10.0),
         }
 
         blocker = _local_scan_path_blocker(
@@ -103,7 +107,7 @@ class SimExplorationBackendTests(unittest.TestCase):
             "range_max": 10.0,
             "angle_min": 0.48,
             "angle_increment": 0.0,
-            "ranges": (0.6,),
+            "ranges": (0.4,),
         }
 
         blocker = _local_scan_path_blocker(
@@ -142,7 +146,7 @@ class SimExplorationBackendTests(unittest.TestCase):
 
         self.assertIsNone(blocker)
 
-    def test_nav2_router_path_guard_ignores_known_static_obstacles(self) -> None:
+    def test_nav2_router_path_guard_stops_on_known_static_obstacles(self) -> None:
         session = ManiSkillNav2RouterExplorationSession.__new__(ManiSkillNav2RouterExplorationSession)
         session.config = SimExplorationConfig(
             repo_root="/tmp/XLeRobot",
@@ -159,7 +163,7 @@ class SimExplorationBackendTests(unittest.TestCase):
             "range_max": 10.0,
             "angle_min": 0.0,
             "angle_increment": 0.0,
-            "ranges": (0.55,),
+            "ranges": (0.4,),
         }
 
         blocker = session._local_path_blocker_from_observation(
@@ -167,10 +171,54 @@ class SimExplorationBackendTests(unittest.TestCase):
             target_pose=Pose2D(2.0, 0.0, 0.0),
         )
 
-        self.assertIsNone(blocker)
-        self.assertTrue(
+        self.assertIsNotNone(blocker)
+        assert blocker is not None
+        self.assertEqual(blocker["beam_index"], 0)
+        self.assertFalse(
             any(event["type"] == "local_path_guard_ignored_known_static_obstacle" for event in session.guardrail_events)
         )
+
+    def test_nav2_router_collision_stop_requests_human_assistance(self) -> None:
+        session = ManiSkillNav2RouterExplorationSession.__new__(ManiSkillNav2RouterExplorationSession)
+        session.guardrail_events = []
+        session.paused = False
+        session.status = "moving"
+        session.last_error = None
+        session.action = np.ones(4, dtype=np.float32)
+        publish_calls = []
+        blocker = {
+            "reason": "test obstacle",
+            "point": {"x": 0.5, "y": 0.0},
+            "forward_distance_m": 0.5,
+            "lateral_distance_m": 0.0,
+        }
+
+        def raise_blocked(_path_poses, *, final_pose):
+            raise Nav2LocalPathBlocked(blocker, travelled_distance_m=0.2)
+
+        session._execute_router_path_once = raise_blocked
+        session._publish_router_state = lambda: publish_calls.append("published")
+
+        with self.assertRaises(HumanAssistanceRequired):
+            session._execute_router_path([Pose2D(1.0, 0.0, 0.0)], final_pose=Pose2D(1.0, 0.0, 0.0))
+
+        self.assertTrue(session.paused)
+        self.assertEqual(session.status, "human_assistance_required")
+        self.assertIn("Human assistance required", session.last_error)
+        self.assertTrue(np.all(session.action == 0.0))
+        self.assertEqual(publish_calls, ["published"])
+        self.assertTrue(any(event["type"] == "human_assistance_requested" for event in session.guardrail_events))
+
+    def test_nav2_router_motion_loop_honors_pause_stop(self) -> None:
+        session = ManiSkillNav2RouterExplorationSession.__new__(ManiSkillNav2RouterExplorationSession)
+        session.paused = True
+        session.last_error = "Autonomous navigation is paused."
+        session.action = np.ones(4, dtype=np.float32)
+
+        with self.assertRaises(HumanAssistanceRequired):
+            session._drive_straight_to(Pose2D(1.0, 0.0, 0.0), publish_stride=1)
+
+        self.assertTrue(np.all(session.action == 0.0))
 
     def test_nav2_router_rejects_path_crossing_known_occupied_cell(self) -> None:
         session = ManiSkillNav2RouterExplorationSession.__new__(ManiSkillNav2RouterExplorationSession)

@@ -5,7 +5,7 @@ INTERACTIVE_REACT_HTML = """<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>XLeRobot LLM Frontier Playground</title>
+  <title>Robot Exploration Mode</title>
   <style>
     :root {
       --bg: #eef2e6;
@@ -132,7 +132,7 @@ INTERACTIVE_REACT_HTML = """<!doctype html>
       ));
     }
 
-    function FrontierList({state}) {
+    function FrontierList({state, onPost}) {
       const pending = state?.pending_target?.frontier_id;
       const frontiers = state?.candidate_frontiers || [];
       if (!frontiers.length) return e('div', {className: 'muted'}, 'No active frontier information.');
@@ -145,7 +145,12 @@ INTERACTIVE_REACT_HTML = """<!doctype html>
           e('br'),
           `gain ${frontier.unknown_gain ?? 'n/a'} · path ${frontier.path_cost_m ?? 'n/a'}m · priority ${frontier.llm_memory_priority ?? 'n/a'}`,
           e('br'),
-          e('span', {className: 'muted'}, (frontier.evidence || []).slice(0, 2).join(' | '))
+          e('span', {className: 'muted'}, (frontier.evidence || []).slice(0, 2).join(' | ')),
+          frontier.frontier_id === pending
+            ? e('div', {className: 'buttons', style: {marginTop: 8}},
+                e('button', {className: 'primary', onClick: () => onPost('/api/frontier/solved')}, 'Mark Solved')
+              )
+            : null
         )
       ));
     }
@@ -240,7 +245,7 @@ INTERACTIVE_REACT_HTML = """<!doctype html>
       const flushPaint = useCallback(async () => {
         const cells = Array.from(pendingPaintCellsRef.current.values());
         pendingPaintCellsRef.current.clear();
-        if (!cells.length) return;
+        if (!cells.length || mapEditMode === 'none') return;
         await onPost('/api/map/edit', {mode: mapEditMode, cells});
       }, [mapEditMode, onPost]);
 
@@ -257,6 +262,7 @@ INTERACTIVE_REACT_HTML = """<!doctype html>
 
       const enqueuePaintCell = useCallback((cell) => {
         if (!cell) return;
+        if (mapEditMode === 'none') return;
         if (mapEditMode === 'clear') {
           const state = occupancyRef.current.get(cell.key);
           if (!state || (state.state !== 'occupied' && state.manual_override !== 'blocked')) return;
@@ -284,6 +290,7 @@ INTERACTIVE_REACT_HTML = """<!doctype html>
           });
           return;
         }
+        if (mapEditMode === 'none') return;
         paintingRef.current = true;
         lastPaintedCellRef.current = cell.key;
         enqueuePaintCell(cell);
@@ -355,6 +362,11 @@ INTERACTIVE_REACT_HTML = """<!doctype html>
       });
 
       const trajectory = (map.trajectory || []).map((point) => {
+        const p = project(point);
+        return `${p.x},${p.y}`;
+      }).join(' ');
+
+      const plannedNavPath = (map.artifacts?.planned_nav_path || []).map((point) => {
         const p = project(point);
         return `${p.x},${p.y}`;
       }).join(' ');
@@ -473,6 +485,7 @@ INTERACTIVE_REACT_HTML = """<!doctype html>
         e('rect', {width: VIEW_W, height: VIEW_H, fill: 'rgba(255,255,255,.92)'}),
         occupancyCells,
         trajectory ? e('polyline', {points: trajectory, fill: 'none', stroke: '#4f772d', strokeWidth: 4, strokeLinecap: 'round'}) : null,
+        plannedNavPath ? e('polyline', {points: plannedNavPath, fill: 'none', stroke: '#f59e0b', strokeWidth: 3, strokeLinecap: 'round', strokeDasharray: '8,4'}) : null,
         regionCells,
         selectedCells,
         remembered,
@@ -489,12 +502,14 @@ INTERACTIVE_REACT_HTML = """<!doctype html>
 
     function App() {
       const [state, setState] = useState(null);
-      const [mapEditMode, setMapEditMode] = useState('block');
+      const [mapEditMode, setMapEditMode] = useState('none');
       const [uiMessage, setUiMessage] = useState('');
       const [regionMode, setRegionMode] = useState(null);
       const [selectedRegionCells, setSelectedRegionCells] = useState(new Map());
       const [pendingSubwaypoint, setPendingSubwaypoint] = useState(null);
-      const isDeveloper = window.INTERACTIVE_UI_FLAVOR === 'developer';
+      const [showMapEditing, setShowMapEditing] = useState(false);
+      const [showRegionEditing, setShowRegionEditing] = useState(false);
+      const autoStepInFlight = useRef(false);
 
       const refresh = useCallback(async () => {
         const next = await requestJson('/api/state');
@@ -511,6 +526,17 @@ INTERACTIVE_REACT_HTML = """<!doctype html>
         const timer = setInterval(() => refresh().catch((err) => setUiMessage(err.message)), 1000);
         return () => clearInterval(timer);
       }, [refresh]);
+
+      useEffect(() => {
+        const status = state?.status;
+        if (!status || autoStepInFlight.current) return;
+        if (!['initial_scan_complete', 'waiting_for_llm', 'llm_response_ready'].includes(status)) return;
+        autoStepInFlight.current = true;
+        requestJson('/api/auto_explore', {})
+          .then((next) => setState(next))
+          .catch((err) => setUiMessage(err.message))
+          .finally(() => { autoStepInFlight.current = false; });
+      }, [state?.status, state?.session, state?.pending_target?.frontier_id]);
 
       const startRegion = () => {
         setRegionMode('select');
@@ -547,23 +573,13 @@ INTERACTIVE_REACT_HTML = """<!doctype html>
 
       const lastError = state?.last_error || uiMessage || '';
       const map = state?.map || {};
-      const isRosNav2 = map.mode === 'interactive_ros_nav2' || map.mode === 'interactive_manishkill_rgbd_nav2_router';
       const hasStarted = state?.status && state.status !== 'not_started';
-      const frames = map.keyframes || [];
-      const promptText = state?.prompt || '';
-      const responseText = state?.pending_decision
-        ? JSON.stringify({decision: state.pending_decision, applied_memory_updates: state.applied_memory_updates}, null, 2)
-        : 'No response yet.';
 
       return e('div', {className: 'shell'},
         e('header', null,
           e('div', null,
-            e('div', {className: 'eyebrow'}, isRosNav2 ? 'ROS/Nav2 LLM Frontier Playground' : 'No-Nav2 LLM Frontier Playground'),
-            e('h1', null, 'Inspect the prompt before the robot moves.')
-          ),
-          e('p', {className: 'subtitle'}, isRosNav2
-            ? 'The robot brain builds the map locally and routes approved frontier motion through the ROS/Nav2 adapter. Inspect each frontier prompt, call the LLM, then apply the selected frontier.'
-            : 'The robot starts in the selected backend, performs a step-gated 360 scan, pauses at each decision, then lets you call the LLM and apply the selected frontier with direct mock motion or ManiSkill teleport motion.')
+            e('h1', null, 'Robot Exploration Mode')
+          )
         ),
         e('div', {className: 'layout'},
           e('div', {className: 'stack left-column'},
@@ -573,21 +589,31 @@ INTERACTIVE_REACT_HTML = """<!doctype html>
                 e('button', {className: hasStarted ? 'secondary' : 'primary', onClick: () => post('/api/reset')}, hasStarted ? 'Reset + Scan' : 'Start Explore'),
                 e('button', {className: 'secondary', onClick: () => post('/api/pause')}, 'Pause'),
                 e('button', {className: 'secondary', onClick: () => post('/api/resume')}, 'Resume'),
-                e('button', {className: 'primary', onClick: () => post('/api/call_llm')}, 'Call LLM'),
-                map.automatic_semantic_waypoints ? e('button', {className: 'primary', onClick: () => post('/api/call_semantic_llm')}, 'Call Semantic LLM') : null,
-                e('button', {className: 'primary', onClick: () => post('/api/apply_decision')}, 'Move To Selected Frontier')
+                e('button', {className: 'primary', onClick: () => post('/api/control_robot')}, 'Control Robot')
               ),
               e('div', {className: 'buttons', style: {marginTop: 10}},
+                e('button', {className: 'secondary', onClick: () => setShowMapEditing((value) => {
+                  if (value) setMapEditMode('none');
+                  return !value;
+                })}, 'Map Editing'),
+                e('button', {className: 'secondary', onClick: () => setShowRegionEditing((value) => {
+                  if (value) {
+                    setRegionMode(null);
+                    setSelectedRegionCells(new Map());
+                  }
+                  return !value;
+                })}, 'Region Edit')
+              ),
+              showMapEditing ? e('div', {className: 'buttons', style: {marginTop: 10}},
                 e('button', {className: 'secondary', onClick: () => setMapEditMode('block')}, 'Draw Wall'),
                 e('button', {className: 'secondary', onClick: () => setMapEditMode('clear')}, 'Erase Wall'),
-                e('button', {className: 'secondary', onClick: () => setMapEditMode('reset')}, 'Reset Cell'),
+                e('button', {className: 'secondary', onClick: () => setMapEditMode('reset')}, 'Reset Cell')
+              ) : null,
+              showRegionEditing ? e('div', {className: 'buttons', style: {marginTop: 10}},
                 e('button', {className: 'secondary', onClick: startRegion}, 'Add Region'),
                 e('button', {className: 'primary', onClick: finishRegion}, 'Done Region'),
                 e('button', {className: 'secondary', onClick: startSubwaypoint}, 'Add Subwaypoint')
-              ),
-              e('p', {className: 'muted'}, isRosNav2
-                ? 'The brain-side ManiSkill session builds the fused map and publishes map/scan state to the ROS/Nav2 router, which validates paths and republishes ROS topics. Map edits support click-and-drag painting.'
-                : 'No Nav2 is used here. Movement is direct synthetic pose update or ManiSkill teleport to the selected frontier, followed by another 360 scan. Map edits support click-and-drag painting.'),
+              ) : null,
               e('div', {className: 'error'}, lastError)
             ),
             e('section', {className: 'panel'},
@@ -596,17 +622,13 @@ INTERACTIVE_REACT_HTML = """<!doctype html>
             ),
             e('section', {className: 'panel'},
               e('div', {className: 'eyebrow'}, 'Frontier Information'),
-              e('div', {className: 'frontier-list'}, e(FrontierList, {state}))
+              e('div', {className: 'frontier-list'}, e(FrontierList, {state, onPost: post}))
             ),
             e('section', {className: 'panel'},
               e('div', {className: 'eyebrow'}, 'Navigation Memory'),
               e('div', {className: 'frontier-list'}, e(NavigationMemory, {regions: map.regions || []}))
             ),
-            e(SemanticPanel, {map}),
-            e('section', {className: 'panel'},
-              e('div', {className: 'eyebrow'}, 'Recent RGB-D Views'),
-              e('div', {className: 'thumbs'}, e(RecentViews, {frames}))
-            )
+            e(SemanticPanel, {map})
           ),
           e('div', {className: 'stack right-column'},
             e('section', {className: 'panel'},
@@ -622,15 +644,7 @@ INTERACTIVE_REACT_HTML = """<!doctype html>
                 setPendingSubwaypoint,
                 onPost: post,
               })
-            ),
-            isDeveloper ? e('section', {className: 'panel'},
-              e('div', {className: 'eyebrow'}, 'Prompt Sent To LLM'),
-              e('textarea', {readOnly: true, value: promptText})
-            ) : null,
-            isDeveloper ? e('section', {className: 'panel'},
-              e('div', {className: 'eyebrow'}, 'LLM Structured Response'),
-              e('pre', null, responseText)
-            ) : null
+            )
           )
         )
       );

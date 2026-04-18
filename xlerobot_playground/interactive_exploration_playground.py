@@ -84,9 +84,8 @@ SIM_MOTION_SPEED_PRESETS = {
     "faster": {"linear_m_s": 0.60, "angular_multiplier": 1.8},
     "fastest": {"linear_m_s": 1.00, "angular_multiplier": 3.0},
 }
-LOCAL_PATH_GUARD_LOOKAHEAD_M = 0.15
+LOCAL_PATH_GUARD_LOOKAHEAD_M = 0.25
 LOCAL_PATH_GUARD_PADDING_M = 0.0
-LOCAL_PATH_GUARD_MAX_REPLANS = 4
 KEYBOARD_SPEED_PROFILES = {
     "slow": {"base_forward": 0.05, "base_turn": 0.02},
     "normal": {"base_forward": 0.1, "base_turn": 0.05},
@@ -99,6 +98,10 @@ class Nav2LocalPathBlocked(RuntimeError):
         self.blocker = blocker
         self.travelled_distance_m = travelled_distance_m
         super().__init__(str(blocker.get("reason", "local RGB-D scan blocked the current path")))
+
+
+class HumanAssistanceRequired(RuntimeError):
+    """Raised when autonomous navigation must stop for operator takeover."""
 
 
 def _local_scan_path_blocker(
@@ -392,6 +395,28 @@ class InteractiveRosNav2ExplorationSession(RosExplorationSession):
         payload["waypoint_name"] = str(payload.get("name", "")).strip() or "subwaypoint"
         return self.update_manual_region_waypoint(payload)
 
+    def add_manual_frontier(self, payload: dict[str, Any]) -> dict[str, Any]:
+        pose = payload.get("pose")
+        if not isinstance(pose, dict):
+            return self.snapshot()
+        frontier = FrontierCandidate(
+            nav_pose=Pose2D(float(pose.get("x", 0)), float(pose.get("y", 0)), float(pose.get("yaw", 0))),
+            centroid_pose=Pose2D(float(pose.get("x", 0)), float(pose.get("y", 0)), float(pose.get("yaw", 0))),
+            unknown_gain=1,
+            sensor_range_edge=False,
+            room_hint="manual",
+            evidence=["manually added by user"],
+        )
+        records = self.frontier_memory.upsert_candidates([frontier], step_index=self.decision_index)
+        if records:
+            record = records[0]
+            decision = ExplorationDecision(
+                decision_type="explore_frontier",
+                selected_frontier_id=record.frontier_id,
+            )
+            self.pending_decision = decision
+        return self.snapshot()
+
     def _build_map_payload(self) -> dict[str, Any]:
         payload = super()._build_map_payload()
         regions = list(getattr(self, "manual_regions", []))
@@ -551,6 +576,29 @@ class InteractiveNoNav2ExplorationSession:
         payload["waypoint_name"] = str(payload.get("name", "")).strip() or "subwaypoint"
         return self.update_manual_region_waypoint(payload)
 
+    def add_manual_frontier(self, payload: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            pose = payload.get("pose")
+            if not isinstance(pose, dict):
+                return self.snapshot()
+            frontier = FrontierCandidate(
+                nav_pose=Pose2D(float(pose.get("x", 0)), float(pose.get("y", 0)), float(pose.get("yaw", 0))),
+                centroid_pose=Pose2D(float(pose.get("x", 0)), float(pose.get("y", 0)), float(pose.get("yaw", 0))),
+                unknown_gain=1,
+                sensor_range_edge=False,
+                room_hint="manual",
+                evidence=["manually added by user"],
+            )
+            records = self.frontier_memory.upsert_candidates([frontier], step_index=self.decision_index)
+            if records:
+                record = records[0]
+                decision = ExplorationDecision(
+                    decision_type="explore_frontier",
+                    selected_frontier_id=record.frontier_id,
+                )
+                self.pending_decision = decision
+            return self.snapshot()
+
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             return {
@@ -629,7 +677,7 @@ class InteractiveNoNav2ExplorationSession:
                 self.last_error = "Exploration is paused. Resume before applying a decision."
                 return self.snapshot()
             if self.pending_decision is None:
-                self.last_error = "No pending LLM decision. Click `Call LLM` first."
+                self.last_error = "No pending LLM decision is ready yet."
                 return self.snapshot()
             decision = self.pending_decision
             if decision.decision_type == "finish" or decision.exploration_complete:
@@ -764,6 +812,9 @@ class InteractiveNoNav2ExplorationSession:
             self.paused = True
             self.status = "paused"
             return self.snapshot()
+
+    def control_robot(self) -> dict[str, Any]:
+        return self.pause()
 
     def resume(self) -> dict[str, Any]:
         with self._lock:
@@ -1168,6 +1219,7 @@ class ManiSkillTeleportExplorationSession:
             pygame.display.set_mode((200, 100))
             self._keyboard_control_active = True
         self.reset()
+        self._pending_keyboard_scan = False
 
     def close(self) -> None:
         env = getattr(self, "env", None)
@@ -1183,6 +1235,9 @@ class ManiSkillTeleportExplorationSession:
             if self._keyboard_control_active:
                 self._poll_keyboard_controls()
                 self.env.step(self.action)
+                if self._pending_keyboard_scan:
+                    self._pending_keyboard_scan = False
+                    self._perform_scan(full_turnaround=True, capture_frame=True, reason="keyboard_manual_scan")
             self.env.render()
         finally:
             self._lock.release()
@@ -1216,7 +1271,10 @@ class ManiSkillTeleportExplorationSession:
 
         if head_tilt_delta != 0.0:
             self.action[15] = head_tilt_delta
-        
+
+        if keys[pygame.K_s]:
+            self._pending_keyboard_scan = True
+
         if forward != 0.0 or turn != 0.0:
             current_pose = self._current_pose()
             target_pose = Pose2D(
@@ -1258,7 +1316,7 @@ class ManiSkillTeleportExplorationSession:
             robot_length_m=XLEROBOT_IKEA_CART_FOOTPRINT_LENGTH_M,
             robot_width_m=XLEROBOT_IKEA_CART_FOOTPRINT_WIDTH_M,
             lookahead_m=LOCAL_PATH_GUARD_LOOKAHEAD_M,
-            safety_padding_m=XLEROBOT_IKEA_CART_CLEARANCE_PADDING_M,
+            safety_padding_m=LOCAL_PATH_GUARD_PADDING_M,
         )
         if blocker is not None:
             print(f"COLLISION: {blocker.get('reason', 'unknown')}")
@@ -1460,7 +1518,7 @@ class ManiSkillTeleportExplorationSession:
                 self.last_error = "Exploration is paused. Resume before applying a decision."
                 return self.snapshot()
             if self.pending_decision is None:
-                self.last_error = "No pending LLM decision. Click `Call LLM` first."
+                self.last_error = "No pending LLM decision is ready yet."
                 return self.snapshot()
             decision = self.pending_decision
             if decision.decision_type == "finish" or decision.exploration_complete:
@@ -2074,10 +2132,21 @@ class ManiSkillTeleportExplorationSession:
         return overlay_known_cells(self.known_cells, edits)
 
     def pause(self) -> dict[str, Any]:
-        with self._lock:
-            self.paused = True
-            self.status = "paused"
-            return self.snapshot()
+        self.paused = True
+        self.status = "paused"
+        self.last_error = "Autonomous navigation is paused."
+        self._stop_robot_action()
+        return self.snapshot()
+
+    def control_robot(self) -> dict[str, Any]:
+        self.paused = True
+        self.status = "human_control"
+        self.last_error = (
+            "Manual robot control is active. Use arrow keys to drive, F/V to tilt the head, "
+            "and S to capture a scan when keyboard controls are enabled."
+        )
+        self._stop_robot_action()
+        return self.snapshot()
 
     def resume(self) -> dict[str, Any]:
         with self._lock:
@@ -2087,6 +2156,32 @@ class ManiSkillTeleportExplorationSession:
             elif self.pending_prompt_payload is not None:
                 self.status = "waiting_for_llm"
             return self.snapshot()
+
+    def mark_selected_frontier_solved(self) -> dict[str, Any]:
+        with self._lock:
+            frontier_id = self.frontier_memory.active_frontier_id
+            if frontier_id is None and self.pending_decision is not None:
+                frontier_id = self.pending_decision.selected_frontier_id
+            if not frontier_id:
+                self.last_error = "No active or selected frontier is available to mark solved."
+                return self.snapshot()
+            record = self.frontier_memory.records.get(frontier_id)
+            if record is None:
+                self.last_error = f"Frontier `{frontier_id}` no longer exists."
+                return self.snapshot()
+            if self.frontier_memory.active_frontier_id != frontier_id:
+                self.frontier_memory.activate(frontier_id)
+            decision = self.pending_decision or ExplorationDecision(
+                decision_type="explore_frontier",
+                selected_frontier_id=frontier_id,
+            )
+            self.paused = False
+            self.last_error = None
+            return self._complete_active_frontier_locked(
+                record=record,
+                decision=decision,
+                event_type="human_marked_frontier_solved",
+            )
 
     def update_occupancy_edits(self, *, mode: str, cells: list[dict[str, Any]]) -> dict[str, Any]:
         with self._lock:
@@ -2977,7 +3072,7 @@ class ManiSkillTeleportExplorationSession:
             "coverage": round(self._coverage(), 3),
             "mode": "interactive_manishkill_rgbd_teleport_no_nav2",
             "summary": (
-                "Interactive playground using the actual ManiSkill scene and XLeRobot head RGB-D, "
+                "Robot exploration mode using the actual ManiSkill scene and XLeRobot head RGB-D, "
                 "with teleport-only movement after operator-approved LLM decisions."
             ),
             "trajectory": self.trajectory,
@@ -3042,9 +3137,57 @@ class ManiSkillNav2RouterExplorationSession(ManiSkillTeleportExplorationSession)
 
     def reset(self) -> dict[str, Any]:
         self._transient_navigation_obstacle_cells: set[GridCell] = set()
+        self._planned_nav_path: list[dict[str, Any]] = []
         snapshot = super().reset()
         self._publish_router_state()
         return snapshot
+
+    def visualize_planned_nav_path(self) -> dict[str, Any]:
+        with self._lock:
+            self.last_error = None
+            self._planned_nav_path = []
+            if self.paused:
+                self.last_error = "Exploration is paused. Resume before visualizing a Nav2 path."
+                return self.snapshot()
+            if self.pending_decision is None:
+                self.last_error = "No pending LLM decision is ready yet."
+                return self.snapshot()
+            decision = self.pending_decision
+            if decision.decision_type == "finish" or decision.exploration_complete:
+                self.last_error = "The pending LLM decision is finish; there is no frontier path to visualize."
+                return self.snapshot()
+            if not decision.selected_frontier_id:
+                self.last_error = "The LLM decision did not select a frontier."
+                return self.snapshot()
+            record = self.frontier_memory.records.get(decision.selected_frontier_id)
+            if record is None:
+                self.last_error = f"Selected frontier `{decision.selected_frontier_id}` no longer exists."
+                return self.snapshot()
+
+            start_pose = self._current_pose()
+            current_cell = self._world_to_cell(start_pose.x, start_pose.y)
+            reachable_safe_cells = self._reachable_safe_navigation_cells(current_cell)
+            target_pose, path_poses, rejection_reason = self._plan_router_path_to_frontier(
+                record=record,
+                start_pose=start_pose,
+                reachable_safe_cells=reachable_safe_cells,
+            )
+            self._planned_nav_path = [p.to_dict() for p in path_poses]
+            if target_pose is None or not path_poses:
+                self.last_error = (
+                    f"Nav2 could not compute a preview path for `{record.frontier_id}` "
+                    f"({rejection_reason or 'unknown reason'})."
+                )
+            else:
+                self.guardrail_events.append(
+                    {
+                        "type": "nav2_planned_path_visualized",
+                        "frontier_id": record.frontier_id,
+                        "path_pose_count": len(path_poses),
+                        "target_pose": target_pose.to_dict(),
+                    }
+                )
+            return self.snapshot()
 
     def apply_decision(self) -> dict[str, Any]:
         with self._lock:
@@ -3053,7 +3196,7 @@ class ManiSkillNav2RouterExplorationSession(ManiSkillTeleportExplorationSession)
                 self.last_error = "Exploration is paused. Resume before applying a decision."
                 return self.snapshot()
             if self.pending_decision is None:
-                self.last_error = "No pending LLM decision. Click `Call LLM` first."
+                self.last_error = "No pending LLM decision is ready yet."
                 return self.snapshot()
             decision = self.pending_decision
             if decision.decision_type == "finish" or decision.exploration_complete:
@@ -3077,6 +3220,7 @@ class ManiSkillNav2RouterExplorationSession(ManiSkillTeleportExplorationSession)
                 start_pose=start_pose,
                 reachable_safe_cells=reachable_safe_cells,
             )
+            self._planned_nav_path = [p.to_dict() for p in path_poses]
             if target_pose is None or not path_poses:
                 if self._is_close_enough_to_complete_frontier(start_pose, record):
                     record.evidence = _dedupe_text(
@@ -3108,6 +3252,8 @@ class ManiSkillNav2RouterExplorationSession(ManiSkillTeleportExplorationSession)
 
             try:
                 travelled_distance_m = self._execute_router_path(path_poses, final_pose=target_pose)
+            except HumanAssistanceRequired:
+                return self.snapshot()
             except Exception as exc:
                 self.frontier_memory.fail(record.frontier_id, f"router movement failed: {exc}")
                 self.last_error = f"Router movement failed for `{record.frontier_id}`: {exc}"
@@ -3225,12 +3371,6 @@ class ManiSkillNav2RouterExplorationSession(ManiSkillTeleportExplorationSession)
 
         rejection_reasons: list[str] = []
         for index, candidate in enumerate(candidates, start=1):
-            ok, reason = self._probe_teleport_pose(candidate)
-            if not ok:
-                rejection_reasons.append(
-                    f"candidate {index} physical validation failed: {reason or 'unknown reason'}"
-                )
-                continue
             try:
                 self._publish_router_state(required=True)
                 status, path_poses, status_label = self.router.compute_path(
@@ -3258,50 +3398,40 @@ class ManiSkillNav2RouterExplorationSession(ManiSkillTeleportExplorationSession)
 
         return None, [], "; ".join(rejection_reasons[-5:]) if rejection_reasons else "all candidates were rejected"
 
-    def _request_router_replan(self, *, final_pose: Pose2D) -> list[Pose2D]:
-        self._publish_router_state(required=True)
-        status, path_poses, status_label = self.router.compute_path(
-            goal_pose=final_pose,
-            planner_id=self.config.nav2_planner_id,
-        )
-        if status_label != "succeeded" or not path_poses:
-            raise RuntimeError(f"Nav2 replan returned `{status_label}` with {len(path_poses)} poses")
-        self._validate_router_path(
-            path_poses,
-            start_pose=self._current_pose(),
-            target_pose=final_pose,
-        )
-        return path_poses
-
     def _execute_router_path(self, path_poses: list[Pose2D], *, final_pose: Pose2D) -> float:
         travelled_distance_m = 0.0
-        replans = 0
         active_path = list(path_poses)
-        while True:
+        try:
+            travelled_distance_m += self._execute_router_path_once(active_path, final_pose=final_pose)
+            self._transient_navigation_obstacle_cells.clear()
+            self._publish_router_state()
+            return travelled_distance_m
+        except Nav2LocalPathBlocked as exc:
+            travelled_distance_m += exc.travelled_distance_m
+            self._stop_robot_action()
             try:
-                travelled_distance_m += self._execute_router_path_once(active_path, final_pose=final_pose)
-                self._transient_navigation_obstacle_cells.clear()
                 self._publish_router_state()
-                return travelled_distance_m
-            except Nav2LocalPathBlocked as exc:
-                travelled_distance_m += exc.travelled_distance_m
-                replans += 1
-                self._remember_transient_navigation_obstacle(exc.blocker)
-                self.guardrail_events.append(
-                    {
-                        "type": "nav2_local_path_blocked_replan_requested",
-                        "replan_index": replans,
-                        "blocker": exc.blocker,
-                    }
-                )
-                if replans > LOCAL_PATH_GUARD_MAX_REPLANS:
-                    raise RuntimeError(
-                        "local RGB-D path guard exhausted replan attempts "
-                        f"({LOCAL_PATH_GUARD_MAX_REPLANS})"
-                    ) from exc
-                active_path = self._request_router_replan(final_pose=final_pose)
+            except Exception:
+                pass
+            self.paused = True
+            self.status = "human_assistance_required"
+            self.last_error = (
+                "Human assistance required: autonomous navigation stopped because the local RGB-D guard "
+                f"detected a collision risk ({exc}). Take over the robot, scan with S if keyboard controls "
+                "are enabled, mark the frontier solved, then resume exploration."
+            )
+            self.guardrail_events.append(
+                {
+                    "type": "human_assistance_requested",
+                    "reason": "nav2_local_path_blocked",
+                    "blocker": exc.blocker,
+                    "travelled_distance_m": round(travelled_distance_m, 3),
+                }
+            )
+            raise HumanAssistanceRequired(self.last_error) from exc
 
     def _execute_router_path_once(self, path_poses: list[Pose2D], *, final_pose: Pose2D) -> float:
+        self._raise_if_manual_stop_requested()
         if not path_poses:
             self._teleport_robot(final_pose)
             self.control_steps += 1
@@ -3315,6 +3445,7 @@ class ManiSkillNav2RouterExplorationSession(ManiSkillTeleportExplorationSession)
         travelled_distance_m = 0.0
         pose_publish_stride = 5
         for waypoint in waypoints[1:]:
+            self._raise_if_manual_stop_requested()
             current = self._current_pose()
             dx = waypoint.x - current.x
             dy = waypoint.y - current.y
@@ -3333,7 +3464,28 @@ class ManiSkillNav2RouterExplorationSession(ManiSkillTeleportExplorationSession)
         self._rotate_in_place(final_pose.yaw, publish_stride=pose_publish_stride)
         return travelled_distance_m
 
+    def _raise_if_manual_stop_requested(self) -> None:
+        if not getattr(self, "paused", False):
+            return
+        self._stop_robot_action()
+        raise HumanAssistanceRequired(
+            self.last_error or "Autonomous navigation is paused for operator control."
+        )
+
+    def _stop_robot_action(self) -> None:
+        action = getattr(self, "action", None)
+        if action is None:
+            return
+        try:
+            action[...] = 0.0
+        except Exception:
+            try:
+                self.action = np.zeros_like(action)
+            except Exception:
+                pass
+
     def _rotate_in_place(self, target_yaw: float, *, publish_stride: int) -> None:
+        self._raise_if_manual_stop_requested()
         current = self._current_pose()
         yaw_delta = _angle_wrap(target_yaw - current.yaw)
         if abs(yaw_delta) <= 1e-3:
@@ -3344,6 +3496,7 @@ class ManiSkillNav2RouterExplorationSession(ManiSkillTeleportExplorationSession)
         step_yaw = angular_speed * step_s
         steps = max(int(math.ceil(abs(yaw_delta) / max(step_yaw, 1e-6))), 1)
         for step in range(1, steps + 1):
+            self._raise_if_manual_stop_requested()
             fraction = step / steps
             pose = Pose2D(current.x, current.y, _angle_wrap(current.yaw + yaw_delta * fraction))
             self._teleport_robot(pose)
@@ -3353,6 +3506,7 @@ class ManiSkillNav2RouterExplorationSession(ManiSkillTeleportExplorationSession)
             self._sleep_after_motion_step(step_s)
 
     def _drive_straight_to(self, target_pose: Pose2D, *, publish_stride: int) -> float:
+        self._raise_if_manual_stop_requested()
         current = self._current_pose()
         dx = target_pose.x - current.x
         dy = target_pose.y - current.y
@@ -3367,7 +3521,9 @@ class ManiSkillNav2RouterExplorationSession(ManiSkillTeleportExplorationSession)
         travelled_distance_m = 0.0
         previous = current
         for step in range(1, steps + 1):
+            self._raise_if_manual_stop_requested()
             observation = self._publish_navigation_only_observation()
+            self._raise_if_manual_stop_requested()
             blocker = self._local_path_blocker_from_observation(observation, target_pose=target_pose)
             if blocker is not None:
                 print(f"NAV2 COLLISION: {blocker.get('reason', 'unknown')}")
@@ -3449,15 +3605,6 @@ class ManiSkillNav2RouterExplorationSession(ManiSkillTeleportExplorationSession)
         )
         return blocker
 
-    def _is_known_static_obstacle_near(self, cell: GridCell) -> bool:
-        effective = self._effective_known_cells()
-        if effective.get(cell) == "occupied":
-            return True
-        for neighbor in _neighbors8(cell):
-            if effective.get(neighbor) == "occupied":
-                return True
-        return False
-
     def _remember_transient_navigation_obstacle(self, blocker: dict[str, Any]) -> None:
         point = blocker.get("point")
         if not isinstance(point, dict):
@@ -3468,13 +3615,6 @@ class ManiSkillNav2RouterExplorationSession(ManiSkillTeleportExplorationSession)
             return
         cells = getattr(self, "_transient_navigation_obstacle_cells", set())
         cells.add(center)
-        # Add surrounding cells for inflation (robot needs space to navigate around)
-        resolution = self.config.occupancy_resolution
-        inflation_radius_cells = 2  # ~0.5m around obstacle
-        for dx in range(-inflation_radius_cells, inflation_radius_cells + 1):
-            for dy in range(-inflation_radius_cells, inflation_radius_cells + 1):
-                if abs(dx) + abs(dy) <= inflation_radius_cells:
-                    cells.add(GridCell(center.x + dx, center.y + dy))
         self._transient_navigation_obstacle_cells = cells
 
     def _move_to_scan_sample_pose(
@@ -3572,7 +3712,7 @@ class ManiSkillNav2RouterExplorationSession(ManiSkillTeleportExplorationSession)
         payload = super()._build_map_payload()
         payload["mode"] = "interactive_manishkill_rgbd_nav2_router"
         payload["summary"] = (
-            "Interactive playground using ManiSkill as the robot brain, with fused RGB-D mapping kept local "
+            "Robot exploration mode using ManiSkill as the robot brain, with fused RGB-D mapping kept local "
             "and Nav2 path approval routed through the external ROS adapter."
         )
         artifacts = payload.setdefault("artifacts", {})
@@ -3587,6 +3727,7 @@ class ManiSkillNav2RouterExplorationSession(ManiSkillTeleportExplorationSession)
             artifacts["nav2_router"] = self.router.snapshot()
         except Exception as exc:
             artifacts["nav2_router"] = {"status": "unavailable", "error": str(exc)}
+        artifacts["planned_nav_path"] = getattr(self, "_planned_nav_path", [])
         return payload
 
 
@@ -3846,7 +3987,7 @@ INTERACTIVE_HTML = """<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>XLeRobot LLM Frontier Playground</title>
+  <title>Robot Exploration Mode</title>
   <style>
     :root {
       --bg: #eef2e6;
@@ -3908,12 +4049,8 @@ INTERACTIVE_HTML = """<!doctype html>
   <div class="shell">
     <header>
       <div>
-        <div class="eyebrow">No-Nav2 LLM Frontier Playground</div>
-        <h1>Inspect the prompt before the robot moves.</h1>
+        <h1>Robot Exploration Mode</h1>
       </div>
-      <p class="subtitle">
-        The robot starts in the selected backend, performs a step-gated 360 scan, pauses at each decision, then lets you call the LLM and apply the selected frontier with direct mock motion or ManiSkill teleport motion.
-      </p>
     </header>
     <div class="layout">
       <div class="stack left-column">
@@ -3923,9 +4060,8 @@ INTERACTIVE_HTML = """<!doctype html>
             <button class="secondary" id="reset">Reset + Scan</button>
             <button class="secondary" id="pause">Pause</button>
             <button class="secondary" id="resume">Resume</button>
-            <button class="primary" id="call">Call LLM</button>
             <button class="primary" id="call-semantic" style="display:none;">Call Semantic LLM</button>
-            <button class="primary" id="apply">Move To Selected Frontier</button>
+            <button class="primary" id="control-robot">Control Robot</button>
           </div>
           <div class="buttons" style="margin-top:10px;">
             <button class="secondary" id="edit-block">Draw Wall</button>
@@ -3935,7 +4071,6 @@ INTERACTIVE_HTML = """<!doctype html>
             <button class="primary" id="region-done">Done Region</button>
             <button class="secondary" id="subwaypoint-add">Add Subwaypoint</button>
           </div>
-          <p class="muted">No Nav2 is used here. Movement is direct synthetic pose update or ManiSkill teleport to the selected frontier, followed by another 360 scan. Map edits support click-and-drag painting.</p>
           <div id="error" class="error"></div>
         </section>
         <section class="panel">
@@ -3954,23 +4089,11 @@ INTERACTIVE_HTML = """<!doctype html>
           <div class="eyebrow">Automatic Semantic Places</div>
           <div id="semantic" class="frontier-list"></div>
         </section>
-        <section class="panel">
-          <div class="eyebrow">Recent RGB-D Views</div>
-          <div id="thumbs" class="thumbs"></div>
-        </section>
       </div>
       <div class="stack right-column">
         <section class="panel">
           <div class="eyebrow">Scanned 2D Map</div>
           <svg id="map" viewBox="0 0 1000 760"></svg>
-        </section>
-        <section class="panel" __DEVELOPER_PANEL_ATTR__>
-          <div class="eyebrow">Prompt Sent To LLM</div>
-          <textarea id="prompt" readonly></textarea>
-        </section>
-        <section class="panel" __DEVELOPER_PANEL_ATTR__>
-          <div class="eyebrow">LLM Structured Response</div>
-          <pre id="response">No response yet.</pre>
         </section>
       </div>
     </div>
@@ -4434,6 +4557,16 @@ class InteractiveExplorationServer:
                 if self.path == "/api/resume":
                     self._send_json(session.resume())
                     return
+                if self.path == "/api/control_robot":
+                    controller = getattr(session, "control_robot", None)
+                    if callable(controller):
+                        self._send_json(controller())
+                    else:
+                        self._send_json(session.pause())
+                    return
+                if self.path == "/api/auto_explore":
+                    self._send_json(self._auto_explore_step())
+                    return
                 if self.path == "/api/call_llm":
                     self._send_json(session.call_llm())
                     return
@@ -4443,6 +4576,14 @@ class InteractiveExplorationServer:
                 if self.path == "/api/apply_decision":
                     self._send_json(session.apply_decision())
                     return
+                if self.path == "/api/visualize_nav2_path":
+                    planner = getattr(session, "visualize_planned_nav_path", None)
+                    if callable(planner):
+                        self._send_json(planner())
+                    else:
+                        setattr(session, "last_error", "Nav2 path visualization is only available in the Nav2 router mode.")
+                        self._send_json(session.snapshot())
+                    return
                 if self.path == "/api/region/create":
                     self._send_json(session.create_manual_region(self._read_json()))
                     return
@@ -4451,6 +4592,17 @@ class InteractiveExplorationServer:
                     return
                 if self.path == "/api/region/subwaypoint":
                     self._send_json(session.add_manual_region_subwaypoint(self._read_json()))
+                    return
+                if self.path == "/api/frontier/solved":
+                    solver = getattr(session, "mark_selected_frontier_solved", None)
+                    if callable(solver):
+                        self._send_json(solver())
+                    else:
+                        setattr(session, "last_error", "Manual frontier solving is not available in this robot exploration mode.")
+                        self._send_json(session.snapshot())
+                    return
+                if self.path == "/api/frontier/manual":
+                    self._send_json(session.add_manual_frontier(self._read_json()))
                     return
                 if self.path == "/api/map/edit":
                     payload = self._read_json()
@@ -4471,6 +4623,25 @@ class InteractiveExplorationServer:
                 if not length:
                     return {}
                 return json.loads(self.rfile.read(length).decode("utf-8"))
+
+            def _auto_explore_step(self) -> dict[str, Any]:
+                snapshot = session.snapshot()
+                status = str(snapshot.get("status", ""))
+                if status in {"finished", "paused", "human_control", "human_assistance_required"}:
+                    return snapshot
+                started_from_llm_wait = status in {"waiting_for_llm", "initial_scan_complete"}
+                if status in {"waiting_for_llm", "initial_scan_complete"}:
+                    snapshot = session.call_llm()
+                    status = str(snapshot.get("status", ""))
+                planner = getattr(session, "visualize_planned_nav_path", None)
+                if callable(planner) and status == "llm_response_ready":
+                    snapshot = planner()
+                    status = str(snapshot.get("status", ""))
+                if started_from_llm_wait:
+                    return snapshot
+                if status in {"llm_response_ready", "semantic_response_ready"}:
+                    snapshot = session.apply_decision()
+                return snapshot
 
             def _send_html(self, content: str) -> None:
                 encoded = content.encode("utf-8")
@@ -4503,11 +4674,11 @@ class InteractiveExplorationServer:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run a web playground for inspecting LLM frontier exploration prompts and decisions."
+        description="Run Robot Exploration Mode for autonomous frontier exploration."
     )
     parser.add_argument("--backend", choices=("synthetic", "maniskill", "ros"), default="synthetic")
     parser.add_argument("--repo-root", default=str(Path.home() / "XLeRobot"))
-    parser.add_argument("--session", default="interactive_llm_frontier")
+    parser.add_argument("--session", default="robot_exploration")
     parser.add_argument("--area", default="apartment")
     parser.add_argument("--source", default="operator")
     parser.add_argument("--env-id", default="SceneManipulation-v1")
@@ -4581,7 +4752,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--ros-odom-frame",
         default="odom",
         help=(
-            "Accepted for command compatibility. The interactive playground uses TF from map to base_link; "
+            "Accepted for command compatibility. Robot Exploration Mode uses TF from map to base_link; "
             "set odom in the bridge/Nav2 launch files."
         ),
     )
@@ -4767,10 +4938,10 @@ def main(argv: list[str] | None = None) -> int:
         session = InteractiveNoNav2ExplorationSession(config)
     server = InteractiveExplorationServer(session, host=args.host, port=args.port, ui_flavor=args.ui_flavor)
     print(
-        f"Interactive LLM frontier playground running at {server.url} "
+        f"Robot exploration mode running at {server.url} "
         f"(backend={args.backend}, flavor={args.ui_flavor})"
     )
-    print("Flow: inspect prompt -> Call LLM -> inspect response/target -> Move To Selected Frontier.")
+    print("Flow: automatic LLM decision -> Nav2 path preview when available -> automatic frontier motion.")
     if args.open_browser:
         webbrowser.open(server.url)
     try:
@@ -4789,7 +4960,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             server.serve_forever()
     except KeyboardInterrupt:
-        print("\nShutting down interactive playground.")
+        print("\nShutting down robot exploration mode.")
     finally:
         server.shutdown()
         close = getattr(session, "close", None)
