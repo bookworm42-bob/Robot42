@@ -57,10 +57,29 @@ class RosNav2RouterConfig:
     allow_multiple_action_servers: bool = False
     publish_clock: bool = True
     publish_external_state_tf: bool = True
+    fake_free_map: bool = False
+    fake_map_size_m: float = 2.0
+    fake_map_resolution_m: float = 0.02
 
 
 def serialize_pose(pose: Pose2D | None) -> dict[str, Any] | None:
     return None if pose is None else pose.to_dict()
+
+
+def build_fake_free_map(*, size_m: float, resolution_m: float) -> RosOccupancyMap:
+    if size_m <= 0.0:
+        raise ValueError("fake map size must be positive")
+    if resolution_m <= 0.0:
+        raise ValueError("fake map resolution must be positive")
+    cells = max(1, int(round(size_m / resolution_m)))
+    return RosOccupancyMap(
+        resolution=float(resolution_m),
+        width=cells,
+        height=cells,
+        origin_x=-0.5 * cells * resolution_m,
+        origin_y=-0.5 * cells * resolution_m,
+        data=tuple(0 for _ in range(cells * cells)),
+    )
 
 
 def pose_from_payload(payload: Any) -> Pose2D | None:
@@ -162,7 +181,11 @@ class RosNav2RouterNode(Node):
         self._scan_pub = self.create_publisher(LaserScan, config.scan_topic, 10)
         self._clock_pub = self.create_publisher(Clock, "/clock", 10) if config.publish_clock else None
         self._compute_path_client = ActionClient(self, ComputePathToPose, "compute_path_to_pose")
-        self.latest_map: RosOccupancyMap | None = None
+        self.latest_map: RosOccupancyMap | None = (
+            build_fake_free_map(size_m=config.fake_map_size_m, resolution_m=config.fake_map_resolution_m)
+            if config.fake_free_map
+            else None
+        )
         self.latest_pose: Pose2D = Pose2D(0.0, 0.0, 0.0)
         self.received_external_state = False
         self.latest_scan_observation: dict[str, Any] | None = None
@@ -347,7 +370,7 @@ class RosNav2RouterNode(Node):
         self._clock_pub.publish(msg)
 
     def _publish_transforms(self) -> None:
-        if not self.config.publish_external_state_tf:
+        if not self.config.publish_external_state_tf and not self.config.fake_free_map:
             return
         map_to_odom = TransformStamped()
         map_to_odom.header.stamp = self._ros_now_msg()
@@ -355,6 +378,8 @@ class RosNav2RouterNode(Node):
         map_to_odom.child_frame_id = self.config.odom_frame
         map_to_odom.transform.rotation = quaternion_from_yaw(0.0)
         self.tf_broadcaster.sendTransform(map_to_odom)
+        if not self.config.publish_external_state_tf:
+            return
         odom_to_base = TransformStamped()
         odom_to_base.header.stamp = self._ros_now_msg()
         odom_to_base.header.frame_id = self.config.odom_frame
@@ -611,6 +636,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
         help="Use only for simulator/external-state mode. Real robot mode should leave this disabled.",
     )
+    parser.add_argument(
+        "--fake-free-map",
+        action="store_true",
+        help=(
+            "Publish a small all-free /map and identity map->odom TF from this router. "
+            "Useful for tiny real-robot smoke tests before SLAM is stable."
+        ),
+    )
+    parser.add_argument("--fake-map-size-m", type=float, default=2.0)
+    parser.add_argument("--fake-map-resolution-m", type=float, default=0.02)
     return parser
 
 
@@ -626,6 +661,9 @@ def config_from_args(args: argparse.Namespace) -> RosNav2RouterConfig:
         allow_multiple_action_servers=args.allow_multiple_action_servers,
         publish_clock=args.publish_clock,
         publish_external_state_tf=args.publish_external_state_tf,
+        fake_free_map=args.fake_free_map,
+        fake_map_size_m=args.fake_map_size_m,
+        fake_map_resolution_m=args.fake_map_resolution_m,
     )
 
 

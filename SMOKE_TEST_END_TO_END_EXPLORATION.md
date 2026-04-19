@@ -115,7 +115,19 @@ python -m xlerobot_playground.rgbd_visual_odometry \
   --publish-rate-hz 15
 ```
 
-### Terminal OFF-3: SLAM Toolbox
+### Terminal OFF-3: SLAM Toolbox Or Fake Map
+
+For the current tiny smoke-test experiment, use the fake map path first. Skip SLAM Toolbox and let the Nav2 router publish a small all-free map. This is enough for:
+
+```text
+forward 5cm
+rotate left 5deg
+rotate right 5deg
+```
+
+The fake map only replaces `map -> odom` and `/map`. It still requires RGB-D visual odometry to publish `odom -> base_link`.
+
+Do not run this SLAM Toolbox command for the fake-map smoke test:
 
 ```bash
 cd /home/alin/Robot42
@@ -125,6 +137,8 @@ ros2 launch slam_toolbox online_async_launch.py \
   use_sim_time:=false \
   slam_params_file:=/home/alin/Robot42/artifacts/nav2/xlerobot_slam_toolbox.yaml
 ```
+
+Use SLAM Toolbox later when the real `/scan` and odometry path are stable.
 
 ### Terminal OFF-4: Nav2
 
@@ -138,7 +152,7 @@ ros2 launch nav2_bringup navigation_launch.py \
   params_file:=/home/alin/Robot42/artifacts/nav2/xlerobot_nav2_params.yaml
 ```
 
-### Terminal OFF-5: Nav2 HTTP Router
+### Terminal OFF-5: Nav2 HTTP Router With Fake Map
 
 ```bash
 cd /home/alin/Robot42
@@ -148,7 +162,20 @@ python -m xlerobot_playground.ros_nav2_router \
   --host 0.0.0.0 \
   --port 8891 \
   --no-publish-clock \
-  --no-publish-external-state-tf
+  --no-publish-external-state-tf \
+  --fake-free-map \
+  --fake-map-size-m 2.0 \
+  --fake-map-resolution-m 0.02
+```
+
+This publishes `/map` as a centered free 2m x 2m occupancy grid and publishes identity `map -> odom`. It does not publish fake `odom -> base_link`; RGB-D visual odometry still owns that transform.
+
+Later, when using SLAM Toolbox instead of the fake map, remove these fake-map flags:
+
+```text
+--fake-free-map
+--fake-map-size-m 2.0
+--fake-map-resolution-m 0.02
 ```
 
 ## Verification
