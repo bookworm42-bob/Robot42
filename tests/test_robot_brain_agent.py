@@ -47,6 +47,20 @@ class RobotBrainAgentTests(unittest.TestCase):
         self.assertEqual(config.port2, "/dev/tty.usbmodem5B140332271")
         self.assertFalse(config.allow_motion_commands)
         self.assertEqual(config.port, 8765)
+        self.assertFalse(config.debug_motion)
+        self.assertEqual(config.calibration_prompt_response, "")
+
+    def test_parser_accepts_debug_motion(self) -> None:
+        args = build_parser().parse_args(["--debug-motion"])
+        config = config_from_args(args)
+
+        self.assertTrue(config.debug_motion)
+
+    def test_parser_accepts_interactive_calibration(self) -> None:
+        args = build_parser().parse_args(["--interactive-calibration"])
+        config = config_from_args(args)
+
+        self.assertIsNone(config.calibration_prompt_response)
 
     def test_agent_forwards_velocity_to_runtime(self) -> None:
         runtime = FakeRuntime()

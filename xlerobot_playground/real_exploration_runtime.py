@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import builtins
+from contextlib import contextmanager
 from dataclasses import dataclass
 import math
+from collections.abc import Iterator
 from typing import Any, Sequence
 
 from multido_xlerobot import XLeRobotInterface
@@ -27,6 +30,8 @@ class RealXLeRobotRuntimeConfig:
     allow_motion_commands: bool = False
     max_linear_m_s: float = 0.20
     max_angular_rad_s: float = 0.50
+    debug_motion: bool = False
+    calibration_prompt_response: str | None = ""
 
 
 class RealXLeRobotDirectRuntime:
@@ -57,6 +62,7 @@ class RealXLeRobotDirectRuntime:
     @property
     def robot(self) -> Any:
         if self._robot is None:
+            self._debug("building robot interface")
             interface = XLeRobotInterface(self.config.repo_root)
             if self.config.robot_kind == "xlerobot_2wheels":
                 config_cls, robot_cls = interface.robot_2wheels_classes()
@@ -70,18 +76,33 @@ class RealXLeRobotDirectRuntime:
                     use_degrees=self.config.use_degrees,
                 )
             )
+            self._debug("robot interface built")
         return self._robot
 
     def connect(self) -> None:
         if self._connected:
+            self._debug("connect skipped; already marked connected")
             return
-        self.robot.connect()
+        try:
+            self._debug("connect start")
+            with self._calibration_input_context():
+                self.robot.connect()
+            self._debug("connect ok")
+        except Exception as exc:
+            if "already connected" not in str(exc).lower():
+                self._debug(f"connect failed: {exc}")
+                raise
+            self._debug("connect recovered from already-connected motor bus")
         self._connected = True
 
     def close(self) -> None:
+        if self._robot is None:
+            return
         if not self._connected:
             return
-        self.robot.disconnect()
+        self._debug("disconnect start")
+        self._robot.disconnect()
+        self._debug("disconnect ok")
         self._connected = False
 
     def reset(self) -> None:
@@ -108,7 +129,9 @@ class RealXLeRobotDirectRuntime:
             )
         self.connect()
         action = self._base_velocity_action(linear_m_s=linear_m_s, angular_rad_s=angular_rad_s)
+        self._debug(f"send_action start: {action}")
         sent = self.robot.send_action(action)
+        self._debug(f"send_action ok: {sent}")
         return NavigationResult(
             succeeded=True,
             message="Velocity command sent to real XLeRobot base.",
@@ -118,10 +141,10 @@ class RealXLeRobotDirectRuntime:
     def stop(self) -> NavigationResult:
         if not self._connected:
             return NavigationResult(succeeded=True, message="Robot is not connected; nothing to stop.")
-        if hasattr(self.robot, "stop_base"):
-            self.robot.stop_base()
-            return NavigationResult(succeeded=True, message="Real XLeRobot base stop command sent.")
-        sent = self.robot.send_action(self._base_velocity_action(linear_m_s=0.0, angular_rad_s=0.0))
+        action = self._base_velocity_action(linear_m_s=0.0, angular_rad_s=0.0)
+        self._debug(f"zero stop send_action start: {action}")
+        sent = self.robot.send_action(action)
+        self._debug(f"zero stop send_action ok: {sent}")
         return NavigationResult(
             succeeded=True,
             message="Zero velocity command sent to real XLeRobot base.",
@@ -144,3 +167,27 @@ class RealXLeRobotDirectRuntime:
         if self.config.robot_kind != "xlerobot_2wheels":
             action["y.vel"] = 0.0
         return action
+
+    def _debug(self, message: str) -> None:
+        if self.config.debug_motion:
+            print(f"[real_xlerobot_direct] {message}", flush=True)
+
+    @contextmanager
+    def _calibration_input_context(self) -> Iterator[None]:
+        if self.config.calibration_prompt_response is None:
+            yield
+            return
+        original_input = builtins.input
+
+        def auto_input(prompt: str = "") -> str:
+            if prompt:
+                print(prompt, end="", flush=True)
+            response = self.config.calibration_prompt_response or ""
+            print(response, flush=True)
+            return response
+
+        builtins.input = auto_input
+        try:
+            yield
+        finally:
+            builtins.input = original_input

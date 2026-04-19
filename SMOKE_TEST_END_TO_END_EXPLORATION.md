@@ -8,7 +8,7 @@ Mode B means:
 robot brain asks offload Nav2 router for current pose
 robot brain asks offload Nav2 router for compute_path_to_pose
 robot brain follows the path locally with x.vel/theta.vel
-robot brain validates final pose through RGB-D odometry
+robot brain records final pose through RGB-D odometry
 ```
 
 Replace these placeholders:
@@ -17,6 +17,20 @@ Replace these placeholders:
 ROBOT_BRAIN_IP = robot brain network address
 OFFLOAD_IP = ROS/Nav2 offload computer network address
 ```
+
+Required data flow:
+
+```text
+robot brain Orbbec sidecar writes RGB/depth files
+robot brain agent serves /rgb and /depth over HTTP
+offload real_ros_bridge fetches /rgb and /depth
+offload real_ros_bridge publishes /camera/head/* and /scan
+offload rgbd_visual_odometry consumes /camera/head/*
+offload rgbd_visual_odometry publishes /odom and odom -> base_link
+Nav2 needs /map plus map -> odom -> base_link before planning can succeed
+```
+
+Do not start the moving smoke test until `/camera/head/camera_info`, `/odom`, and `odom -> base_link` work on the offload computer.
 
 ## Robot Brain
 
@@ -88,6 +102,19 @@ This writes:
 
 ### Terminal OFF-1: Real ROS Bridge
 
+This process is required. It is what turns the robot brain HTTP camera files into ROS topics. Without it, `/camera/head/camera_info` will not exist, RGB-D visual odometry cannot run, `/odom` will not exist, and Nav2 will fail with `base_link` to `map` transform errors.
+
+First verify the offload computer can fetch camera data from the robot brain:
+
+```bash
+curl --max-time 3 http://ROBOT_BRAIN_IP:8765/health
+curl --max-time 3 http://ROBOT_BRAIN_IP:8765/rgb --output /tmp/xlerobot_rgb.ppm
+curl --max-time 3 http://ROBOT_BRAIN_IP:8765/depth --output /tmp/xlerobot_depth.pgm
+ls -lh /tmp/xlerobot_rgb.ppm /tmp/xlerobot_depth.pgm
+```
+
+Then start the bridge:
+
 ```bash
 cd /home/alin/Robot42
 source /opt/ros/humble/setup.bash
@@ -101,7 +128,18 @@ python -m xlerobot_playground.real_ros_bridge \
   --camera-yaw-rad 0.0
 ```
 
+In another offload terminal, do not continue until these work:
+
+```bash
+ros2 topic echo /camera/head/camera_info --once
+ros2 topic echo /camera/head/image_raw --once
+ros2 topic echo /camera/head/depth/image_raw --once
+ros2 topic echo /scan --once
+```
+
 ### Terminal OFF-2: RGB-D Visual Odometry
+
+Start this only after the `real_ros_bridge` camera topics above are alive. This process creates `/odom` from RGB-D and publishes `odom -> base_link`.
 
 ```bash
 cd /home/alin/Robot42
@@ -113,6 +151,13 @@ python -m xlerobot_playground.rgbd_visual_odometry \
   --camera-info-topic /camera/head/camera_info \
   --odom-topic /odom \
   --publish-rate-hz 15
+```
+
+In another offload terminal, do not continue until these work:
+
+```bash
+ros2 topic echo /odom --once
+ros2 run tf2_ros tf2_echo odom base_link
 ```
 
 ### Terminal OFF-3: SLAM Toolbox Or Fake Map
@@ -209,9 +254,38 @@ python -m xlerobot_playground.robot_brain_smoke_test \
 
 This checks the offload router, local robot brain agent, and RGB-D odometry pose path without sending wheel commands.
 
-## Run The Smoke Test From Robot Brain
+## Run The Smoke Tests From Robot Brain
 
-### Terminal RB-3: Mode B Smoke Test
+### Terminal RB-3A: Motor Smoke Test
+
+Run this first. It sends timed low-speed commands and verifies that the robot brain command path responds. It does not validate centimeter-level odometry accuracy.
+
+```bash
+cd /home/alin/Robot42
+
+python -m xlerobot_playground.robot_brain_smoke_test \
+  --robot-brain-url http://127.0.0.1:8765 \
+  --motor-smoke-only \
+  --forward-m 0.05 \
+  --turn-deg 5 \
+  --max-linear-m-s 0.03 \
+  --max-angular-rad-s 0.10 \
+  --robot-timeout-s 10 \
+  --step-timeout-s 15
+```
+
+Expected success:
+
+```json
+{
+  "ok": true,
+  "mode": "motor_smoke_only_open_loop"
+}
+```
+
+### Terminal RB-3B: Nav2 Participation Smoke Test
+
+Run this after motor smoke works. This is the main "is Nav2 in the loop?" test: the robot brain asks the offload router/Nav2 for paths, follows them through the real motors, and reports the final pose error. By default, pose accuracy is diagnostic only, so the test can pass even if the real robot overshoots or turns imperfectly on soil.
 
 ```bash
 cd /home/alin/Robot42
@@ -225,8 +299,10 @@ python -m xlerobot_playground.robot_brain_smoke_test \
   --max-angular-rad-s 0.10 \
   --goal-distance-tolerance-m 0.025 \
   --yaw-tolerance-deg 2.5 \
+  --pose-validation-mode diagnostic \
   --max-translation-error-m 0.05 \
   --max-yaw-error-deg 5 \
+  --robot-timeout-s 10 \
   --step-timeout-s 15
 ```
 
@@ -235,7 +311,8 @@ Expected success:
 ```json
 {
   "ok": true,
-  "mode": "robot_brain_follows_nav2_path"
+  "mode": "robot_brain_follows_nav2_path",
+  "pose_validation_mode": "diagnostic"
 }
 ```
 
@@ -245,6 +322,44 @@ The smoke test executes:
 forward 5cm
 rotate left 5deg
 rotate right 5deg
+```
+
+Each result includes:
+
+```text
+path_pose_count
+path_start
+path_end
+reached_goal
+timed_out
+translation_error_m
+yaw_error_deg
+last_cmd_linear_m_s
+last_cmd_angular_rad_s
+```
+
+In `diagnostic` mode, `timed_out: true` or a larger final pose error means "Nav2 was used, but real-world following/odometry needs tuning." It does not mean the robot command path failed.
+
+### Optional: Strict Pose Accuracy Test
+
+Use this later, after odometry and controller behavior look sane. This mode fails if the robot cannot reach the final pose tolerance before timeout.
+
+```bash
+python -m xlerobot_playground.robot_brain_smoke_test \
+  --router-url http://OFFLOAD_IP:8891 \
+  --robot-brain-url http://127.0.0.1:8765 \
+  --forward-m 0.05 \
+  --turn-deg 5 \
+  --max-linear-m-s 0.03 \
+  --max-angular-rad-s 0.10 \
+  --goal-distance-tolerance-m 0.025 \
+  --yaw-tolerance-deg 2.5 \
+  --pose-validation-mode strict \
+  --max-translation-error-m 0.05 \
+  --max-yaw-error-deg 5 \
+  --robot-timeout-s 10 \
+  --step-timeout-s 15 \
+  --debug-progress
 ```
 
 ## What To Watch
