@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -55,10 +56,30 @@ class RosNav2RouterConfig:
     ready_timeout_s: float = 20.0
     allow_multiple_action_servers: bool = False
     publish_clock: bool = True
+    publish_external_state_tf: bool = True
+    fake_free_map: bool = False
+    fake_map_size_m: float = 2.0
+    fake_map_resolution_m: float = 0.02
 
 
 def serialize_pose(pose: Pose2D | None) -> dict[str, Any] | None:
     return None if pose is None else pose.to_dict()
+
+
+def build_fake_free_map(*, size_m: float, resolution_m: float) -> RosOccupancyMap:
+    if size_m <= 0.0:
+        raise ValueError("fake map size must be positive")
+    if resolution_m <= 0.0:
+        raise ValueError("fake map resolution must be positive")
+    cells = max(1, int(round(size_m / resolution_m)))
+    return RosOccupancyMap(
+        resolution=float(resolution_m),
+        width=cells,
+        height=cells,
+        origin_x=-0.5 * cells * resolution_m,
+        origin_y=-0.5 * cells * resolution_m,
+        data=tuple(0 for _ in range(cells * cells)),
+    )
 
 
 def pose_from_payload(payload: Any) -> Pose2D | None:
@@ -160,7 +181,11 @@ class RosNav2RouterNode(Node):
         self._scan_pub = self.create_publisher(LaserScan, config.scan_topic, 10)
         self._clock_pub = self.create_publisher(Clock, "/clock", 10) if config.publish_clock else None
         self._compute_path_client = ActionClient(self, ComputePathToPose, "compute_path_to_pose")
-        self.latest_map: RosOccupancyMap | None = None
+        self.latest_map: RosOccupancyMap | None = (
+            build_fake_free_map(size_m=config.fake_map_size_m, resolution_m=config.fake_map_resolution_m)
+            if config.fake_free_map
+            else None
+        )
         self.latest_pose: Pose2D = Pose2D(0.0, 0.0, 0.0)
         self.received_external_state = False
         self.latest_scan_observation: dict[str, Any] | None = None
@@ -180,6 +205,20 @@ class RosNav2RouterNode(Node):
     def current_pose(self) -> Pose2D:
         return Pose2D(self.latest_pose.x, self.latest_pose.y, self.latest_pose.yaw)
 
+    def current_pose_for_robot(self) -> Pose2D:
+        try:
+            transform = self.tf_buffer.lookup_transform(self.config.odom_frame, self.config.base_frame, RosTime())
+            translation = transform.transform.translation
+            rotation = transform.transform.rotation
+            return Pose2D(
+                float(translation.x),
+                float(translation.y),
+                yaw_from_quaternion_xyzw(rotation.x, rotation.y, rotation.z, rotation.w),
+            )
+        except (LookupException, ConnectivityException, ExtrapolationException):
+            pass
+        return self.current_pose()
+
     def current_pose_in_frame(self, frame_id: str) -> Pose2D | None:
         if frame_id == self.config.map_frame or frame_id == self.config.odom_frame:
             return self.current_pose()
@@ -196,6 +235,14 @@ class RosNav2RouterNode(Node):
             float(translation.y),
             yaw_from_quaternion_xyzw(rotation.x, rotation.y, rotation.z, rotation.w),
         )
+
+    def _spin_future_until_complete(self, future: Any, *, timeout_s: float, label: str) -> None:
+        deadline = time.monotonic() + timeout_s
+        while not future.done():
+            remaining_s = deadline - time.monotonic()
+            if remaining_s <= 0.0:
+                raise RuntimeError(f"Timed out waiting for Nav2 {label} after {timeout_s:.1f}s.")
+            rclpy.spin_once(self, timeout_sec=min(0.05, remaining_s))
 
     def update_state(
         self,
@@ -236,12 +283,16 @@ class RosNav2RouterNode(Node):
                 request.planner_id = planner_id
             request.use_start = False
             future = self._compute_path_client.send_goal_async(request)
-            rclpy.spin_until_future_complete(self, future)
+            self._spin_future_until_complete(future, timeout_s=self.config.server_timeout_s, label="goal response")
             goal_handle = future.result()
             if goal_handle is None or not goal_handle.accepted:
                 raise RuntimeError("Nav2 rejected the ComputePathToPose goal.")
             result_future = goal_handle.get_result_async()
-            rclpy.spin_until_future_complete(self, result_future)
+            self._spin_future_until_complete(
+                result_future,
+                timeout_s=max(self.config.server_timeout_s, 30.0),
+                label="ComputePathToPose result",
+            )
             outcome = result_future.result()
         path = getattr(getattr(outcome, "result", None), "path", None)
         poses: list[Pose2D] = []
@@ -269,6 +320,7 @@ class RosNav2RouterNode(Node):
             "latest_map": serialize_map(self.latest_map) if include_map else None,
             "latest_map_summary": self._map_summary(),
             "latest_pose": serialize_pose(self.latest_pose),
+            "current_pose": serialize_pose(self.current_pose_for_robot()),
             "received_external_state": self.received_external_state,
             "latest_scan": self.latest_scan_stats,
             "latest_image_data_url": self.latest_image_data_url if include_map else None,
@@ -318,12 +370,16 @@ class RosNav2RouterNode(Node):
         self._clock_pub.publish(msg)
 
     def _publish_transforms(self) -> None:
+        if not self.config.publish_external_state_tf and not self.config.fake_free_map:
+            return
         map_to_odom = TransformStamped()
         map_to_odom.header.stamp = self._ros_now_msg()
         map_to_odom.header.frame_id = self.config.map_frame
         map_to_odom.child_frame_id = self.config.odom_frame
         map_to_odom.transform.rotation = quaternion_from_yaw(0.0)
         self.tf_broadcaster.sendTransform(map_to_odom)
+        if not self.config.publish_external_state_tf:
+            return
         odom_to_base = TransformStamped()
         odom_to_base.header.stamp = self._ros_now_msg()
         odom_to_base.header.frame_id = self.config.odom_frame
@@ -475,8 +531,10 @@ class RosNav2RouterServer:
                     self._send_json({"status": "ok"})
                     return
                 if self.path.rstrip("/") == "/api/state":
-                    with outer._lock:
-                        self._send_json(outer.node.snapshot())
+                    self._send_json(outer.node.snapshot())
+                    return
+                if self.path.rstrip("/") == "/api/router/current_pose":
+                    self._send_json({"pose": serialize_pose(outer.node.current_pose_for_robot())})
                     return
                 self.send_error(HTTPStatus.NOT_FOUND)
 
@@ -484,8 +542,8 @@ class RosNav2RouterServer:
                 try:
                     path = self.path.rstrip("/")
                     payload = self._read_json()
-                    with outer._lock:
-                        if path == "/api/router/update_state":
+                    if path == "/api/router/update_state":
+                        with outer._lock:
                             occupancy_map = map_from_payload(payload.get("occupancy_map"))
                             pose = pose_from_payload(payload.get("pose"))
                             if pose is None:
@@ -498,24 +556,27 @@ class RosNav2RouterServer:
                             )
                             self._send_json({"status": "ok", "state": outer.node.snapshot(include_map=False)})
                             return
-                        if path == "/api/router/compute_path":
-                            goal_pose = pose_from_payload(payload.get("goal_pose"))
-                            if goal_pose is None:
-                                raise ValueError("goal_pose is required")
-                            status, path_poses, status_label = outer.node.compute_path(
-                                goal_pose=goal_pose,
-                                planner_id=str(payload.get("planner_id", "")),
-                            )
-                            self._send_json(
-                                {
-                                    "status": status,
-                                    "status_label": status_label,
-                                    "path_poses": [pose.to_dict() for pose in path_poses],
-                                    "state": outer.node.snapshot(include_map=False),
-                                }
-                            )
-                            return
-                    self.send_error(HTTPStatus.NOT_FOUND)
+                    if path in {"/api/router/compute_path", "/api/router/compute_path_to_pose"}:
+                        goal_pose = pose_from_payload(payload.get("goal_pose"))
+                        if goal_pose is None:
+                            raise ValueError("goal_pose is required")
+                        planner_id = str(payload.get("planner_id", ""))
+                    else:
+                        self.send_error(HTTPStatus.NOT_FOUND)
+                        return
+                    status, path_poses, status_label = outer.node.compute_path(
+                        goal_pose=goal_pose,
+                        planner_id=planner_id,
+                    )
+                    self._send_json(
+                        {
+                            "status": status,
+                            "status_label": status_label,
+                            "path_poses": [pose.to_dict() for pose in path_poses],
+                            "state": outer.node.snapshot(include_map=False),
+                        }
+                    )
+                    return
                 except Exception as exc:
                     self._send_json(
                         {
@@ -554,3 +615,70 @@ class RosNav2RouterServer:
         self.node.close()
         if self._owns_rclpy and rclpy.ok():
             rclpy.shutdown()
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="HTTP wrapper around ROS/Nav2 ComputePathToPose for XLeRobot.")
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=8891)
+    parser.add_argument("--map-topic", default="/map")
+    parser.add_argument("--scan-topic", default="/scan")
+    parser.add_argument("--map-frame", default="map")
+    parser.add_argument("--odom-frame", default="odom")
+    parser.add_argument("--base-frame", default="base_link")
+    parser.add_argument("--server-timeout-s", type=float, default=10.0)
+    parser.add_argument("--ready-timeout-s", type=float, default=20.0)
+    parser.add_argument("--allow-multiple-action-servers", action="store_true")
+    parser.add_argument("--publish-clock", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--publish-external-state-tf",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use only for simulator/external-state mode. Real robot mode should leave this disabled.",
+    )
+    parser.add_argument(
+        "--fake-free-map",
+        action="store_true",
+        help=(
+            "Publish a small all-free /map and identity map->odom TF from this router. "
+            "Useful for tiny real-robot smoke tests before SLAM is stable."
+        ),
+    )
+    parser.add_argument("--fake-map-size-m", type=float, default=2.0)
+    parser.add_argument("--fake-map-resolution-m", type=float, default=0.02)
+    return parser
+
+
+def config_from_args(args: argparse.Namespace) -> RosNav2RouterConfig:
+    return RosNav2RouterConfig(
+        map_topic=args.map_topic,
+        scan_topic=args.scan_topic,
+        map_frame=args.map_frame,
+        odom_frame=args.odom_frame,
+        base_frame=args.base_frame,
+        server_timeout_s=args.server_timeout_s,
+        ready_timeout_s=args.ready_timeout_s,
+        allow_multiple_action_servers=args.allow_multiple_action_servers,
+        publish_clock=args.publish_clock,
+        publish_external_state_tf=args.publish_external_state_tf,
+        fake_free_map=args.fake_free_map,
+        fake_map_size_m=args.fake_map_size_m,
+        fake_map_resolution_m=args.fake_map_resolution_m,
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    server = RosNav2RouterServer(config_from_args(args), host=args.host, port=args.port)
+    print(f"ROS Nav2 router ready: http://{server.host}:{server.port}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.shutdown()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
