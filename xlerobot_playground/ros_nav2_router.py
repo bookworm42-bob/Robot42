@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -55,6 +56,7 @@ class RosNav2RouterConfig:
     ready_timeout_s: float = 20.0
     allow_multiple_action_servers: bool = False
     publish_clock: bool = True
+    publish_external_state_tf: bool = True
 
 
 def serialize_pose(pose: Pose2D | None) -> dict[str, Any] | None:
@@ -180,6 +182,20 @@ class RosNav2RouterNode(Node):
     def current_pose(self) -> Pose2D:
         return Pose2D(self.latest_pose.x, self.latest_pose.y, self.latest_pose.yaw)
 
+    def current_pose_for_robot(self) -> Pose2D:
+        try:
+            transform = self.tf_buffer.lookup_transform(self.config.odom_frame, self.config.base_frame, RosTime())
+            translation = transform.transform.translation
+            rotation = transform.transform.rotation
+            return Pose2D(
+                float(translation.x),
+                float(translation.y),
+                yaw_from_quaternion_xyzw(rotation.x, rotation.y, rotation.z, rotation.w),
+            )
+        except (LookupException, ConnectivityException, ExtrapolationException):
+            pass
+        return self.current_pose()
+
     def current_pose_in_frame(self, frame_id: str) -> Pose2D | None:
         if frame_id == self.config.map_frame or frame_id == self.config.odom_frame:
             return self.current_pose()
@@ -269,6 +285,7 @@ class RosNav2RouterNode(Node):
             "latest_map": serialize_map(self.latest_map) if include_map else None,
             "latest_map_summary": self._map_summary(),
             "latest_pose": serialize_pose(self.latest_pose),
+            "current_pose": serialize_pose(self.current_pose_for_robot()),
             "received_external_state": self.received_external_state,
             "latest_scan": self.latest_scan_stats,
             "latest_image_data_url": self.latest_image_data_url if include_map else None,
@@ -318,6 +335,8 @@ class RosNav2RouterNode(Node):
         self._clock_pub.publish(msg)
 
     def _publish_transforms(self) -> None:
+        if not self.config.publish_external_state_tf:
+            return
         map_to_odom = TransformStamped()
         map_to_odom.header.stamp = self._ros_now_msg()
         map_to_odom.header.frame_id = self.config.map_frame
@@ -478,6 +497,10 @@ class RosNav2RouterServer:
                     with outer._lock:
                         self._send_json(outer.node.snapshot())
                     return
+                if self.path.rstrip("/") == "/api/router/current_pose":
+                    with outer._lock:
+                        self._send_json({"pose": serialize_pose(outer.node.current_pose_for_robot())})
+                    return
                 self.send_error(HTTPStatus.NOT_FOUND)
 
             def do_POST(self) -> None:
@@ -498,7 +521,7 @@ class RosNav2RouterServer:
                             )
                             self._send_json({"status": "ok", "state": outer.node.snapshot(include_map=False)})
                             return
-                        if path == "/api/router/compute_path":
+                        if path in {"/api/router/compute_path", "/api/router/compute_path_to_pose"}:
                             goal_pose = pose_from_payload(payload.get("goal_pose"))
                             if goal_pose is None:
                                 raise ValueError("goal_pose is required")
@@ -554,3 +577,57 @@ class RosNav2RouterServer:
         self.node.close()
         if self._owns_rclpy and rclpy.ok():
             rclpy.shutdown()
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="HTTP wrapper around ROS/Nav2 ComputePathToPose for XLeRobot.")
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=8891)
+    parser.add_argument("--map-topic", default="/map")
+    parser.add_argument("--scan-topic", default="/scan")
+    parser.add_argument("--map-frame", default="map")
+    parser.add_argument("--odom-frame", default="odom")
+    parser.add_argument("--base-frame", default="base_link")
+    parser.add_argument("--server-timeout-s", type=float, default=10.0)
+    parser.add_argument("--ready-timeout-s", type=float, default=20.0)
+    parser.add_argument("--allow-multiple-action-servers", action="store_true")
+    parser.add_argument("--publish-clock", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--publish-external-state-tf",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use only for simulator/external-state mode. Real robot mode should leave this disabled.",
+    )
+    return parser
+
+
+def config_from_args(args: argparse.Namespace) -> RosNav2RouterConfig:
+    return RosNav2RouterConfig(
+        map_topic=args.map_topic,
+        scan_topic=args.scan_topic,
+        map_frame=args.map_frame,
+        odom_frame=args.odom_frame,
+        base_frame=args.base_frame,
+        server_timeout_s=args.server_timeout_s,
+        ready_timeout_s=args.ready_timeout_s,
+        allow_multiple_action_servers=args.allow_multiple_action_servers,
+        publish_clock=args.publish_clock,
+        publish_external_state_tf=args.publish_external_state_tf,
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    server = RosNav2RouterServer(config_from_args(args), host=args.host, port=args.port)
+    print(f"ROS Nav2 router ready: http://{server.host}:{server.port}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.shutdown()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,5 +1,6 @@
 #include <libobsensor/ObSensor.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -23,6 +24,7 @@ struct Options {
     int fps = 30;
     int log_every = 1;
     bool latest_only = false;
+    bool enable_depth = false;
 };
 
 int parse_int(const std::string &value, const std::string &name) {
@@ -77,11 +79,14 @@ Options parse_args(int argc, char **argv) {
         else if(arg == "--latest-only") {
             options.latest_only = true;
         }
+        else if(arg == "--enable-depth") {
+            options.enable_depth = true;
+        }
         else if(arg == "--help" || arg == "-h") {
             std::cout << "Usage: orbbec_rgb_test [--output-dir DIR] [--frames N]\n"
                       << "                       [--warmup-frames N] [--timeout-ms MS]\n"
                       << "                       [--width PX] [--height PX] [--fps FPS]\n"
-                      << "                       [--log-every N] [--latest-only]\n";
+                      << "                       [--log-every N] [--latest-only] [--enable-depth]\n";
             std::exit(EXIT_SUCCESS);
         }
         else {
@@ -153,9 +158,43 @@ void write_ppm_atomic(const fs::path &path, const std::shared_ptr<ob::ColorFrame
     fs::rename(tmp_path, path);
 }
 
+void write_depth_pgm_mm(const fs::path &path, const std::shared_ptr<ob::DepthFrame> &depth_frame) {
+    const auto width = depth_frame->getWidth();
+    const auto height = depth_frame->getHeight();
+    const auto pixel_count = static_cast<uint64_t>(width) * static_cast<uint64_t>(height);
+    const auto expected_size = pixel_count * sizeof(uint16_t);
+    if(depth_frame->getDataSize() < expected_size) {
+        throw std::runtime_error("Depth frame data is smaller than width * height * uint16");
+    }
+
+    const auto *raw = reinterpret_cast<const uint16_t *>(depth_frame->getData());
+    const float scale_to_mm = depth_frame->getValueScale();
+    std::ofstream out(path, std::ios::binary);
+    if(!out) {
+        throw std::runtime_error("Could not open output file: " + path.string());
+    }
+    out << "P5\n" << width << " " << height << "\n65535\n";
+    for(uint64_t index = 0; index < pixel_count; ++index) {
+        const float scaled = static_cast<float>(raw[index]) * scale_to_mm;
+        const auto clamped = static_cast<uint16_t>(std::max(0.0f, std::min(65535.0f, scaled)));
+        const char bytes[2] = {
+            static_cast<char>((clamped >> 8) & 0xff),
+            static_cast<char>(clamped & 0xff),
+        };
+        out.write(bytes, 2);
+    }
+}
+
+void write_depth_pgm_atomic(const fs::path &path, const std::shared_ptr<ob::DepthFrame> &depth_frame) {
+    const auto tmp_path = path.string() + ".tmp";
+    write_depth_pgm_mm(tmp_path, depth_frame);
+    fs::rename(tmp_path, path);
+}
+
 void write_latest_metadata(
     const fs::path &path,
     const std::shared_ptr<ob::ColorFrame> &frame,
+    const std::shared_ptr<ob::DepthFrame> &depth_frame,
     int captured_frames,
     const std::string &source_format
 ) {
@@ -173,7 +212,19 @@ void write_latest_metadata(
         << "  \"frame_index\": " << frame->getIndex() << ",\n"
         << "  \"device_timestamp_us\": " << frame->getTimeStampUs() << ",\n"
         << "  \"system_timestamp_us\": " << frame->getSystemTimeStampUs() << ",\n"
-        << "  \"latest_frame\": \"latest.ppm\"\n"
+        << "  \"latest_frame\": \"latest.ppm\"";
+    if(depth_frame) {
+        out << ",\n"
+            << "  \"depth_width\": " << depth_frame->getWidth() << ",\n"
+            << "  \"depth_height\": " << depth_frame->getHeight() << ",\n"
+            << "  \"depth_format\": \"PGM_U16_MM\",\n"
+            << "  \"depth_value_scale\": " << depth_frame->getValueScale() << ",\n"
+            << "  \"latest_depth_frame\": \"latest_depth.pgm\"\n";
+    }
+    else {
+        out << "\n";
+    }
+    out
         << "}\n";
     out.close();
     fs::rename(tmp_path, path);
@@ -192,6 +243,15 @@ int main(int argc, char **argv) try {
         static_cast<uint32_t>(options.fps),
         OB_FORMAT_ANY
     );
+    if(options.enable_depth) {
+        config->enableVideoStream(
+            OB_STREAM_DEPTH,
+            static_cast<uint32_t>(options.width),
+            static_cast<uint32_t>(options.height),
+            static_cast<uint32_t>(options.fps),
+            OB_FORMAT_Y16
+        );
+    }
 
     auto device = pipeline.getDevice();
     auto info = device->getDeviceInfo();
@@ -219,6 +279,14 @@ int main(int argc, char **argv) try {
         if(!frame) {
             continue;
         }
+        std::shared_ptr<ob::DepthFrame> depth_frame = nullptr;
+        if(options.enable_depth) {
+            auto depth = frame_set->getFrame(OB_FRAME_DEPTH);
+            if(!depth) {
+                continue;
+            }
+            depth_frame = depth->as<ob::DepthFrame>();
+        }
 
         auto color_frame = frame->as<ob::ColorFrame>();
         const std::string source_format = format_name(color_frame->getFormat());
@@ -231,13 +299,27 @@ int main(int argc, char **argv) try {
             write_ppm_atomic(numbered_path, rgb_frame);
         }
         write_ppm_atomic(latest_path, rgb_frame);
-        write_latest_metadata(options.output_dir / "latest.json", rgb_frame, captured, source_format);
+        if(depth_frame) {
+            const auto latest_depth_path = options.output_dir / "latest_depth.pgm";
+            if(!options.latest_only) {
+                const auto numbered_depth_path =
+                    options.output_dir / ("frame_" + std::to_string(captured) + "_depth.pgm");
+                write_depth_pgm_atomic(numbered_depth_path, depth_frame);
+            }
+            write_depth_pgm_atomic(latest_depth_path, depth_frame);
+        }
+        write_latest_metadata(options.output_dir / "latest.json", rgb_frame, depth_frame, captured, source_format);
 
         if(options.log_every > 0 && captured % options.log_every == 0) {
             std::cout << "Captured RGB frame " << captured
                       << " " << rgb_frame->getWidth() << "x" << rgb_frame->getHeight()
                       << " source=" << source_format
-                      << " saved=" << latest_path << "\n";
+                      << " saved=" << latest_path;
+            if(depth_frame) {
+                std::cout << " depth=" << depth_frame->getWidth() << "x" << depth_frame->getHeight()
+                          << " saved=" << (options.output_dir / "latest_depth.pgm");
+            }
+            std::cout << "\n";
         }
     }
 

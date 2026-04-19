@@ -279,6 +279,7 @@ class InteractiveRosNav2ExplorationSession(RosExplorationSession):
                 "pending_trace": self.pending_trace,
                 "pending_target": None,
                 "applied_memory_updates": list(self.applied_memory_updates),
+                "capabilities": {"web_manual_control": False},
                 "last_error": self.last_error,
                 "map": {
                     "map_id": self.config.session,
@@ -614,6 +615,7 @@ class InteractiveNoNav2ExplorationSession:
                 "pending_trace": self.pending_trace,
                 "pending_target": self._pending_target(),
                 "applied_memory_updates": list(self.applied_memory_updates),
+                "capabilities": {"web_manual_control": False},
                 "last_error": self.last_error,
                 "map": self._build_map_payload(),
             }
@@ -816,6 +818,21 @@ class InteractiveNoNav2ExplorationSession:
 
     def control_robot(self) -> dict[str, Any]:
         return self.pause()
+
+    def manual_drive(self, payload: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            self.last_error = "Manual drive is only available for robot-backed exploration sessions."
+            return self.snapshot()
+
+    def manual_stop(self) -> dict[str, Any]:
+        with self._lock:
+            self.last_error = "Manual stop is only available for robot-backed exploration sessions."
+            return self.snapshot()
+
+    def manual_scan(self) -> dict[str, Any]:
+        with self._lock:
+            self.last_error = "Manual scan is only available for robot-backed exploration sessions."
+            return self.snapshot()
 
     def resume(self) -> dict[str, Any]:
         with self._lock:
@@ -1385,6 +1402,7 @@ class ManiSkillTeleportExplorationSession:
                 "pending_trace": self.pending_trace,
                 "pending_target": self._pending_target(),
                 "applied_memory_updates": list(self.applied_memory_updates),
+                "capabilities": {"web_manual_control": False},
                 "last_error": self.last_error,
                 "map": self._build_map_payload(),
             }
@@ -2148,6 +2166,18 @@ class ManiSkillTeleportExplorationSession:
         )
         self._stop_robot_action()
         return self.snapshot()
+
+    def _stop_robot_action(self) -> None:
+        action = getattr(self, "action", None)
+        if action is None:
+            return
+        try:
+            action[...] = 0.0
+        except Exception:
+            try:
+                self.action = np.zeros_like(action)
+            except Exception:
+                pass
 
     def resume(self) -> dict[str, Any]:
         with self._lock:
@@ -4470,6 +4500,7 @@ INTERACTIVE_HTML = """<!doctype html>
     document.getElementById('call').onclick = () => post('/api/call_llm');
     document.getElementById('call-semantic').onclick = () => post('/api/call_semantic_llm');
     document.getElementById('apply').onclick = () => post('/api/apply_decision');
+    document.getElementById('control-robot').onclick = () => post('/api/control_robot');
     document.getElementById('edit-block').onclick = () => { mapEditMode = 'block'; renderStats(); };
     document.getElementById('edit-clear').onclick = () => { mapEditMode = 'clear'; renderStats(); };
     document.getElementById('edit-reset').onclick = () => { mapEditMode = 'reset'; renderStats(); };
@@ -4564,6 +4595,30 @@ class InteractiveExplorationServer:
                         self._send_json(controller())
                     else:
                         self._send_json(session.pause())
+                    return
+                if self.path == "/api/manual_drive":
+                    controller = getattr(session, "manual_drive", None)
+                    if callable(controller):
+                        self._send_json(controller(self._read_json()))
+                    else:
+                        setattr(session, "last_error", "Manual drive is not available in this exploration mode.")
+                        self._send_json(session.snapshot())
+                    return
+                if self.path == "/api/manual_stop":
+                    controller = getattr(session, "manual_stop", None)
+                    if callable(controller):
+                        self._send_json(controller())
+                    else:
+                        setattr(session, "last_error", "Manual stop is not available in this exploration mode.")
+                        self._send_json(session.snapshot())
+                    return
+                if self.path == "/api/manual_scan":
+                    controller = getattr(session, "manual_scan", None)
+                    if callable(controller):
+                        self._send_json(controller())
+                    else:
+                        setattr(session, "last_error", "Manual scan is not available in this exploration mode.")
+                        self._send_json(session.snapshot())
                     return
                 if self.path == "/api/auto_explore":
                     self._send_json(self._auto_explore_step())

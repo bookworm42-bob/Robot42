@@ -1,0 +1,4 @@
+To Do Next Day:
+- The OpenCV Camera was awful, it was really slow, not updating properly.
+- Wrap up exploration mode and test it with real robot, let's see what it does in real life.
+- Create the first version of Agent Robot42 in which we incorporate exploration mode and prove it works properly.

@@ -574,6 +574,8 @@ INTERACTIVE_REACT_HTML = """<!doctype html>
       const lastError = state?.last_error || uiMessage || '';
       const map = state?.map || {};
       const hasStarted = state?.status && state.status !== 'not_started';
+      const canWebManualControl = !!state?.capabilities?.web_manual_control;
+      const manualDrive = (direction) => post('/api/manual_drive', {direction});
 
       return e('div', {className: 'shell'},
         e('header', null,
@@ -591,6 +593,14 @@ INTERACTIVE_REACT_HTML = """<!doctype html>
                 e('button', {className: 'secondary', onClick: () => post('/api/resume')}, 'Resume'),
                 e('button', {className: 'primary', onClick: () => post('/api/control_robot')}, 'Control Robot')
               ),
+              canWebManualControl ? e('div', {className: 'buttons', style: {marginTop: 10}},
+                e('button', {className: 'secondary', onClick: () => manualDrive('forward')}, 'Forward'),
+                e('button', {className: 'secondary', onClick: () => manualDrive('left')}, 'Left'),
+                e('button', {className: 'secondary', onClick: () => manualDrive('right')}, 'Right'),
+                e('button', {className: 'secondary', onClick: () => manualDrive('back')}, 'Back'),
+                e('button', {className: 'danger', onClick: () => post('/api/manual_stop')}, 'Stop'),
+                e('button', {className: 'primary', onClick: () => post('/api/manual_scan')}, 'Scan 360')
+              ) : null,
               e('div', {className: 'buttons', style: {marginTop: 10}},
                 e('button', {className: 'secondary', onClick: () => setShowMapEditing((value) => {
                   if (value) setMapEditMode('none');
