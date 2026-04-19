@@ -7,7 +7,7 @@ import math
 from pathlib import Path
 import time
 from typing import Any, Protocol, Sequence
-from urllib import request
+from urllib import error, request
 from urllib.parse import urljoin
 
 from multido_xlerobot.bootstrap import resolve_xlerobot_repo_root
@@ -399,6 +399,7 @@ class RealXLeRobotRosBridge(Node):
         self._yaw = 0.0
         self._last_linear = 0.0
         self._last_angular = 0.0
+        self._last_motion_error = ""
 
         self.create_subscription(Twist, config.cmd_vel_topic, self._on_cmd_vel, 10)
         self.odom_publisher = None
@@ -437,22 +438,34 @@ class RealXLeRobotRosBridge(Node):
         dt = max(0.0, now - self._last_step_stamp)
         self._last_step_stamp = now
         linear, angular = self._active_velocity()
-        self._drive_or_stop(linear=linear, angular=angular)
-        self._integrate_commanded_odom(linear=linear, angular=angular, dt=dt)
+        motion_sent = self._drive_or_stop(linear=linear, angular=angular)
+        if motion_sent:
+            self._integrate_commanded_odom(linear=linear, angular=angular, dt=dt)
         frame = self.rgbd_source.capture()
         stamp = self.get_clock().now().to_msg()
         self._publish_transforms(stamp=stamp, linear=linear, angular=angular)
         self._publish_scan(frame=frame, stamp=stamp)
         self._publish_head_images(frame=frame, stamp=stamp)
 
-    def _drive_or_stop(self, *, linear: float, angular: float) -> None:
-        if abs(linear) <= 1e-6 and abs(angular) <= 1e-6:
-            if abs(self._last_linear) > 1e-6 or abs(self._last_angular) > 1e-6:
-                self.runtime.stop()
-        else:
-            self.runtime.drive_velocity(linear_m_s=linear, angular_rad_s=angular)
+    def _drive_or_stop(self, *, linear: float, angular: float) -> bool:
+        try:
+            if abs(linear) <= 1e-6 and abs(angular) <= 1e-6:
+                if abs(self._last_linear) > 1e-6 or abs(self._last_angular) > 1e-6:
+                    self.runtime.stop()
+            else:
+                self.runtime.drive_velocity(linear_m_s=linear, angular_rad_s=angular)
+        except Exception as exc:
+            message = _format_runtime_error(exc)
+            if message != self._last_motion_error:
+                self.get_logger().error(f"Motion command failed: {message}")
+                self._last_motion_error = message
+            self._last_linear = 0.0
+            self._last_angular = 0.0
+            return False
+        self._last_motion_error = ""
         self._last_linear = linear
         self._last_angular = angular
+        return True
 
     def _integrate_commanded_odom(self, *, linear: float, angular: float, dt: float) -> None:
         if dt <= 0.0:
@@ -577,8 +590,12 @@ class RealXLeRobotRosBridge(Node):
 
     def close(self) -> None:
         try:
-            self.runtime.stop()
-            self.runtime.close()
+            try:
+                self.runtime.stop()
+            except Exception as exc:
+                self.get_logger().warning(f"Failed to send stop during bridge shutdown: {_format_runtime_error(exc)}")
+            finally:
+                self.runtime.close()
         finally:
             self.destroy_node()
 
@@ -605,6 +622,19 @@ def _build_camera_info(*, frame_id: str, width: int, height: int, horizontal_fov
     msg.k = [fx, 0.0, cx, 0.0, fy, cy, 0.0, 0.0, 1.0]
     msg.p = [fx, 0.0, cx, 0.0, 0.0, fy, cy, 0.0, 0.0, 0.0, 1.0, 0.0]
     return msg
+
+
+def _format_runtime_error(exc: Exception) -> str:
+    if isinstance(exc, error.HTTPError):
+        detail = str(exc.reason)
+        try:
+            body = exc.read().decode("utf-8", errors="replace").strip()
+        except Exception:
+            body = ""
+        if body:
+            detail = body
+        return f"HTTP {exc.code}: {detail}"
+    return str(exc)
 
 
 def _angle_wrap(angle_rad: float) -> float:

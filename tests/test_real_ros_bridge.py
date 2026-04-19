@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from io import BytesIO
 from pathlib import Path
 import tempfile
 import unittest
+from urllib.error import HTTPError
 
 from xlerobot_playground.real_ros_bridge import (
     OrbbecFilesystemConfig,
@@ -10,6 +12,7 @@ from xlerobot_playground.real_ros_bridge import (
     RobotBrainRgbdSource,
     build_parser,
     config_from_args,
+    _format_runtime_error,
     parse_depth_pgm_mm,
     parse_rgb_ppm,
     read_depth_pgm_mm,
@@ -78,6 +81,17 @@ class RealRosBridgeTests(unittest.TestCase):
         config = config_from_args(args)
 
         self.assertEqual(config.robot_brain_url, "http://robot-brain.local:8765")
+
+    def test_runtime_error_formatter_includes_robot_brain_http_body(self) -> None:
+        exc = HTTPError(
+            url="http://robot-brain.local:8765/cmd_vel",
+            code=500,
+            msg="Internal Server Error",
+            hdrs={},
+            fp=BytesIO(b"(6, 'Device not configured')"),
+        )
+
+        self.assertEqual(_format_runtime_error(exc), "HTTP 500: (6, 'Device not configured')")
 
     def test_twist_to_base_velocity_uses_forward_and_yaw_only(self) -> None:
         self.assertEqual(twist_to_base_velocity(_Twist()), (0.04, 0.12))

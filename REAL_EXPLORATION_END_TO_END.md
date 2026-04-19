@@ -111,9 +111,10 @@ Run these on the ROS/Nav2 offload computer. Keep terminals OC-1, OC-2, OC-4, and
 ```bash
 cd /home/alin/Robot42
 source /opt/ros/humble/setup.bash
+source /home/alin/Robot42/.venv-maniskill/bin/activate
 
 python -m xlerobot_playground.real_ros_bridge \
-  --robot-brain-url http://ROBOT_BRAIN_IP:8765 \
+  --robot-brain-url http://192.168.1.133:8765 \
   --publish-rate-hz 10 \
   --cmd-vel-timeout-s 0.5 \
   --max-linear-m-s 0.03 \
@@ -139,6 +140,7 @@ curl http://ROBOT_BRAIN_IP:8765/health
 ```bash
 cd /home/alin/Robot42
 source /opt/ros/humble/setup.bash
+source /home/alin/Robot42/.venv-maniskill/bin/activate
 
 python -m xlerobot_playground.rgbd_visual_odometry \
   --rgb-topic /camera/head/image_raw \
@@ -162,6 +164,7 @@ Generate the conservative Nav2 params once:
 ```bash
 cd /home/alin/Robot42
 source /opt/ros/humble/setup.bash
+source /home/alin/Robot42/.venv-maniskill/bin/activate
 
 python -m xlerobot_playground.real_nav2_config \
   --base-nav2-params /opt/ros/humble/share/nav2_bringup/params/nav2_params.yaml \
@@ -182,6 +185,7 @@ python -m xlerobot_playground.real_nav2_config \
 ```bash
 cd /home/alin/Robot42
 source /opt/ros/humble/setup.bash
+source /home/alin/Robot42/.venv-maniskill/bin/activate
 
 ros2 launch nav2_bringup navigation_launch.py \
   use_sim_time:=false \
@@ -204,6 +208,7 @@ Start with heuristic policy first. This tests mapping, frontiers, path previews,
 ```bash
 cd /home/alin/Robot42
 source /opt/ros/humble/setup.bash
+source /home/alin/Robot42/.venv-maniskill/bin/activate
 
 python -m xlerobot_playground.real_agentic_exploration \
   --persist-path /home/alin/Robot42/artifacts/real_xlerobot_exploration_map.json \

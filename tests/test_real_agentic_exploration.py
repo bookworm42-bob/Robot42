@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
+from xlerobot_agent.exploration import ExplorationBackend, ExplorationBackendConfig
 from xlerobot_playground.real_agentic_exploration import build_parser, translated_args
+from xlerobot_playground.sim_exploration_backend import RosExplorationSession, SimExplorationConfig
 
 
 class RealAgenticExplorationTests(unittest.TestCase):
@@ -44,6 +47,32 @@ class RealAgenticExplorationTests(unittest.TestCase):
         self.assertIn("--no-serve-review-ui", translated)
         self.assertEqual(translated[translated.index("--review-host") + 1], "127.0.0.1")
         self.assertEqual(translated[translated.index("--review-port") + 1], "8899")
+
+    def test_ros_session_initializes_scan_fusion_state_before_first_scan(self) -> None:
+        class FakeRuntime:
+            latest_map = None
+
+            def scan_observation_count(self) -> int:
+                return 3
+
+        config = SimExplorationConfig(
+            repo_root=".",
+            persist_path="/tmp/robot42-test-map.json",
+            ros_adapter_url="http://127.0.0.1:8891",
+        )
+        backend = ExplorationBackend(ExplorationBackendConfig(mode="sim"))
+
+        with patch(
+            "xlerobot_playground.sim_exploration_backend.RemoteRosExplorationRuntime",
+            return_value=FakeRuntime(),
+        ):
+            session = RosExplorationSession(config, backend, "task_1")
+
+        self.assertEqual(session.scan_known_cells, {})
+        self.assertEqual(session.scan_occupancy_evidence, {})
+        self.assertEqual(session.scan_range_edge_cells, set())
+        self.assertEqual(session.scan_map_resolution, config.occupancy_resolution)
+        self.assertEqual(session.scan_observation_index, 3)
 
 
 if __name__ == "__main__":

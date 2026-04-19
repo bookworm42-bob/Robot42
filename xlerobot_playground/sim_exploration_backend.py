@@ -2897,13 +2897,20 @@ class RosExplorationSession:
                     publish_internal_navigation_map=config.ros_navigation_map_source == "fused_scan",
                 )
             )
+        self.scan_known_cells: dict[GridCell, str] = {}
+        self.scan_occupancy_evidence: dict[GridCell, float] = {}
+        self.scan_range_edge_cells: set[GridCell] = set()
+        if self.runtime.latest_map is not None:
+            self.scan_map_resolution = float(self.runtime.latest_map.resolution)
+        else:
+            self.scan_map_resolution = config.occupancy_resolution
+        self.scan_observation_index = self.runtime.scan_observation_count()
         self.nav2 = RosNav2NavigationModule(
             config,
             self.runtime,
             current_map=self._current_effective_map,
             should_cancel=self._pause_requested_or_canceled,
         )
-        self.scan_observation_index = self.runtime.scan_observation_count()
 
     def close(self) -> None:
         try:
