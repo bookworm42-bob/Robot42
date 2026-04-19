@@ -22,6 +22,9 @@ struct Options {
     int width = 640;
     int height = 480;
     int fps = 30;
+    int depth_width = 0;
+    int depth_height = 0;
+    int depth_fps = 0;
     int log_every = 1;
     bool latest_only = false;
     bool enable_depth = false;
@@ -73,6 +76,15 @@ Options parse_args(int argc, char **argv) {
         else if(arg == "--fps") {
             options.fps = parse_int(require_value(arg), arg);
         }
+        else if(arg == "--depth-width") {
+            options.depth_width = parse_int(require_value(arg), arg);
+        }
+        else if(arg == "--depth-height") {
+            options.depth_height = parse_int(require_value(arg), arg);
+        }
+        else if(arg == "--depth-fps") {
+            options.depth_fps = parse_int(require_value(arg), arg);
+        }
         else if(arg == "--log-every") {
             options.log_every = parse_int(require_value(arg), arg);
         }
@@ -86,6 +98,7 @@ Options parse_args(int argc, char **argv) {
             std::cout << "Usage: orbbec_rgb_test [--output-dir DIR] [--frames N]\n"
                       << "                       [--warmup-frames N] [--timeout-ms MS]\n"
                       << "                       [--width PX] [--height PX] [--fps FPS]\n"
+                      << "                       [--depth-width PX] [--depth-height PX] [--depth-fps FPS]\n"
                       << "                       [--log-every N] [--latest-only] [--enable-depth]\n";
             std::exit(EXIT_SUCCESS);
         }
@@ -99,6 +112,9 @@ Options parse_args(int argc, char **argv) {
     }
     if(options.width < 1 || options.height < 1 || options.fps < 1) {
         throw std::runtime_error("--width, --height, and --fps must be positive");
+    }
+    if(options.depth_width < 0 || options.depth_height < 0 || options.depth_fps < 0) {
+        throw std::runtime_error("--depth-width, --depth-height, and --depth-fps must be zero/auto or positive");
     }
     if(options.log_every < 0) {
         throw std::runtime_error("--log-every must be 0 or positive");
@@ -244,11 +260,14 @@ int main(int argc, char **argv) try {
         OB_FORMAT_ANY
     );
     if(options.enable_depth) {
+        const uint32_t depth_width = options.depth_width > 0 ? static_cast<uint32_t>(options.depth_width) : OB_WIDTH_ANY;
+        const uint32_t depth_height = options.depth_height > 0 ? static_cast<uint32_t>(options.depth_height) : OB_HEIGHT_ANY;
+        const uint32_t depth_fps = options.depth_fps > 0 ? static_cast<uint32_t>(options.depth_fps) : OB_FPS_ANY;
         config->enableVideoStream(
             OB_STREAM_DEPTH,
-            static_cast<uint32_t>(options.width),
-            static_cast<uint32_t>(options.height),
-            static_cast<uint32_t>(options.fps),
+            depth_width,
+            depth_height,
+            depth_fps,
             OB_FORMAT_Y16
         );
     }
@@ -258,6 +277,15 @@ int main(int argc, char **argv) try {
     std::cout << "Orbbec device: " << info->getName()
               << " pid=0x" << std::hex << info->getPid() << std::dec
               << " sn=" << info->getSerialNumber() << "\n";
+    if(options.enable_depth) {
+        std::cout << "Depth stream requested: "
+                  << (options.depth_width > 0 ? std::to_string(options.depth_width) : "any")
+                  << "x"
+                  << (options.depth_height > 0 ? std::to_string(options.depth_height) : "any")
+                  << "@"
+                  << (options.depth_fps > 0 ? std::to_string(options.depth_fps) : "any")
+                  << " Y16\n";
+    }
 
     auto converter = std::make_shared<ob::FormatConvertFilter>();
     pipeline.start(config);

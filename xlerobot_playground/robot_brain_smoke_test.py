@@ -4,8 +4,10 @@ import argparse
 from dataclasses import dataclass
 import json
 import math
+import socket
 import time
 from typing import Any
+from urllib import error
 from urllib import request
 from urllib.parse import urljoin
 
@@ -53,21 +55,43 @@ def yaw_error_rad(actual: Pose2D, goal: Pose2D) -> float:
     return abs(angle_wrap(actual.yaw - goal.yaw))
 
 
+class HttpRequestError(RuntimeError):
+    pass
+
+
 def get_json(base_url: str, path: str, *, timeout_s: float = 2.0) -> dict[str, Any]:
-    with request.urlopen(urljoin(base_url.rstrip("/") + "/", path.lstrip("/")), timeout=timeout_s) as response:
-        return json.loads(response.read().decode("utf-8"))
+    url = urljoin(base_url.rstrip("/") + "/", path.lstrip("/"))
+    try:
+        with request.urlopen(url, timeout=timeout_s) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except socket.timeout as exc:
+        raise HttpRequestError(f"GET {url} timed out after {timeout_s:.1f}s") from exc
+    except error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise HttpRequestError(f"GET {url} failed with HTTP {exc.code}: {body}") from exc
+    except error.URLError as exc:
+        raise HttpRequestError(f"GET {url} failed: {exc.reason}") from exc
 
 
 def post_json(base_url: str, path: str, payload: dict[str, Any], *, timeout_s: float) -> dict[str, Any]:
     body = json.dumps(payload).encode("utf-8")
+    url = urljoin(base_url.rstrip("/") + "/", path.lstrip("/"))
     req = request.Request(
-        urljoin(base_url.rstrip("/") + "/", path.lstrip("/")),
+        url,
         data=body,
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with request.urlopen(req, timeout=timeout_s) as response:
-        return json.loads(response.read().decode("utf-8"))
+    try:
+        with request.urlopen(req, timeout=timeout_s) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except socket.timeout as exc:
+        raise HttpRequestError(f"POST {url} timed out after {timeout_s:.1f}s") from exc
+    except error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise HttpRequestError(f"POST {url} failed with HTTP {exc.code}: {body}") from exc
+    except error.URLError as exc:
+        raise HttpRequestError(f"POST {url} failed: {exc.reason}") from exc
 
 
 class RouterClient:
@@ -200,6 +224,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--step-timeout-s", type=float, default=15.0)
     parser.add_argument("--publish-hz", type=float, default=10.0)
     parser.add_argument("--timeout-s", type=float, default=10.0)
+    parser.add_argument(
+        "--preflight-only",
+        action="store_true",
+        help="Check router, robot brain, and current pose connectivity without moving the robot.",
+    )
     return parser
 
 
@@ -219,6 +248,17 @@ def run_smoke_test(args: argparse.Namespace) -> dict[str, Any]:
     robot_health = robot.health()
     if not robot_health.get("motion_enabled", False):
         raise RuntimeError("robot_brain_agent reports motion_enabled=false. Restart it with --allow-motion-commands.")
+    current_pose = router.current_pose()
+
+    if args.preflight_only:
+        return {
+            "ok": True,
+            "mode": "robot_brain_follows_nav2_path",
+            "preflight_only": True,
+            "router_health": router_health,
+            "robot_brain_health": robot_health,
+            "current_pose": current_pose.to_dict(),
+        }
 
     results: list[dict[str, Any]] = []
     yaw_tolerance_rad = math.radians(args.yaw_tolerance_deg)

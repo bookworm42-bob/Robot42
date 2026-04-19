@@ -213,6 +213,14 @@ class RosNav2RouterNode(Node):
             yaw_from_quaternion_xyzw(rotation.x, rotation.y, rotation.z, rotation.w),
         )
 
+    def _spin_future_until_complete(self, future: Any, *, timeout_s: float, label: str) -> None:
+        deadline = time.monotonic() + timeout_s
+        while not future.done():
+            remaining_s = deadline - time.monotonic()
+            if remaining_s <= 0.0:
+                raise RuntimeError(f"Timed out waiting for Nav2 {label} after {timeout_s:.1f}s.")
+            rclpy.spin_once(self, timeout_sec=min(0.05, remaining_s))
+
     def update_state(
         self,
         *,
@@ -252,12 +260,16 @@ class RosNav2RouterNode(Node):
                 request.planner_id = planner_id
             request.use_start = False
             future = self._compute_path_client.send_goal_async(request)
-            rclpy.spin_until_future_complete(self, future)
+            self._spin_future_until_complete(future, timeout_s=self.config.server_timeout_s, label="goal response")
             goal_handle = future.result()
             if goal_handle is None or not goal_handle.accepted:
                 raise RuntimeError("Nav2 rejected the ComputePathToPose goal.")
             result_future = goal_handle.get_result_async()
-            rclpy.spin_until_future_complete(self, result_future)
+            self._spin_future_until_complete(
+                result_future,
+                timeout_s=max(self.config.server_timeout_s, 30.0),
+                label="ComputePathToPose result",
+            )
             outcome = result_future.result()
         path = getattr(getattr(outcome, "result", None), "path", None)
         poses: list[Pose2D] = []
@@ -494,12 +506,10 @@ class RosNav2RouterServer:
                     self._send_json({"status": "ok"})
                     return
                 if self.path.rstrip("/") == "/api/state":
-                    with outer._lock:
-                        self._send_json(outer.node.snapshot())
+                    self._send_json(outer.node.snapshot())
                     return
                 if self.path.rstrip("/") == "/api/router/current_pose":
-                    with outer._lock:
-                        self._send_json({"pose": serialize_pose(outer.node.current_pose_for_robot())})
+                    self._send_json({"pose": serialize_pose(outer.node.current_pose_for_robot())})
                     return
                 self.send_error(HTTPStatus.NOT_FOUND)
 
@@ -507,8 +517,8 @@ class RosNav2RouterServer:
                 try:
                     path = self.path.rstrip("/")
                     payload = self._read_json()
-                    with outer._lock:
-                        if path == "/api/router/update_state":
+                    if path == "/api/router/update_state":
+                        with outer._lock:
                             occupancy_map = map_from_payload(payload.get("occupancy_map"))
                             pose = pose_from_payload(payload.get("pose"))
                             if pose is None:
@@ -521,24 +531,27 @@ class RosNav2RouterServer:
                             )
                             self._send_json({"status": "ok", "state": outer.node.snapshot(include_map=False)})
                             return
-                        if path in {"/api/router/compute_path", "/api/router/compute_path_to_pose"}:
-                            goal_pose = pose_from_payload(payload.get("goal_pose"))
-                            if goal_pose is None:
-                                raise ValueError("goal_pose is required")
-                            status, path_poses, status_label = outer.node.compute_path(
-                                goal_pose=goal_pose,
-                                planner_id=str(payload.get("planner_id", "")),
-                            )
-                            self._send_json(
-                                {
-                                    "status": status,
-                                    "status_label": status_label,
-                                    "path_poses": [pose.to_dict() for pose in path_poses],
-                                    "state": outer.node.snapshot(include_map=False),
-                                }
-                            )
-                            return
-                    self.send_error(HTTPStatus.NOT_FOUND)
+                    if path in {"/api/router/compute_path", "/api/router/compute_path_to_pose"}:
+                        goal_pose = pose_from_payload(payload.get("goal_pose"))
+                        if goal_pose is None:
+                            raise ValueError("goal_pose is required")
+                        planner_id = str(payload.get("planner_id", ""))
+                    else:
+                        self.send_error(HTTPStatus.NOT_FOUND)
+                        return
+                    status, path_poses, status_label = outer.node.compute_path(
+                        goal_pose=goal_pose,
+                        planner_id=planner_id,
+                    )
+                    self._send_json(
+                        {
+                            "status": status,
+                            "status_label": status_label,
+                            "path_poses": [pose.to_dict() for pose in path_poses],
+                            "state": outer.node.snapshot(include_map=False),
+                        }
+                    )
+                    return
                 except Exception as exc:
                     self._send_json(
                         {

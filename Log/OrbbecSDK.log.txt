@@ -1715,3 +1715,665 @@
 [04/18 23:53:36.364088][info][366535][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.934143fps
 [04/18 23:53:41.238843][info][366531][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
 [04/18 23:53:41.374348][info][366535][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:33:47.052083][info][135684][MacUsbPal.cpp:214] Create PollingDeviceWatcher!
+[04/19 15:33:47.052362][info][135684][DeviceManager.cpp:25] Current found device(s): (1)
+[04/19 15:33:47.052366][info][135684][DeviceManager.cpp:34] 	- Name: Gemini2, PID: 0x0670, SN/ID: AY6495F002P, Connection: USB3.0
+[04/19 15:33:47.052370][info][135684][DeviceManager.cpp:339] Enable net device enumeration: true
+[04/19 15:33:49.075879][info][135684][DeviceManager.cpp:25] Current device(s) list: (1)
+[04/19 15:33:49.076019][info][135684][DeviceManager.cpp:34] 	- Name: Gemini2, PID: 0x0670, SN/ID: AY6495F002P, Connection: USB3.0
+[04/19 15:33:49.077540][warning][135684][PropertyServer.cpp:87] [AY6495F002P] Not added to property map, property not found in OBPropertyBaseInfoMap, id=108
+[04/19 15:33:49.077581][warning][135684][PropertyServer.cpp:87] [AY6495F002P] Not added to property map, property not found in OBPropertyBaseInfoMap, id=4035
+[04/19 15:33:49.077613][warning][135684][PropertyServer.cpp:87] [AY6495F002P] Not added to property map, property not found in OBPropertyBaseInfoMap, id=5003
+[04/19 15:33:49.078914][warning][135684][ObLibuvcDevicePort.cpp:71] uvc_open failed: [Path: 3-2-1.0, Return Code: -3]
+[04/19 15:33:49.081378][warning][135684][ObLibuvcDevicePort.cpp:71] uvc_open failed: [Path: 3-2-1.0, Return Code: -3]
+[04/19 15:33:49.081472][warning][135684][DeviceBase.cpp:343] Execute failure! A std::exception has occurred!
+ - where: DeviceBase.cpp(343):getComponent
+ - msg: uvc_open failed: [Path: 3-2-1.0, Return Code: -3]
+ - type: St13runtime_error
+[04/19 15:34:06.741291][info][136421][MacUsbPal.cpp:214] Create PollingDeviceWatcher!
+[04/19 15:34:06.741433][info][136421][DeviceManager.cpp:25] Current found device(s): (1)
+[04/19 15:34:06.741437][info][136421][DeviceManager.cpp:34] 	- Name: Gemini2, PID: 0x0670, SN/ID: AY6495F002P, Connection: USB3.0
+[04/19 15:34:06.741440][info][136421][DeviceManager.cpp:339] Enable net device enumeration: true
+[04/19 15:34:08.750274][info][136421][DeviceManager.cpp:25] Current device(s) list: (1)
+[04/19 15:34:08.750405][info][136421][DeviceManager.cpp:34] 	- Name: Gemini2, PID: 0x0670, SN/ID: AY6495F002P, Connection: USB3.0
+[04/19 15:34:08.750630][warning][136421][PropertyServer.cpp:87] [AY6495F002P] Not added to property map, property not found in OBPropertyBaseInfoMap, id=108
+[04/19 15:34:08.750662][warning][136421][PropertyServer.cpp:87] [AY6495F002P] Not added to property map, property not found in OBPropertyBaseInfoMap, id=4035
+[04/19 15:34:08.750695][warning][136421][PropertyServer.cpp:87] [AY6495F002P] Not added to property map, property not found in OBPropertyBaseInfoMap, id=5003
+[04/19 15:34:08.761642][info][136421][DeviceManager.cpp:194] Device created successfully! Name: Gemini 2, PID: 0x0670, SN/ID: AY6495F002P FW: 1.4.92
+[04/19 15:34:08.761923][info][136421][Pipeline.cpp:42] [AY6495F002P] Pipeline created with device: {name: Gemini 2, sn: AY6495F002P}, @0x1028F8758
+[04/19 15:34:08.771989][warning][136421][ObException.cpp:8] No matched profile found for: {type: Depth, format: Y16, width: 640, height: 480, fps: 30}
+[04/19 15:34:08.772569][info][136421][Pipeline.cpp:53] [AY6495F002P] Pipeline destroyed! @0x1028F8758
+[04/19 15:34:08.772636][info][136421][SensorBase.cpp:47] [AY6495F002P] SensorBase is destroyed
+[04/19 15:34:08.773240][info][136421][ObLibuvcDevicePort.cpp:87] uvc_close done.
+[04/19 15:34:08.773258][info][136421][ObLibuvcDevicePort.cpp:88] ~ObLibuvcDevicePort done
+[04/19 15:34:08.773303][info][136421][SensorBase.cpp:47] [AY6495F002P] SensorBase is destroyed
+[04/19 15:34:08.827468][info][136421][ObLibuvcDevicePort.cpp:87] uvc_close done.
+[04/19 15:34:08.827519][info][136421][ObLibuvcDevicePort.cpp:88] ~ObLibuvcDevicePort done
+[04/19 15:42:36.207807][info][142917][MacUsbPal.cpp:214] Create PollingDeviceWatcher!
+[04/19 15:42:36.207960][info][142917][DeviceManager.cpp:25] Current found device(s): (1)
+[04/19 15:42:36.207964][info][142917][DeviceManager.cpp:34] 	- Name: Gemini2, PID: 0x0670, SN/ID: AY6495F002P, Connection: USB3.0
+[04/19 15:42:36.207967][info][142917][DeviceManager.cpp:339] Enable net device enumeration: true
+[04/19 15:42:38.234658][info][142917][DeviceManager.cpp:25] Current device(s) list: (1)
+[04/19 15:42:38.234799][info][142917][DeviceManager.cpp:34] 	- Name: Gemini2, PID: 0x0670, SN/ID: AY6495F002P, Connection: USB3.0
+[04/19 15:42:38.236371][warning][142917][PropertyServer.cpp:87] [AY6495F002P] Not added to property map, property not found in OBPropertyBaseInfoMap, id=108
+[04/19 15:42:38.236418][warning][142917][PropertyServer.cpp:87] [AY6495F002P] Not added to property map, property not found in OBPropertyBaseInfoMap, id=4035
+[04/19 15:42:38.236453][warning][142917][PropertyServer.cpp:87] [AY6495F002P] Not added to property map, property not found in OBPropertyBaseInfoMap, id=5003
+[04/19 15:42:38.245849][info][142917][DeviceManager.cpp:194] Device created successfully! Name: Gemini 2, PID: 0x0670, SN/ID: AY6495F002P FW: 1.4.92
+[04/19 15:42:38.246106][info][142917][Pipeline.cpp:42] [AY6495F002P] Pipeline created with device: {name: Gemini 2, sn: AY6495F002P}, @0x102C5A258
+[04/19 15:42:38.256386][info][142917][Pipeline.cpp:216] [AY6495F002P] Check and set config done!
+[04/19 15:42:38.256623][info][142917][Pipeline.cpp:254] [AY6495F002P] Try to start streams!
+[04/19 15:42:38.256640][info][142917][VideoSensor.cpp:58] [AY6495F002P] Try to start stream: {type: Color, format: RGB, width: 640, height: 480, fps: 30}
+[04/19 15:42:38.256655][info][142917][SensorBase.cpp:213] [AY6495F002P] Stream state changed to STARTING@Color
+[04/19 15:42:38.256670][info][142917][VideoSensor.cpp:127] [AY6495F002P] Start backend stream: {type: Color, format: MJPG, width: 640, height: 480, fps: 30}
+[04/19 15:42:38.267408][info][142917][VideoSensor.cpp:58] [AY6495F002P] Try to start stream: {type: Depth, format: Y16, width: 1280, height: 800, fps: 30}
+[04/19 15:42:38.267458][info][142917][SensorBase.cpp:213] [AY6495F002P] Stream state changed to STARTING@Depth
+[04/19 15:42:38.267475][info][142917][VideoSensor.cpp:127] [AY6495F002P] Start backend stream: {type: Depth, format: Y16, width: 1280, height: 800, fps: 30}
+[04/19 15:42:38.272908][info][142917][Pipeline.cpp:270] [AY6495F002P] Start streams done!
+[04/19 15:42:38.272921][info][142917][Pipeline.cpp:238] [AY6495F002P] Pipeline start done!
+[04/19 15:42:38.354527][warning][142957][VideoSensor.cpp:194] [AY6495F002P] This frame will be dropped because the data size does not match the expectation! size=65364, expected=2048000 @Depth
+[04/19 15:42:38.399318][warning][142955][VideoSensor.cpp:184] [AY6495F002P] This frame will be dropped because jpg format verification failure! @Color
+[04/19 15:42:38.417256][warning][142957][ObException.hpp:48] Update data size(2057488) > data buffer size! (2048000)
+[04/19 15:42:38.418414][warning][142957][ObLibuvcDevicePort.cpp:465] Execute failure! A libobsensor_exception has occurred!
+ - where: ObLibuvcDevicePort.cpp(465):onFrameCallback
+ - msg: Update data size(2057488) > data buffer size! (2048000)
+ - type: N11libobsensor16memory_exceptionE
+[04/19 15:42:38.432614][info][142955][SensorBase.cpp:213] [AY6495F002P] Stream state changed to STREAMING@Color
+[04/19 15:42:38.450287][info][142957][SensorBase.cpp:213] [AY6495F002P] Stream state changed to STREAMING@Depth
+[04/19 15:42:41.359233][warning][142958][VideoSensor.cpp:194] [AY6495F002P] This frame will be dropped because the data size does not match the expectation! size=32432, expected=2048000 @Depth [**77 logs in 3004ms, last: 15:42:38.383262**]
+[04/19 15:42:43.359998][info][142957][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=45.154842fps
+[04/19 15:42:43.405120][info][142955][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.764282fps
+[04/19 15:42:43.439498][info][142961][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.788086fps
+[04/19 15:42:43.462223][info][142962][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=30.175858fps
+[04/19 15:42:48.370076][info][142957][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.934143fps
+[04/19 15:42:48.415252][info][142955][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:42:48.449570][info][142961][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:42:48.472404][info][142962][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:42:53.380174][info][142957][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:42:53.425289][info][142955][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:42:53.459717][info][142961][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:42:53.482440][info][142962][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:42:58.390239][info][142957][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:42:58.435363][info][142955][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:42:58.469739][info][142961][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:42:58.492482][info][142962][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:43:03.400327][info][142957][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:43:03.445449][info][142955][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:43:03.479857][info][142961][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:43:03.502559][info][142962][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:43:08.410389][info][142957][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:43:08.455529][info][142955][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:43:08.489887][info][142961][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:43:08.512755][info][142962][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:43:13.420474][info][142957][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:43:13.465609][info][142955][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:43:13.499939][info][142961][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:43:13.522651][info][142962][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:43:18.430539][info][142957][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:43:18.475757][info][142955][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:43:18.510046][info][142961][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.934143fps
+[04/19 15:43:18.532779][info][142962][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:43:19.617547][warning][142957][VideoSensor.cpp:194] [AY6495F002P] This frame will be dropped because the data size does not match the expectation! size=1195108, expected=2048000 @Depth
+[04/19 15:43:19.674371][warning][142957][ObException.hpp:48] Update data size(2073892) > data buffer size! (2048000)
+[04/19 15:43:19.674451][warning][142957][ObLibuvcDevicePort.cpp:465] Execute failure! A libobsensor_exception has occurred!
+ - where: ObLibuvcDevicePort.cpp(465):onFrameCallback
+ - msg: Update data size(2073892) > data buffer size! (2048000)
+ - type: N11libobsensor16memory_exceptionE
+[04/19 15:43:22.626100][warning][144011][VideoSensor.cpp:194] [AY6495F002P] This frame will be dropped because the data size does not match the expectation! size=32588, expected=2048000 @Depth [**30 logs in 3008ms, last: 15:43:19.632763**]
+[04/19 15:43:23.440635][info][142957][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=35.528942fps
+[04/19 15:43:23.485818][info][142955][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:43:23.520206][info][142961][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:43:23.542976][info][142962][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.341316fps
+[04/19 15:43:28.450769][info][142957][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=30.339319fps
+[04/19 15:43:28.495920][info][142955][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:43:28.530318][info][142961][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:43:28.553220][info][142962][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.734583fps
+[04/19 15:43:33.460869][info][142957][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:43:33.505964][info][142955][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:43:33.540322][info][142961][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:43:33.563435][info][142962][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:43:33.816378][warning][144477][VideoSensor.cpp:194] [AY6495F002P] This frame will be dropped because the data size does not match the expectation! size=16156, expected=2048000 @Depth [**3 logs in 11190ms, last: 15:43:27.827754**]
+[04/19 15:43:38.470882][info][142957][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=41.117764fps
+[04/19 15:43:38.516054][info][142955][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.934143fps
+[04/19 15:43:38.550633][info][142961][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:43:38.573227][info][142962][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=28.942114fps
+[04/19 15:43:43.481085][info][142957][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.934143fps
+[04/19 15:43:43.526090][info][142955][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:43:43.560705][info][142961][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:43:43.583729][info][142962][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:43:46.950999][warning][144790][VideoSensor.cpp:194] [AY6495F002P] This frame will be dropped because the data size does not match the expectation! size=16200, expected=2048000 @Depth [**61 logs in 13134ms, last: 15:43:35.568601**]
+[04/19 15:43:48.491027][info][142957][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:43:48.536146][info][142955][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:43:48.570496][info][142961][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:43:48.593218][info][142962][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:43:53.501141][info][142957][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:43:53.546278][info][142955][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:43:53.580641][info][142961][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:43:53.603343][info][142962][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:43:58.511173][info][142957][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:43:58.556343][info][142955][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:43:58.590707][info][142961][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:43:58.613719][info][142962][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:44:03.521240][info][142957][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:44:03.566353][info][142955][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:44:03.600787][info][142961][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:44:03.623850][info][142962][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:44:08.531314][info][142957][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:44:08.576441][info][142955][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:44:08.610888][info][142961][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:44:08.633694][info][142962][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:44:13.541375][info][142957][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:44:13.586508][info][142955][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:44:13.620925][info][142961][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:44:13.643646][info][142962][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:44:18.551466][info][142957][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:44:18.596620][info][142955][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:44:18.631005][info][142961][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.934143fps
+[04/19 15:44:18.653765][info][142962][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:44:23.561548][info][142957][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:44:23.606637][info][142955][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:44:23.640995][info][142961][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.946098fps
+[04/19 15:44:23.664006][info][142962][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.934143fps
+[04/19 15:44:28.571596][info][142957][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:44:28.616793][info][142955][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:44:28.651160][info][142961][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.934143fps
+[04/19 15:44:28.673884][info][142962][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.946098fps
+[04/19 15:44:33.581685][info][142957][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:44:33.626855][info][142955][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:44:33.661255][info][142961][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:44:33.684232][info][142962][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.934143fps
+[04/19 15:47:26.133294][info][148560][MacUsbPal.cpp:214] Create PollingDeviceWatcher!
+[04/19 15:47:26.133427][info][148560][DeviceManager.cpp:25] Current found device(s): (1)
+[04/19 15:47:26.133431][info][148560][DeviceManager.cpp:34] 	- Name: Gemini2, PID: 0x0670, SN/ID: AY6495F002P, Connection: USB3.0
+[04/19 15:47:26.133435][info][148560][DeviceManager.cpp:339] Enable net device enumeration: true
+[04/19 15:47:28.147408][info][148560][DeviceManager.cpp:25] Current device(s) list: (1)
+[04/19 15:47:28.147626][info][148560][DeviceManager.cpp:34] 	- Name: Gemini2, PID: 0x0670, SN/ID: AY6495F002P, Connection: USB3.0
+[04/19 15:47:28.147841][warning][148560][PropertyServer.cpp:87] [AY6495F002P] Not added to property map, property not found in OBPropertyBaseInfoMap, id=108
+[04/19 15:47:28.147874][warning][148560][PropertyServer.cpp:87] [AY6495F002P] Not added to property map, property not found in OBPropertyBaseInfoMap, id=4035
+[04/19 15:47:28.147907][warning][148560][PropertyServer.cpp:87] [AY6495F002P] Not added to property map, property not found in OBPropertyBaseInfoMap, id=5003
+[04/19 15:47:28.155045][info][148560][DeviceManager.cpp:194] Device created successfully! Name: Gemini 2, PID: 0x0670, SN/ID: AY6495F002P FW: 1.4.92
+[04/19 15:47:28.155098][info][148560][Pipeline.cpp:42] [AY6495F002P] Pipeline created with device: {name: Gemini 2, sn: AY6495F002P}, @0x104C85E08
+[04/19 15:47:28.165318][info][148560][Pipeline.cpp:216] [AY6495F002P] Check and set config done!
+[04/19 15:47:28.165548][info][148560][Pipeline.cpp:254] [AY6495F002P] Try to start streams!
+[04/19 15:47:28.165565][info][148560][VideoSensor.cpp:58] [AY6495F002P] Try to start stream: {type: Color, format: RGB, width: 640, height: 480, fps: 30}
+[04/19 15:47:28.165580][info][148560][SensorBase.cpp:213] [AY6495F002P] Stream state changed to STARTING@Color
+[04/19 15:47:28.165594][info][148560][VideoSensor.cpp:127] [AY6495F002P] Start backend stream: {type: Color, format: MJPG, width: 640, height: 480, fps: 30}
+[04/19 15:47:28.172239][info][148560][VideoSensor.cpp:58] [AY6495F002P] Try to start stream: {type: Depth, format: Y16, width: 1280, height: 800, fps: 30}
+[04/19 15:47:28.172306][info][148560][SensorBase.cpp:213] [AY6495F002P] Stream state changed to STARTING@Depth
+[04/19 15:47:28.172328][info][148560][VideoSensor.cpp:127] [AY6495F002P] Start backend stream: {type: Depth, format: Y16, width: 1280, height: 800, fps: 30}
+[04/19 15:47:28.174203][warning][148773][VideoSensor.cpp:194] [AY6495F002P] This frame will be dropped because the data size does not match the expectation! size=16232, expected=2048000 @Depth
+[04/19 15:47:28.174808][info][148560][Pipeline.cpp:270] [AY6495F002P] Start streams done!
+[04/19 15:47:28.174833][info][148560][Pipeline.cpp:238] [AY6495F002P] Pipeline start done!
+[04/19 15:47:28.266948][info][148773][SensorBase.cpp:213] [AY6495F002P] Stream state changed to STREAMING@Depth
+[04/19 15:47:28.277908][info][148772][SensorBase.cpp:213] [AY6495F002P] Stream state changed to STREAMING@Color
+[04/19 15:47:28.279090][warning][148778][FormatConverterProcess.cpp:344] Failed to decode mjpeg frame to rgb! Invalid JPEG file structure: two SOI markers
+[04/19 15:47:31.207201][warning][148775][VideoSensor.cpp:194] [AY6495F002P] This frame will be dropped because the data size does not match the expectation! size=48976, expected=2048000 @Depth [**80 logs in 3032ms, last: 15:47:28.236716**]
+[04/19 15:47:33.176416][info][148773][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=45.781689fps
+[04/19 15:47:33.278645][info][148777][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=30.169830fps
+[04/19 15:47:33.287874][info][148772][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=30.139719fps
+[04/19 15:47:33.322224][info][148780][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=30.145739fps
+[04/19 15:47:38.186512][info][148773][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:47:38.288723][info][148777][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:47:38.297954][info][148772][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:47:38.332320][info][148780][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:47:43.196575][info][148773][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:47:43.298807][info][148777][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:47:43.308050][info][148772][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.934143fps
+[04/19 15:47:43.342391][info][148780][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:47:48.206667][info][148773][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:47:48.308895][info][148777][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:47:48.318143][info][148772][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:47:48.352570][info][148780][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:47:53.216747][info][148773][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:47:53.318911][info][148777][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:47:53.328217][info][148772][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:47:53.362544][info][148780][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:47:58.226836][info][148773][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:47:58.328994][info][148777][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:47:58.338290][info][148772][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:47:58.372682][info][148780][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:48:03.236913][info][148773][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:48:03.339168][info][148777][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.934143fps
+[04/19 15:48:03.348377][info][148772][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:48:03.382728][info][148780][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:48:08.246999][info][148773][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:48:08.349202][info][148777][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:48:08.358467][info][148772][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:48:08.392839][info][148780][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:48:13.257083][info][148773][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.934143fps
+[04/19 15:48:13.359293][info][148777][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:48:13.368546][info][148772][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:48:13.402945][info][148780][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:48:18.267161][info][148773][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:48:18.369353][info][148777][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:48:18.378637][info][148772][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:48:18.413006][info][148780][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.934143fps
+[04/19 15:48:23.277275][info][148773][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:48:23.379519][info][148777][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:48:23.388702][info][148772][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:48:23.423083][info][148780][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:48:28.287362][info][148773][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:48:28.393711][info][148777][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.916235fps
+[04/19 15:48:28.398825][info][148772][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:48:28.433169][info][148780][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:48:33.297412][info][148773][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:48:33.399583][info][148777][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.964043fps
+[04/19 15:48:33.408868][info][148772][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:48:33.443218][info][148780][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:48:38.307495][info][148773][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:48:38.409636][info][148777][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:48:38.418947][info][148772][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:48:38.453301][info][148780][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:48:43.317583][info][148773][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:48:43.419798][info][148777][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:48:43.429056][info][148772][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.934143fps
+[04/19 15:48:43.463390][info][148780][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:48:48.327657][info][148773][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:48:48.429808][info][148777][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:48:48.439108][info][148772][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:48:48.473481][info][148780][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:48:53.337738][info][148773][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:48:53.439920][info][148777][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:48:53.449200][info][148772][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:48:53.483533][info][148780][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:48:58.347824][info][148773][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:48:58.449977][info][148777][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:48:58.459297][info][148772][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:48:58.493645][info][148780][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:49:03.357893][info][148773][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:49:03.462540][info][148777][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.922203fps
+[04/19 15:49:03.469379][info][148772][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:49:03.503772][info][148780][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:49:08.367975][info][148773][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:49:08.470167][info][148777][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.952078fps
+[04/19 15:49:08.479442][info][148772][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:49:08.513814][info][148780][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:49:13.378070][info][148773][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.934143fps
+[04/19 15:49:13.480231][info][148777][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:49:13.489539][info][148772][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:49:13.523879][info][148780][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:49:18.388136][info][148773][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:49:18.490296][info][148777][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:49:18.499598][info][148772][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:49:18.533991][info][148780][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:49:23.398217][info][148773][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:49:23.500410][info][148777][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:49:23.509678][info][148772][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:49:23.544029][info][148780][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.934143fps
+[04/19 15:49:28.408311][info][148773][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:49:28.510444][info][148777][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:49:28.519766][info][148772][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:49:28.554119][info][148780][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:49:33.418376][info][148773][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:49:33.520593][info][148777][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:49:33.529844][info][148772][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:49:33.564213][info][148780][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:49:38.428450][info][148773][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:49:38.530716][info][148777][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:49:38.539924][info][148772][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:49:38.574330][info][148780][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:49:43.438546][info][148773][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:49:43.540869][info][148777][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:49:43.550013][info][148772][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.934143fps
+[04/19 15:49:43.584395][info][148780][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:49:48.448614][info][148773][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:49:48.550965][info][148777][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:49:48.560083][info][148772][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:49:48.594434][info][148780][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:49:53.458683][info][148773][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:49:53.560845][info][148777][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:49:53.570156][info][148772][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:49:53.604516][info][148780][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:49:58.468785][info][148773][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:49:58.570914][info][148777][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:49:58.580245][info][148772][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:49:58.614591][info][148780][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:50:03.478853][info][148773][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:50:03.581110][info][148777][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.934143fps
+[04/19 15:50:03.590337][info][148772][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:50:03.624787][info][148780][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:50:08.488947][info][148773][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:50:08.591094][info][148777][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:50:08.600409][info][148772][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:50:08.634761][info][148780][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:50:09.352389][warning][148773][VideoSensor.cpp:194] [AY6495F002P] This frame will be dropped because the data size does not match the expectation! size=49076, expected=2048000 @Depth
+[04/19 15:50:12.358246][warning][150978][VideoSensor.cpp:194] [AY6495F002P] This frame will be dropped because the data size does not match the expectation! size=16192, expected=2048000 @Depth [**18 logs in 3005ms, last: 15:50:09.360927**]
+[04/19 15:50:13.499023][info][148773][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=33.326679fps
+[04/19 15:50:13.601219][info][148777][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.540916fps
+[04/19 15:50:13.610476][info][148772][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:50:13.644882][info][148780][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:50:18.509108][info][148773][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:50:18.611371][info][148777][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:50:18.620567][info][148772][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:50:18.654896][info][148780][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:50:23.519186][info][148773][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:50:23.621649][info][148777][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:50:23.630663][info][148772][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:50:23.664996][info][148780][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:50:28.529270][info][148773][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:50:28.631747][info][148777][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:50:28.640733][info][148772][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:50:28.675065][info][148780][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.934143fps
+[04/19 15:50:33.539322][info][148773][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:50:33.641597][info][148777][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:50:33.650813][info][148772][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:50:33.685142][info][148780][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:50:38.549415][info][148773][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:50:38.651644][info][148777][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:50:38.660897][info][148772][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:50:38.695226][info][148780][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:50:43.559809][info][148773][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:50:43.661850][info][148777][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:50:43.671055][info][148772][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.934143fps
+[04/19 15:50:43.705409][info][148780][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:50:48.569821][info][148773][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:50:48.672042][info][148777][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.934143fps
+[04/19 15:50:48.681223][info][148772][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:50:48.715575][info][148780][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:50:53.580041][info][148773][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.934143fps
+[04/19 15:50:53.683472][info][148777][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.934143fps
+[04/19 15:50:53.691361][info][148772][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:50:53.725796][info][148780][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:50:58.589983][info][148773][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.946098fps
+[04/19 15:50:58.692550][info][148777][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.946098fps
+[04/19 15:50:58.701442][info][148772][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:50:58.736019][info][148780][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.934143fps
+[04/19 15:51:01.102555][warning][148773][VideoSensor.cpp:194] [AY6495F002P] This frame will be dropped because the data size does not match the expectation! size=16148, expected=2048000 @Depth
+[04/19 15:51:03.600086][info][148773][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=41.708241fps
+[04/19 15:51:03.702413][info][148777][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.540916fps
+[04/19 15:51:03.711541][info][148772][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:51:03.745877][info][148780][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.946098fps
+[04/19 15:51:04.103191][warning][152245][VideoSensor.cpp:194] [AY6495F002P] This frame will be dropped because the data size does not match the expectation! size=48964, expected=2048000 @Depth [**60 logs in 3000ms, last: 15:51:01.132031**]
+[04/19 15:51:08.610152][info][148773][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:51:08.712475][info][148777][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:51:08.721632][info][148772][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:51:08.755987][info][148780][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:51:13.620383][info][148773][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:51:13.722809][info][148777][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:51:13.731730][info][148772][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:51:13.766086][info][148780][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.934143fps
+[04/19 15:51:18.630333][info][148773][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:51:18.732754][info][148777][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:51:18.741812][info][148772][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:51:18.776218][info][148780][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:51:23.640428][info][148773][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:51:23.742999][info][148777][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:51:23.751904][info][148772][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:51:23.786253][info][148780][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:51:28.650515][info][148773][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:51:28.752774][info][148777][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:51:28.761979][info][148772][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:51:28.796339][info][148780][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:51:33.660590][info][148773][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:51:33.762981][info][148777][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:51:33.772043][info][148772][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.934143fps
+[04/19 15:51:33.806394][info][148780][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:51:38.670667][info][148773][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:51:38.772992][info][148777][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:51:38.782129][info][148772][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:51:38.816465][info][148780][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:51:43.680764][info][148773][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:51:43.783184][info][148777][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.934143fps
+[04/19 15:51:43.792218][info][148772][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:51:43.826603][info][148780][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:52:03.719799][info][154243][MacUsbPal.cpp:214] Create PollingDeviceWatcher!
+[04/19 15:52:03.719954][info][154243][DeviceManager.cpp:25] Current found device(s): (1)
+[04/19 15:52:03.719959][info][154243][DeviceManager.cpp:34] 	- Name: Gemini2, PID: 0x0670, SN/ID: AY6495F002P, Connection: USB3.0
+[04/19 15:52:03.719962][info][154243][DeviceManager.cpp:339] Enable net device enumeration: true
+[04/19 15:52:05.744642][info][154243][DeviceManager.cpp:25] Current device(s) list: (1)
+[04/19 15:52:05.744805][info][154243][DeviceManager.cpp:34] 	- Name: Gemini2, PID: 0x0670, SN/ID: AY6495F002P, Connection: USB3.0
+[04/19 15:52:05.745013][warning][154243][PropertyServer.cpp:87] [AY6495F002P] Not added to property map, property not found in OBPropertyBaseInfoMap, id=108
+[04/19 15:52:05.745056][warning][154243][PropertyServer.cpp:87] [AY6495F002P] Not added to property map, property not found in OBPropertyBaseInfoMap, id=4035
+[04/19 15:52:05.745090][warning][154243][PropertyServer.cpp:87] [AY6495F002P] Not added to property map, property not found in OBPropertyBaseInfoMap, id=5003
+[04/19 15:52:05.754820][info][154243][DeviceManager.cpp:194] Device created successfully! Name: Gemini 2, PID: 0x0670, SN/ID: AY6495F002P FW: 1.4.92
+[04/19 15:52:05.754916][info][154243][Pipeline.cpp:42] [AY6495F002P] Pipeline created with device: {name: Gemini 2, sn: AY6495F002P}, @0x1052F6E38
+[04/19 15:52:05.765036][info][154243][Pipeline.cpp:216] [AY6495F002P] Check and set config done!
+[04/19 15:52:05.765293][info][154243][Pipeline.cpp:254] [AY6495F002P] Try to start streams!
+[04/19 15:52:05.765320][info][154243][VideoSensor.cpp:58] [AY6495F002P] Try to start stream: {type: Color, format: RGB, width: 640, height: 480, fps: 30}
+[04/19 15:52:05.765337][info][154243][SensorBase.cpp:213] [AY6495F002P] Stream state changed to STARTING@Color
+[04/19 15:52:05.765352][info][154243][VideoSensor.cpp:127] [AY6495F002P] Start backend stream: {type: Color, format: MJPG, width: 640, height: 480, fps: 30}
+[04/19 15:52:05.776302][info][154243][VideoSensor.cpp:58] [AY6495F002P] Try to start stream: {type: Depth, format: Y16, width: 1280, height: 800, fps: 30}
+[04/19 15:52:05.776350][info][154243][SensorBase.cpp:213] [AY6495F002P] Stream state changed to STARTING@Depth
+[04/19 15:52:05.776366][info][154243][VideoSensor.cpp:127] [AY6495F002P] Start backend stream: {type: Depth, format: Y16, width: 1280, height: 800, fps: 30}
+[04/19 15:52:05.781865][info][154243][Pipeline.cpp:270] [AY6495F002P] Start streams done!
+[04/19 15:52:05.781881][info][154243][Pipeline.cpp:238] [AY6495F002P] Pipeline start done!
+[04/19 15:52:05.841293][warning][154360][ObException.hpp:48] Update data size(2064372) > data buffer size! (2048000)
+[04/19 15:52:05.841416][warning][154360][ObLibuvcDevicePort.cpp:465] Execute failure! A libobsensor_exception has occurred!
+ - where: ObLibuvcDevicePort.cpp(465):onFrameCallback
+ - msg: Update data size(2064372) > data buffer size! (2048000)
+ - type: N11libobsensor16memory_exceptionE
+[04/19 15:52:05.873210][info][154360][SensorBase.cpp:213] [AY6495F002P] Stream state changed to STREAMING@Depth
+[04/19 15:52:05.922604][warning][154359][VideoSensor.cpp:184] [AY6495F002P] This frame will be dropped because jpg format verification failure! @Color
+[04/19 15:52:05.955969][info][154359][SensorBase.cpp:213] [AY6495F002P] Stream state changed to STREAMING@Color
+[04/19 15:52:10.883101][info][154360][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=30.139719fps
+[04/19 15:52:10.885231][info][154361][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=30.169830fps
+[04/19 15:52:10.928452][info][154359][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.764282fps
+[04/19 15:52:10.962828][info][154364][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.776178fps
+[04/19 15:52:12.984421][warning][154360][VideoSensor.cpp:194] [AY6495F002P] This frame will be dropped because the data size does not match the expectation! size=16188, expected=2048000 @Depth
+[04/19 15:52:15.893255][info][154360][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=30.139719fps
+[04/19 15:52:15.895679][info][154361][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.740517fps
+[04/19 15:52:15.938550][info][154359][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:52:15.972923][info][154364][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:52:15.989389][warning][154950][VideoSensor.cpp:194] [AY6495F002P] This frame will be dropped because the data size does not match the expectation! size=492660, expected=2048000 @Depth [**1 logs in 3004ms, last: 15:52:12.988180**]
+[04/19 15:52:20.903237][info][154360][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:52:20.905292][info][154361][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:52:20.948623][info][154359][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:52:20.982978][info][154364][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:52:25.913458][info][154360][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:52:25.916551][info][154361][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.934143fps
+[04/19 15:52:25.958700][info][154359][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:52:25.993075][info][154364][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.934143fps
+[04/19 15:52:30.923406][info][154360][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:52:30.925456][info][154361][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.946098fps
+[04/19 15:52:30.968783][info][154359][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:52:31.003116][info][154364][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:52:35.933492][info][154360][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:52:35.935556][info][154361][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:52:35.978870][info][154359][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:52:36.013207][info][154364][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:52:40.943546][info][154360][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:52:40.945648][info][154361][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:52:40.988929][info][154359][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:52:41.023310][info][154364][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:52:45.526838][warning][154360][VideoSensor.cpp:194] [AY6495F002P] This frame will be dropped because the data size does not match the expectation! size=1229400, expected=2048000 @Depth
+[04/19 15:52:45.953651][info][154360][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:52:45.955902][info][154361][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.740517fps
+[04/19 15:52:45.999013][info][154359][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.934143fps
+[04/19 15:52:46.033404][info][154364][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:52:50.963744][info][154360][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:52:50.965876][info][154361][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:52:51.009105][info][154359][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:52:51.043493][info][154364][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:52:55.973802][info][154360][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:52:55.975940][info][154361][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:52:56.019176][info][154359][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:52:56.053572][info][154364][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:53:00.983884][info][154360][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:53:00.985976][info][154361][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:53:01.029275][info][154359][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:53:01.063609][info][154364][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:53:05.993978][info][154360][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:53:05.996122][info][154361][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.934143fps
+[04/19 15:53:06.039318][info][154359][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:53:06.073719][info][154364][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:53:11.004036][info][154360][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.934143fps
+[04/19 15:53:11.006139][info][154361][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:53:11.049394][info][154359][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:53:11.083779][info][154364][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:53:16.014136][info][154360][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:53:16.016207][info][154361][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:53:16.059491][info][154359][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:53:16.093836][info][154364][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:53:21.024207][info][154360][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:53:21.026314][info][154361][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:53:21.069562][info][154359][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:53:21.103916][info][154364][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:53:26.034272][info][154360][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:53:26.036304][info][154361][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:53:26.079635][info][154359][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:53:26.113980][info][154364][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:53:31.044366][info][154360][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:53:31.046410][info][154361][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:53:31.089719][info][154359][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:53:31.124078][info][154364][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.934143fps
+[04/19 15:53:36.054438][info][154360][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:53:36.056477][info][154361][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:53:36.099806][info][154359][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:53:36.134152][info][154364][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:53:41.064517][info][154360][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:53:41.066605][info][154361][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:53:41.109870][info][154359][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:53:41.144234][info][154364][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:53:46.074600][info][154360][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:53:46.076707][info][154361][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:53:46.119963][info][154359][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:53:46.154305][info][154364][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:53:51.084797][info][154360][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:53:51.087331][info][154361][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.934143fps
+[04/19 15:53:51.130028][info][154359][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.934143fps
+[04/19 15:53:51.164357][info][154364][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:53:56.095145][info][154360][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.934143fps
+[04/19 15:53:56.097723][info][154361][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:53:56.140147][info][154359][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:53:56.174486][info][154364][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:54:01.104877][info][154360][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.946098fps
+[04/19 15:54:01.107091][info][154361][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:54:01.150182][info][154359][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:54:01.184536][info][154364][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:54:06.115042][info][154360][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.934143fps
+[04/19 15:54:06.117446][info][154361][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:54:06.160265][info][154359][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:54:06.194615][info][154364][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:54:11.124957][info][154360][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.946098fps
+[04/19 15:54:11.127196][info][154361][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:54:11.170345][info][154359][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:54:11.204703][info][154364][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:54:16.135105][info][154360][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.934143fps
+[04/19 15:54:16.137419][info][154361][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:54:16.180433][info][154359][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:54:16.214789][info][154364][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:54:21.145403][info][154360][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:54:21.147902][info][154361][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:54:21.190490][info][154359][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:54:21.224834][info][154364][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:54:26.155200][info][154360][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:54:26.157502][info][154361][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:54:26.200569][info][154359][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:54:26.234962][info][154364][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:54:31.165419][info][154360][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:54:31.167850][info][154361][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:54:31.210652][info][154359][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:54:31.244987][info][154364][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:54:36.175456][info][154360][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:54:36.178030][info][154361][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.934143fps
+[04/19 15:54:36.220748][info][154359][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:54:36.255491][info][154364][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.934143fps
+[04/19 15:54:41.185449][info][154360][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:54:41.188001][info][154361][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:54:41.230788][info][154359][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:54:41.265142][info][154364][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:54:46.195524][info][154360][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:54:46.198077][info][154361][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:54:46.240859][info][154359][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:54:46.275197][info][154364][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:54:51.205575][info][154360][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:54:51.207781][info][154361][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.946098fps
+[04/19 15:54:51.250931][info][154359][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:54:51.285317][info][154364][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:54:56.215647][info][154360][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:54:56.217906][info][154361][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:54:56.261004][info][154359][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.934143fps
+[04/19 15:54:56.295399][info][154364][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:55:01.225694][info][154360][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:55:01.228086][info][154361][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.934143fps
+[04/19 15:55:01.271066][info][154359][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:55:01.305428][info][154364][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:55:06.235773][info][154360][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:55:06.237975][info][154361][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.946098fps
+[04/19 15:55:06.281121][info][154359][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:55:06.315471][info][154364][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:55:11.245844][info][154360][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:55:11.248010][info][154361][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.934143fps
+[04/19 15:55:11.291211][info][154359][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:55:11.325555][info][154364][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:55:16.226466][warning][154360][VideoSensor.cpp:194] [AY6495F002P] This frame will be dropped because the data size does not match the expectation! size=1277016, expected=2048000 @Depth
+[04/19 15:55:16.256144][info][154360][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=30.133705fps
+[04/19 15:55:16.260829][info][154361][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.728651fps
+[04/19 15:55:16.301298][info][154359][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:55:16.336588][info][154364][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.934143fps
+[04/19 15:55:19.236305][warning][159469][VideoSensor.cpp:194] [AY6495F002P] This frame will be dropped because the data size does not match the expectation! size=34256, expected=2048000 @Depth [**1 logs in 3009ms, last: 15:55:16.228488**]
+[04/19 15:55:21.265992][info][154360][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.946098fps
+[04/19 15:55:21.268292][info][154361][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.952078fps
+[04/19 15:55:21.311342][info][154359][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:55:21.347081][info][154364][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.934143fps
+[04/19 15:55:26.276048][info][154360][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.934143fps
+[04/19 15:55:26.278135][info][154361][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:55:26.321400][info][154359][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:55:26.355757][info][154364][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.952078fps
+[04/19 15:55:31.286113][info][154360][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:55:31.288213][info][154361][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:55:31.331466][info][154359][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:55:31.365776][info][154364][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:55:34.169070][warning][154360][VideoSensor.cpp:194] [AY6495F002P] This frame will be dropped because the data size does not match the expectation! size=16384, expected=2048000 @Depth
+[04/19 15:55:34.191956][warning][154360][ObException.hpp:48] Update data size(2065872) > data buffer size! (2048000)
+[04/19 15:55:34.191988][warning][154360][ObLibuvcDevicePort.cpp:465] Execute failure! A libobsensor_exception has occurred!
+ - where: ObLibuvcDevicePort.cpp(465):onFrameCallback
+ - msg: Update data size(2065872) > data buffer size! (2048000)
+ - type: N11libobsensor16memory_exceptionE
+[04/19 15:55:36.296248][info][154360][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.740517fps
+[04/19 15:55:36.298436][info][154361][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.540916fps
+[04/19 15:55:36.341563][info][154359][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:55:36.375918][info][154364][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:55:41.306252][info][154360][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:55:41.308396][info][154361][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:55:41.351634][info][154359][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:55:41.385946][info][154364][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:55:46.098715][warning][154360][VideoSensor.cpp:194] [AY6495F002P] This frame will be dropped because the data size does not match the expectation! size=16384, expected=2048000 @Depth
+[04/19 15:55:46.316498][info][154360][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=30.339319fps
+[04/19 15:55:46.318982][info][154361][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.740517fps
+[04/19 15:55:46.361701][info][154359][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:55:46.396069][info][154364][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.934143fps
+[04/19 15:55:49.101325][warning][160259][VideoSensor.cpp:194] [AY6495F002P] This frame will be dropped because the data size does not match the expectation! size=48836, expected=2048000 @Depth [**2 logs in 3002ms, last: 15:55:46.115989**]
+[04/19 15:55:51.326488][info][154360][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:55:51.328825][info][154361][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:55:51.371772][info][154359][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:55:51.406415][info][154364][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:55:56.336494][info][154360][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:55:56.338899][info][154361][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:55:56.381844][info][154359][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:55:56.417324][info][154364][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.934143fps
+[04/19 15:56:01.346567][info][154360][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:56:01.348822][info][154361][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:56:01.391896][info][154359][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:56:01.426273][info][154364][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.946098fps
+[04/19 15:56:06.356630][info][154360][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:56:06.358838][info][154361][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:56:06.401956][info][154359][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:56:06.436305][info][154364][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:56:11.366716][info][154360][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:56:11.457878][info][154359][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.469934fps
+[04/19 15:56:11.459175][info][154364][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.464464fps
+[04/19 15:56:11.461212][info][154361][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.394472fps
+[04/19 15:56:16.376736][info][154360][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.740517fps
+[04/19 15:56:16.479360][info][154361][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=30.290953fps
+[04/19 15:56:16.488899][info][154359][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=30.212681fps
+[04/19 15:56:16.489891][info][154364][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=30.218687fps
+[04/19 15:56:21.386808][info][154360][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:56:21.489214][info][154361][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:56:21.498996][info][154359][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:56:21.499971][info][154364][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:56:26.396935][info][154360][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:56:26.499414][info][154361][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:56:26.509039][info][154359][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.934143fps
+[04/19 15:56:26.510012][info][154364][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.934143fps
+[04/19 15:56:31.407042][info][154360][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.934143fps
+[04/19 15:56:31.509695][info][154361][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:56:31.519147][info][154359][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:56:31.520124][info][154364][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:56:36.417038][info][154360][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:56:36.519868][info][154361][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:56:36.529187][info][154359][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:56:36.530170][info][154364][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps
+[04/19 15:56:41.427560][info][154360][VideoSensor.cpp:153] [AY6495F002P] Depth backend frame callback, frameRate=29.940119fps
+[04/19 15:56:41.529595][info][154361][SensorBase.cpp:370] [AY6495F002P] Depth Streaming... frameRate=29.940119fps
+[04/19 15:56:41.539278][info][154359][VideoSensor.cpp:153] [AY6495F002P] Color backend frame callback, frameRate=29.940119fps
+[04/19 15:56:41.540254][info][154364][SensorBase.cpp:370] [AY6495F002P] Color Streaming... frameRate=29.940119fps

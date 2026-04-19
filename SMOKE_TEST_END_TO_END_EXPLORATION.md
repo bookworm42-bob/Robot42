@@ -171,6 +171,17 @@ curl http://OFFLOAD_IP:8891/api/health
 curl http://OFFLOAD_IP:8891/api/router/current_pose
 ```
 
+Run this no-motion preflight from the robot brain before the real smoke test:
+
+```bash
+python -m xlerobot_playground.robot_brain_smoke_test \
+  --router-url http://OFFLOAD_IP:8891 \
+  --robot-brain-url http://127.0.0.1:8765 \
+  --preflight-only
+```
+
+This checks the offload router, local robot brain agent, and RGB-D odometry pose path without sending wheel commands.
+
 ## Run The Smoke Test From Robot Brain
 
 ### Terminal RB-3: Mode B Smoke Test

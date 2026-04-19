@@ -26,3 +26,5 @@ For the real exploration ROS bridge, run the sidecar with depth enabled and poin
 ```
 
 This writes `latest.ppm`, `latest_depth.pgm`, and `latest.json`.
+
+Depth defaults to the camera's first matching Y16 profile. If you need to force a specific depth mode, pass `--depth-width`, `--depth-height`, and `--depth-fps`.

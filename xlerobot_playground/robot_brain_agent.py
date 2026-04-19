@@ -91,13 +91,20 @@ def make_handler(agent: RobotBrainAgent) -> type[BaseHTTPRequestHandler]:
         server_version = "RobotBrainAgent/0.1"
 
         def do_GET(self) -> None:
+            self._serve_get_or_head(include_body=True)
+
+        def do_HEAD(self) -> None:
+            self._serve_get_or_head(include_body=False)
+
+        def _serve_get_or_head(self, *, include_body: bool) -> None:
             if self.path == "/health":
                 self._send_json(
                     {
                         "ok": True,
                         "robot_kind": agent.config.robot_kind,
                         "motion_enabled": agent.config.allow_motion_commands,
-                    }
+                    },
+                    include_body=include_body,
                 )
                 return
             path = agent.file_path(self.path)
@@ -118,7 +125,8 @@ def make_handler(agent: RobotBrainAgent) -> type[BaseHTTPRequestHandler]:
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
-            self.wfile.write(data)
+            if include_body:
+                self.wfile.write(data)
 
         def do_POST(self) -> None:
             try:
@@ -147,13 +155,14 @@ def make_handler(agent: RobotBrainAgent) -> type[BaseHTTPRequestHandler]:
             raw = self.rfile.read(length)
             return json.loads(raw.decode("utf-8"))
 
-        def _send_json(self, payload: dict[str, Any]) -> None:
+        def _send_json(self, payload: dict[str, Any], *, include_body: bool = True) -> None:
             data = json.dumps(payload).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
-            self.wfile.write(data)
+            if include_body:
+                self.wfile.write(data)
 
     return Handler
 
