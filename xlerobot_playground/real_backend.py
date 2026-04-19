@@ -45,6 +45,12 @@ class OrbbecRgbConfig:
 
 _VR_CAMERA_FRAMES: dict[str, tuple[bytes, int, int, float]] = {}
 _VR_CAMERA_FRAMES_LOCK = threading.Lock()
+_VR_CAMERA_JPEGS: dict[str, tuple[bytes, int, int, float]] = {}
+_VR_CAMERA_JPEGS_LOCK = threading.Lock()
+_ORBBEC_JPEG_CACHE: tuple[Path, int, int, bytes, float] | None = None
+_ORBBEC_JPEG_CACHE_LOCK = threading.Lock()
+_JPEG_QUALITY = 85
+_MJPEG_BOUNDARY = b"frame"
 
 
 @dataclass(frozen=True)
@@ -296,6 +302,19 @@ def _stop_orbbec_rgb_sidecar(process: subprocess.Popen[bytes] | None) -> None:
         process.wait(timeout=3)
 
 
+def _enable_threaded_vr_http(vr_teleop: Any) -> bool:
+    module_prefix = vr_teleop.__class__.__module__.rsplit(".", 1)[0]
+    monitor_module = sys.modules.get(f"{module_prefix}.vr_monitor")
+    if monitor_module is None or not hasattr(monitor_module, "http"):
+        return False
+    http_server_module = monitor_module.http.server
+    if getattr(http_server_module, "HTTPServer", None) is http_server_module.ThreadingHTTPServer:
+        return True
+    http_server_module.ThreadingHTTPServer.daemon_threads = True
+    http_server_module.HTTPServer = http_server_module.ThreadingHTTPServer
+    return True
+
+
 def _install_orbbec_vr_overlay(vr_teleop: Any, output_dir: Path, *, include_orbbec: bool) -> bool:
     monitor = getattr(vr_teleop, "vr_monitor", None)
     if monitor is None:
@@ -314,6 +333,8 @@ def _install_orbbec_vr_overlay(vr_teleop: Any, output_dir: Path, *, include_orbb
     handler_cls.orbbec_overlay_include_orbbec = include_orbbec
 
     def do_GET(self):
+        if self.path.startswith("/orbbec/latest.mjpg"):
+            return _serve_orbbec_mjpeg_stream(self)
         if self.path.startswith("/orbbec/latest.ppm"):
             return _serve_orbbec_file(self, "latest.ppm", "image/x-portable-pixmap")
         if self.path.startswith("/orbbec/latest.json"):
@@ -350,11 +371,13 @@ def _install_orbbec_vr_overlay(vr_teleop: Any, output_dir: Path, *, include_orbb
 
 def _publish_vr_camera_frames(obs: dict[str, Any]) -> None:
     try:
+        import cv2
         import numpy as np
     except Exception:
         return
 
     frames: dict[str, tuple[bytes, int, int, float]] = {}
+    jpegs: dict[str, tuple[bytes, int, int, float]] = {}
     for name, value in obs.items():
         if name not in {"left_wrist", "right_wrist"}:
             continue
@@ -366,11 +389,19 @@ def _publish_vr_camera_frames(obs: dict[str, Any]) -> None:
         rgb = np.ascontiguousarray(array[:, :, :3])
         height, width = rgb.shape[:2]
         header = f"P6\n{width} {height}\n255\n".encode("ascii")
-        frames[name] = (header + rgb.tobytes(), width, height, time.time())
+        captured_at = time.time()
+        frames[name] = (header + rgb.tobytes(), width, height, captured_at)
+        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        ok, encoded = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), _JPEG_QUALITY])
+        if ok:
+            jpegs[name] = (encoded.tobytes(), width, height, captured_at)
 
     if frames:
         with _VR_CAMERA_FRAMES_LOCK:
             _VR_CAMERA_FRAMES.update(frames)
+    if jpegs:
+        with _VR_CAMERA_JPEGS_LOCK:
+            _VR_CAMERA_JPEGS.update(jpegs)
 
 
 def _get_robot_observation(robot: Any, *, use_camera: bool = True) -> dict[str, Any]:
@@ -380,13 +411,25 @@ def _get_robot_observation(robot: Any, *, use_camera: bool = True) -> dict[str, 
         return robot.get_observation()
 
 
+def _write_response(handler: Any, content: bytes, content_type: str) -> None:
+    handler.send_response(200)
+    handler.send_header("Content-Type", content_type)
+    handler.send_header("Content-Length", str(len(content)))
+    handler.send_header("Cache-Control", "no-store")
+    handler.end_headers()
+    handler.wfile.write(content)
+
+
 def _serve_vr_camera_file(handler: Any) -> None:
     parsed = urllib.parse.urlparse(handler.path)
     rel = parsed.path.removeprefix("/vr-camera/")
     name, suffix = Path(rel).stem, Path(rel).suffix
-    if not name or suffix not in {".ppm", ".json"}:
+    if not name or suffix not in {".ppm", ".json", ".mjpg"}:
         handler.send_error(404, "Unknown VR camera endpoint")
         return
+
+    if suffix == ".mjpg":
+        return _serve_vr_camera_mjpeg_stream(handler, name)
 
     with _VR_CAMERA_FRAMES_LOCK:
         frame = _VR_CAMERA_FRAMES.get(name)
@@ -407,17 +450,56 @@ def _serve_vr_camera_file(handler: Any) -> None:
         content = ppm
 
     try:
-        handler.send_response(200)
-        handler.send_header("Content-Type", content_type)
-        handler.send_header("Content-Length", str(len(content)))
-        handler.send_header("Cache-Control", "no-store")
-        handler.end_headers()
-        handler.wfile.write(content)
+        _write_response(handler, content, content_type)
     except (BrokenPipeError, ConnectionResetError, ssl.SSLError):
         return
     except Exception as exc:
         print(f"Error serving VR camera frame {name}: {exc}")
         handler.send_error(500, "Could not serve VR camera frame")
+
+
+def _serve_vr_camera_mjpeg_stream(handler: Any, name: str) -> None:
+    handler.send_response(200)
+    handler.send_header("Content-Type", f"multipart/x-mixed-replace; boundary={_MJPEG_BOUNDARY.decode()}")
+    handler.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+    handler.send_header("Pragma", "no-cache")
+    handler.end_headers()
+    _stream_jpeg_frames(handler, lambda: _latest_vr_camera_jpeg(name), fps=30)
+
+
+def _latest_vr_camera_jpeg(name: str) -> tuple[bytes, int, int, float] | None:
+    with _VR_CAMERA_JPEGS_LOCK:
+        return _VR_CAMERA_JPEGS.get(name)
+
+
+def _stream_jpeg_frames(
+    handler: Any,
+    latest_frame: Any,
+    *,
+    fps: int,
+) -> None:
+    last_timestamp = 0.0
+    delay = 1.0 / max(1, fps)
+    try:
+        while True:
+            frame = latest_frame()
+            if frame is None:
+                time.sleep(0.05)
+                continue
+            jpeg, _width, _height, captured_at = frame
+            if captured_at <= last_timestamp:
+                time.sleep(min(0.01, delay))
+                continue
+            last_timestamp = captured_at
+            handler.wfile.write(b"--" + _MJPEG_BOUNDARY + b"\r\n")
+            handler.wfile.write(b"Content-Type: image/jpeg\r\n")
+            handler.wfile.write(f"Content-Length: {len(jpeg)}\r\n\r\n".encode("ascii"))
+            handler.wfile.write(jpeg)
+            handler.wfile.write(b"\r\n")
+            handler.wfile.flush()
+            time.sleep(delay)
+    except (BrokenPipeError, ConnectionResetError, ssl.SSLError, ConnectionAbortedError):
+        return
 
 
 def _serve_orbbec_file(handler: Any, filename: str, content_type: str) -> None:
@@ -431,17 +513,94 @@ def _serve_orbbec_file(handler: Any, filename: str, content_type: str) -> None:
         return
     try:
         content = path.read_bytes()
-        handler.send_response(200)
-        handler.send_header("Content-Type", content_type)
-        handler.send_header("Content-Length", str(len(content)))
-        handler.send_header("Cache-Control", "no-store")
-        handler.end_headers()
-        handler.wfile.write(content)
+        _write_response(handler, content, content_type)
     except (BrokenPipeError, ConnectionResetError, ssl.SSLError):
         return
     except Exception as exc:
         print(f"Error serving Orbbec RGB file {path}: {exc}")
         handler.send_error(500, "Could not serve Orbbec RGB frame")
+
+
+def _serve_orbbec_mjpeg_stream(handler: Any) -> None:
+    handler.send_response(200)
+    handler.send_header("Content-Type", f"multipart/x-mixed-replace; boundary={_MJPEG_BOUNDARY.decode()}")
+    handler.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+    handler.send_header("Pragma", "no-cache")
+    handler.end_headers()
+    _stream_jpeg_frames(handler, lambda: _latest_orbbec_jpeg(handler), fps=30)
+
+
+def _latest_orbbec_jpeg(handler: Any) -> tuple[bytes, int, int, float] | None:
+    output_dir = getattr(handler.__class__, "orbbec_output_dir", None)
+    if output_dir is None:
+        return None
+    path = Path(output_dir) / "latest.ppm"
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return None
+
+    global _ORBBEC_JPEG_CACHE
+    with _ORBBEC_JPEG_CACHE_LOCK:
+        if (
+            _ORBBEC_JPEG_CACHE is not None
+            and _ORBBEC_JPEG_CACHE[0] == path
+            and _ORBBEC_JPEG_CACHE[1] == stat.st_mtime_ns
+            and _ORBBEC_JPEG_CACHE[2] == stat.st_size
+        ):
+            return (_ORBBEC_JPEG_CACHE[3], 0, 0, _ORBBEC_JPEG_CACHE[4])
+
+    try:
+        jpeg, width, height = _ppm_file_to_jpeg(path)
+    except Exception:
+        return None
+
+    with _ORBBEC_JPEG_CACHE_LOCK:
+        _ORBBEC_JPEG_CACHE = (path, stat.st_mtime_ns, stat.st_size, jpeg, stat.st_mtime)
+    return (jpeg, width, height, stat.st_mtime)
+
+
+def _ppm_file_to_jpeg(path: Path) -> tuple[bytes, int, int]:
+    import cv2
+    import numpy as np
+
+    data = path.read_bytes()
+    offset = 0
+
+    def skip_ws_and_comments() -> None:
+        nonlocal offset
+        while offset < len(data):
+            value = data[offset]
+            if value == 35:
+                while offset < len(data) and data[offset] != 10:
+                    offset += 1
+            elif value in (9, 10, 13, 32):
+                offset += 1
+            else:
+                break
+
+    def token() -> bytes:
+        nonlocal offset
+        skip_ws_and_comments()
+        start = offset
+        while offset < len(data) and data[offset] not in (9, 10, 13, 32, 35):
+            offset += 1
+        return data[start:offset]
+
+    magic = token()
+    width = int(token())
+    height = int(token())
+    max_value = int(token())
+    skip_ws_and_comments()
+    if magic != b"P6" or max_value != 255:
+        raise ValueError(f"Unsupported PPM header in {path}")
+    rgb = np.frombuffer(data, dtype=np.uint8, count=width * height * 3, offset=offset)
+    rgb = rgb.reshape((height, width, 3))
+    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    ok, encoded = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), _JPEG_QUALITY])
+    if not ok:
+        raise RuntimeError(f"Could not encode JPEG for {path}")
+    return encoded.tobytes(), width, height
 
 
 def _orbbec_vr_overlay_js(*, include_orbbec: bool) -> str:
@@ -450,7 +609,7 @@ def _orbbec_vr_overlay_js(*, include_orbbec: bool) -> str:
   const FEEDS = [
     {
       name: 'orbbec',
-      url: '/orbbec/latest.ppm',
+      url: '/orbbec/latest.mjpg',
       canvasId: 'orbbec-rgb-canvas',
       width: 0.8,
       height: 0.6,
@@ -460,7 +619,7 @@ def _orbbec_vr_overlay_js(*, include_orbbec: bool) -> str:
     },
     {
       name: 'left_wrist',
-      url: '/vr-camera/left_wrist.ppm',
+      url: '/vr-camera/left_wrist.mjpg',
       canvasId: 'left-wrist-rgb-canvas',
       width: 0.32,
       height: 0.24,
@@ -470,7 +629,7 @@ def _orbbec_vr_overlay_js(*, include_orbbec: bool) -> str:
     },
     {
       name: 'right_wrist',
-      url: '/vr-camera/right_wrist.ppm',
+      url: '/vr-camera/right_wrist.mjpg',
       canvasId: 'right-wrist-rgb-canvas',
       width: 0.32,
       height: 0.24,
@@ -499,6 +658,10 @@ def _orbbec_vr_overlay_js(*, include_orbbec: bool) -> str:
     }
 
     if (!overlays.has(feed.name)) {
+      const image = new Image();
+      image.crossOrigin = 'anonymous';
+      image.src = `${feed.url}?t=${Date.now()}`;
+
       const texture = new THREE.CanvasTexture(canvas);
       texture.minFilter = THREE.LinearFilter;
       texture.magFilter = THREE.LinearFilter;
@@ -525,76 +688,32 @@ def _orbbec_vr_overlay_js(*, include_orbbec: bool) -> str:
       marker.renderOrder = 1000;
       headset.object3D.add(marker);
 
-      overlays.set(feed.name, { canvas, texture, mesh, marker });
-      console.log(`[${feed.logName}] Three.js headset overlay created`);
+      overlays.set(feed.name, { canvas, texture, mesh, marker, image });
+      console.log(`[${feed.logName}] MJPEG headset overlay created`);
     }
 
     return overlays.get(feed.name);
   }
 
-  function parsePpm(buffer) {
-    const bytes = new Uint8Array(buffer);
-    let offset = 0;
-
-    function skipWhitespaceAndComments() {
-      while (offset < bytes.length) {
-        const c = bytes[offset];
-        if (c === 35) {
-          while (offset < bytes.length && bytes[offset] !== 10) offset++;
-        } else if (c === 9 || c === 10 || c === 13 || c === 32) {
-          offset++;
-        } else {
-          break;
-        }
-      }
-    }
-
-    function token() {
-      skipWhitespaceAndComments();
-      const start = offset;
-      while (offset < bytes.length) {
-        const c = bytes[offset];
-        if (c === 9 || c === 10 || c === 13 || c === 32 || c === 35) break;
-        offset++;
-      }
-      return new TextDecoder('ascii').decode(bytes.slice(start, offset));
-    }
-
-    const magic = token();
-    const width = Number(token());
-    const height = Number(token());
-    const max = Number(token());
-    skipWhitespaceAndComments();
-    if (magic !== 'P6' || !width || !height || max !== 255) {
-      throw new Error('Unsupported PPM header');
-    }
-    return { width, height, rgb: bytes.slice(offset, offset + width * height * 3) };
-  }
-
-  async function updateFrame(feed) {
+  function updateFrame(feed) {
     const nodes = ensurePanel(feed);
     if (!nodes) return;
     try {
-      const response = await fetch(`${feed.url}?t=${Date.now()}`, { cache: 'no-store' });
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const frame = parsePpm(await response.arrayBuffer());
-      const { canvas, texture, marker } = nodes;
-      canvas.width = frame.width;
-      canvas.height = frame.height;
-      const ctx = canvas.getContext('2d');
-      const image = ctx.createImageData(frame.width, frame.height);
-      for (let src = 0, dst = 0; src < frame.rgb.length; src += 3, dst += 4) {
-        image.data[dst] = frame.rgb[src];
-        image.data[dst + 1] = frame.rgb[src + 1];
-        image.data[dst + 2] = frame.rgb[src + 2];
-        image.data[dst + 3] = 255;
+      const { canvas, texture, marker, image } = nodes;
+      if (!image.naturalWidth || !image.naturalHeight) {
+        throw new Error('MJPEG image not ready');
       }
-      ctx.putImageData(image, 0, 0);
+      if (canvas.width !== image.naturalWidth || canvas.height !== image.naturalHeight) {
+        canvas.width = image.naturalWidth;
+        canvas.height = image.naturalHeight;
+      }
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
       texture.image = canvas;
       texture.needsUpdate = true;
       if (marker) marker.material.color.setHex(0x00ff00);
       if (Date.now() - lastStatusLog > 3000) {
-        console.log(`[${feed.logName}] Updated ${frame.width}x${frame.height}`);
+        console.log(`[${feed.logName}] Streaming ${canvas.width}x${canvas.height}`);
         lastStatusLog = Date.now();
       }
     } catch (error) {
@@ -607,8 +726,11 @@ def _orbbec_vr_overlay_js(*, include_orbbec: bool) -> str:
   }
 
   function start() {
-    setInterval(() => ACTIVE_FEEDS.forEach(updateFrame), 33);
-    ACTIVE_FEEDS.forEach(updateFrame);
+    function renderStreams() {
+      ACTIVE_FEEDS.forEach(updateFrame);
+      requestAnimationFrame(renderStreams);
+    }
+    renderStreams();
   }
 
   if (document.readyState === 'loading') {
@@ -762,6 +884,8 @@ def _run_vr_backend(
     if xlevr_path is not None:
         vr_overrides["xlevr_path"] = xlevr_path
     vr_teleop = interface.make_vr_teleop(**vr_overrides)
+    if _enable_threaded_vr_http(vr_teleop):
+        print("XLeVR HTTPS server patched to ThreadingHTTPServer for camera streams.")
     vr_teleop.connect(robot=robot)
     installed = _install_orbbec_vr_overlay(
         vr_teleop,
