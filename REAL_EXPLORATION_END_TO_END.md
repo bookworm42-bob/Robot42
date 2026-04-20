@@ -232,6 +232,8 @@ http://OFFLOAD_IP:8770
 
 Click `Start Explore` in the UI. The robot should begin with a slow 360 degree scan, build a partial occupancy map, detect frontiers, preview Nav2 paths, choose a frontier, and send a Nav2 navigation goal.
 
+By default this real-exploration command waits for the UI start request before moving the robot. Use `--no-wait-for-ui-start` only when you want the 360 degree scan to begin immediately after the terminal command starts.
+
 Once heuristic exploration is sane, switch to LLM policy:
 
 ```bash
@@ -275,6 +277,15 @@ Expected action servers include:
 ```
 
 During the initial scan, the robot should rotate slowly in place and the UI should move from an empty/not-started map to a partial occupancy map with candidate frontiers.
+
+If the map starts but the robot does not rotate, check whether the scan command is being published and forwarded:
+
+```bash
+ros2 topic echo /cmd_vel --once
+curl http://ROBOT_BRAIN_IP:8765/health
+```
+
+The `real_ros_bridge` terminal should log motion forwarding errors if the robot brain rejects `/cmd_vel`.
 
 ## What You Should See
 

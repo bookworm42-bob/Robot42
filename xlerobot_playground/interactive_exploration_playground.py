@@ -35,6 +35,7 @@ from xlerobot_playground.map_editing import (
     overlay_known_cells,
     overlay_occupancy_payload,
 )
+from xlerobot_playground.nav2_defaults import default_nav2_behavior_tree
 from xlerobot_playground.scan_fusion import integrate_planar_scan
 from xlerobot_playground.interactive_react_ui import INTERACTIVE_REACT_HTML
 from xlerobot_playground.ros_nav2_router import RemoteNav2RouterClient
@@ -4794,7 +4795,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--semantic-vlm-async", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--nav2-planner-id", default="GridBased")
     parser.add_argument("--nav2-controller-id", default="FollowPath")
-    parser.add_argument("--nav2-behavior-tree", default="navigate_to_pose_w_replanning_and_recovery.xml")
+    parser.add_argument("--nav2-behavior-tree", default=default_nav2_behavior_tree())
     parser.add_argument("--nav2-recovery-enabled", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--ros-navigation-map-source", choices=("fused_scan", "external"), default="fused_scan")
     parser.add_argument("--ros-map-topic", default="/map")

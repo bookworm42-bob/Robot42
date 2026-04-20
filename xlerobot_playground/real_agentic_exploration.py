@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 
+from xlerobot_playground.nav2_defaults import default_nav2_behavior_tree
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -38,6 +40,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--review-port", type=int, default=8770)
     parser.add_argument("--review-ui-flavor", choices=("user", "developer"), default="user")
     parser.add_argument("--open-browser", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--wait-for-ui-start", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--ros-navigation-map-source", choices=("fused_scan", "external"), default="fused_scan")
     parser.add_argument("--ros-map-topic", default="/map")
     parser.add_argument("--ros-scan-topic", default="/scan")
@@ -54,7 +57,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ros-manual-spin-publish-hz", type=float, default=10.0)
     parser.add_argument("--nav2-planner-id", default="GridBased")
     parser.add_argument("--nav2-controller-id", default="FollowPath")
-    parser.add_argument("--nav2-behavior-tree", default="navigate_to_pose_w_replanning_and_recovery.xml")
+    parser.add_argument("--nav2-behavior-tree", default=default_nav2_behavior_tree())
     parser.add_argument("--nav2-recovery-enabled", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--ros-allow-multiple-action-servers", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--semantic-waypoints-enabled", action=argparse.BooleanOptionalAction, default=True)
@@ -164,6 +167,7 @@ def translated_args(args: argparse.Namespace) -> list[str]:
         ("--trace-llm-stdout", "--no-trace-llm-stdout", args.trace_llm_stdout),
         ("--serve-review-ui", "--no-serve-review-ui", args.serve_review_ui),
         ("--open-browser", "--no-open-browser", args.open_browser),
+        ("--wait-for-ui-start", "--no-wait-for-ui-start", args.wait_for_ui_start),
         ("--nav2-recovery-enabled", "--no-nav2-recovery-enabled", args.nav2_recovery_enabled),
         ("--ros-allow-multiple-action-servers", "--no-ros-allow-multiple-action-servers", args.ros_allow_multiple_action_servers),
         ("--semantic-waypoints-enabled", "--no-semantic-waypoints-enabled", args.semantic_waypoints_enabled),

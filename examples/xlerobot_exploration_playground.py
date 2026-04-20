@@ -9,6 +9,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from xlerobot_playground.launcher import default_sim_python_bin, exec_python_module, resolve_repo_root
+from xlerobot_playground.nav2_defaults import default_nav2_behavior_tree
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -80,7 +81,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--nav2-mode", choices=("simulated", "ros"), default="simulated")
     parser.add_argument("--nav2-planner-id", default="GridBased")
     parser.add_argument("--nav2-controller-id", default="FollowPath")
-    parser.add_argument("--nav2-behavior-tree", default="navigate_to_pose_w_replanning_and_recovery.xml")
+    parser.add_argument("--nav2-behavior-tree", default=default_nav2_behavior_tree())
     parser.add_argument("--nav2-recovery-enabled", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--ros-navigation-map-source", choices=("fused_scan", "external"), default="fused_scan")
     parser.add_argument("--ros-map-topic", default="/map")

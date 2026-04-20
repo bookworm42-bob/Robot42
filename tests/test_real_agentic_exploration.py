@@ -17,6 +17,7 @@ class RealAgenticExplorationTests(unittest.TestCase):
         self.assertIn("--nav2-mode", translated)
         self.assertEqual(translated[translated.index("--nav2-mode") + 1], "ros")
         self.assertIn("--serve-review-ui", translated)
+        self.assertIn("--wait-for-ui-start", translated)
         self.assertIn("--ros-navigation-map-source", translated)
         self.assertEqual(translated[translated.index("--ros-navigation-map-source") + 1], "fused_scan")
         self.assertEqual(translated[translated.index("--source") + 1], "real_xlerobot")
