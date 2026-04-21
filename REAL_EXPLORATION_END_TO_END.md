@@ -152,8 +152,11 @@ python -m xlerobot_playground.rgbd_visual_odometry \
   --camera-info-topic /camera/head/camera_info \
   --imu-topic /imu \
   --odom-topic /odom \
+  --imu-frame-convention camera_optical \
   --publish-rate-hz 15
 ```
+
+For Gemini 2, keep `--imu-frame-convention camera_optical`. The node converts raw camera optical IMU vectors into robot `base_link` axes before using yaw rate or planar acceleration.
 
 Quick checks:
 

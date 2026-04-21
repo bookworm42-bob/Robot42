@@ -48,6 +48,22 @@ def angle_delta(current: float, previous: float) -> float:
     return math.atan2(math.sin(current - previous), math.cos(current - previous))
 
 
+def imu_value_from_source(*, source: str, gyro_x: float, gyro_y: float, gyro_z: float) -> float:
+    normalized = str(source).strip().lower()
+    if normalized == "x":
+        return gyro_x
+    if normalized == "y":
+        return gyro_y
+    if normalized == "z":
+        return gyro_z
+    if normalized in {"robot_yaw", "optical_yaw"}:
+        # Gemini 2 publishes raw sensor data in camera optical coordinates:
+        # optical X right, Y down, Z forward. For an aligned robot body,
+        # base_link yaw rate (around Z up) maps to -optical Y.
+        return -gyro_y
+    raise ValueError(f"Unsupported IMU source: {source}")
+
+
 class RotationDiagnosticNode(Node):
     def __init__(
         self,
@@ -193,12 +209,12 @@ class RotationDiagnosticNode(Node):
                 gyro_x = float(imu_sample["angular_velocity_x_rad_s"])
                 gyro_y = float(imu_sample["angular_velocity_y_rad_s"])
                 gyro_z = float(imu_sample["angular_velocity_z_rad_s"])
-                if self.imu_axis == "x":
-                    gyro_axis_value = gyro_x
-                elif self.imu_axis == "y":
-                    gyro_axis_value = gyro_y
-                else:
-                    gyro_axis_value = gyro_z
+                gyro_axis_value = imu_value_from_source(
+                    source=self.imu_axis,
+                    gyro_x=gyro_x,
+                    gyro_y=gyro_y,
+                    gyro_z=gyro_z,
+                )
                 imu_dt_s = self.sample_dt_s if previous_imu_stamp_s is None else max(0.0, imu_stamp_s - previous_imu_stamp_s)
                 previous_imu_stamp_s = imu_stamp_s
                 unwrapped_imu_yaw += gyro_axis_value * imu_dt_s
@@ -288,11 +304,14 @@ def _summarize_imu(samples: list[dict[str, Any]]) -> dict[str, Any]:
     end = valid[-1]
     elapsed_s = max(float(end["t_s"]) - float(start["t_s"]), 1e-6)
     yaw_delta_rad = float(end["imu_unwrapped_yaw_rad"]) - float(start["imu_unwrapped_yaw_rad"])
+    yaw_delta_deg = float(end["imu_unwrapped_yaw_deg"]) - float(start["imu_unwrapped_yaw_deg"])
     return {
         "valid_sample_count": len(valid),
         "elapsed_s": round(elapsed_s, 3),
+        "reported_turn_deg": round(yaw_delta_deg, 2),
+        "reported_turn_rad": round(yaw_delta_rad, 4),
         "unwrapped_yaw_delta_rad": round(yaw_delta_rad, 4),
-        "unwrapped_yaw_delta_deg": round(math.degrees(yaw_delta_rad), 2),
+        "unwrapped_yaw_delta_deg": round(yaw_delta_deg, 2),
         "mean_yaw_rate_rad_s": round(yaw_delta_rad / elapsed_s, 4),
         "start": {
             "yaw_deg": start["imu_unwrapped_yaw_deg"],
@@ -331,7 +350,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cmd-vel-topic", default="/cmd_vel")
     parser.add_argument("--odom-topic", default="/odom")
     parser.add_argument("--imu-topic", default="/imu")
-    parser.add_argument("--imu-axis", choices=("x", "y", "z"), default="z")
+    parser.add_argument(
+        "--imu-axis",
+        choices=("x", "y", "z", "robot_yaw", "optical_yaw"),
+        default="robot_yaw",
+        help="Raw IMU axis or derived robot yaw source. For an aligned Gemini 2 camera, use robot_yaw.",
+    )
     parser.add_argument("--angular-rad-s", type=float, default=0.10)
     parser.add_argument(
         "--target-yaw-deg",
@@ -343,7 +367,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--target-source",
         choices=("tf", "odom", "imu"),
         default="tf",
-        help="Source used by --target-yaw-deg. Use 'tf' for odom->base_link, 'odom' for /odom, or 'imu' for integrated gyro z.",
+        help="Source used by --target-yaw-deg. Use 'tf' for odom->base_link, 'odom' for /odom, or 'imu' for integrated selected IMU source.",
     )
     parser.add_argument(
         "--send-motion",
@@ -382,6 +406,9 @@ def main(argv: list[str] | None = None) -> int:
         json_path.parent.mkdir(parents=True, exist_ok=True)
         json_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
         print(json.dumps(summary, indent=2, sort_keys=True))
+        imu_reported_turn_deg = summary.get("imu", {}).get("reported_turn_deg")
+        if imu_reported_turn_deg is not None:
+            print(f"Reported IMU turn: {imu_reported_turn_deg} deg")
         print(f"Wrote samples: {Path(args.csv_out).expanduser()}")
         print(f"Wrote summary: {json_path}")
         return 0 if (

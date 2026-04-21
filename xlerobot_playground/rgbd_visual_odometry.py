@@ -68,6 +68,7 @@ class RgbdVoConfig:
     imu_max_planar_speed_m_s: float = 0.75
     vo_translation_weight: float = 0.85
     imu_stale_after_s: float = 0.5
+    imu_frame_convention: str = "camera_optical"
     camera_x_m: float = 0.0
     camera_y_m: float = 0.0
     camera_yaw_rad: float = 0.0
@@ -139,6 +140,23 @@ def compose_planar_local(pose: PlanarPose, *, delta_x_m: float, delta_y_m: float
 
 def stamp_to_seconds(stamp: Any) -> float:
     return float(stamp.sec) + float(stamp.nanosec) / 1_000_000_000.0
+
+
+def imu_to_base_components(
+    *,
+    frame_convention: str,
+    x: float,
+    y: float,
+    z: float,
+) -> tuple[float, float, float]:
+    normalized = str(frame_convention).strip().lower()
+    if normalized == "base_link":
+        return x, y, z
+    if normalized == "camera_optical":
+        # ROS base_link: X forward, Y left, Z up
+        # Camera optical: X right, Y down, Z forward
+        return z, -x, -y
+    raise ValueError(f"Unsupported IMU frame convention: {frame_convention}")
 
 
 def intrinsics_from_camera_info(message: Any) -> CameraIntrinsics:
@@ -315,8 +333,12 @@ class RgbdVisualOdometryNode(Node):
         dt = max(0.0, min(stamp_s - previous_stamp_s, 0.5))
         if dt <= 1e-6:
             return 0.0, 0.0, 0.0
-        ax = float(self.latest_imu.linear_acceleration.x)
-        ay = float(self.latest_imu.linear_acceleration.y)
+        ax, ay, _ = imu_to_base_components(
+            frame_convention=self.config.imu_frame_convention,
+            x=float(self.latest_imu.linear_acceleration.x),
+            y=float(self.latest_imu.linear_acceleration.y),
+            z=float(self.latest_imu.linear_acceleration.z),
+        )
         damping = max(0.0, 1.0 - self.config.imu_velocity_damping_per_s * dt)
         self.planar_velocity_x_m_s = max(
             -self.config.imu_max_planar_speed_m_s,
@@ -326,7 +348,13 @@ class RgbdVisualOdometryNode(Node):
             -self.config.imu_max_planar_speed_m_s,
             min(self.config.imu_max_planar_speed_m_s, (self.planar_velocity_y_m_s + ay * dt) * damping),
         )
-        delta_yaw_rad = float(self.latest_imu.angular_velocity.z) * dt
+        _, _, yaw_rate_rad_s = imu_to_base_components(
+            frame_convention=self.config.imu_frame_convention,
+            x=float(self.latest_imu.angular_velocity.x),
+            y=float(self.latest_imu.angular_velocity.y),
+            z=float(self.latest_imu.angular_velocity.z),
+        )
+        delta_yaw_rad = yaw_rate_rad_s * dt
         delta_x_m = self.planar_velocity_x_m_s * dt + 0.5 * ax * dt * dt
         delta_y_m = self.planar_velocity_y_m_s * dt + 0.5 * ay * dt * dt
         return delta_x_m, delta_y_m, delta_yaw_rad
@@ -397,7 +425,13 @@ class RgbdVisualOdometryNode(Node):
         odom.twist.twist.linear.x = float(self.planar_velocity_x_m_s)
         odom.twist.twist.linear.y = float(self.planar_velocity_y_m_s)
         if self.latest_imu is not None:
-            odom.twist.twist.angular.z = float(self.latest_imu.angular_velocity.z)
+            _, _, yaw_rate_rad_s = imu_to_base_components(
+                frame_convention=self.config.imu_frame_convention,
+                x=float(self.latest_imu.angular_velocity.x),
+                y=float(self.latest_imu.angular_velocity.y),
+                z=float(self.latest_imu.angular_velocity.z),
+            )
+            odom.twist.twist.angular.z = yaw_rate_rad_s
         self.odom_publisher.publish(odom)
 
         transform = TransformStamped()
@@ -443,6 +477,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--imu-max-planar-speed-m-s", type=float, default=0.75)
     parser.add_argument("--vo-translation-weight", type=float, default=0.85)
     parser.add_argument("--imu-stale-after-s", type=float, default=0.5)
+    parser.add_argument(
+        "--imu-frame-convention",
+        choices=("camera_optical", "base_link"),
+        default="camera_optical",
+        help="Interpret raw IMU vectors in camera optical coordinates or already-rotated base_link coordinates.",
+    )
     parser.add_argument("--camera-x-m", type=float, default=0.0)
     parser.add_argument("--camera-y-m", type=float, default=0.0)
     parser.add_argument("--camera-yaw-rad", type=float, default=0.0)
@@ -470,6 +510,7 @@ def config_from_args(args: argparse.Namespace) -> RgbdVoConfig:
         imu_max_planar_speed_m_s=args.imu_max_planar_speed_m_s,
         vo_translation_weight=args.vo_translation_weight,
         imu_stale_after_s=args.imu_stale_after_s,
+        imu_frame_convention=args.imu_frame_convention,
         camera_x_m=args.camera_x_m,
         camera_y_m=args.camera_y_m,
         camera_yaw_rad=args.camera_yaw_rad,
