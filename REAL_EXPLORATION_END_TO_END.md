@@ -43,6 +43,8 @@ repeat scan/frontier/decision/navigation
 save the final map JSON
 ```
 
+`real_agentic_exploration` now starts from a clean in-memory map by default even when `--persist-path` points to an existing JSON. Pass `--restore-persisted-state` only when you explicitly want to resume the backend/UI snapshot from that file.
+
 ## Robot Brain
 
 Run these on the robot brain Mac. Keep both terminals running.
@@ -90,7 +92,7 @@ python -m xlerobot_playground.robot_brain_agent \
   --port1 /dev/tty.usbmodem5B140330101 \
   --port2 /dev/tty.usbmodem5B140332271 \
   --max-linear-m-s 0.03 \
-  --max-angular-rad-s 0.10 \
+  --max-angular-rad-s 0.30 \
   --orbbec-output-dir artifacts/orbbec_rgbd
 ```
 
@@ -119,7 +121,7 @@ python -m xlerobot_playground.real_ros_bridge \
   --publish-rate-hz 10 \
   --cmd-vel-timeout-s 0.5 \
   --max-linear-m-s 0.03 \
-  --max-angular-rad-s 0.10 \
+  --max-angular-rad-s 0.30 \
   --camera-x-m 0.0 \
   --camera-y-m 0.0 \
   --camera-z-m 0.35 \
@@ -223,7 +225,7 @@ python -m xlerobot_playground.real_agentic_exploration \
   --ros-navigation-map-source fused_scan \
   --ros-ready-timeout-s 30 \
   --ros-turn-scan-timeout-s 75 \
-  --ros-manual-spin-angular-speed-rad-s 0.10 \
+  --ros-manual-spin-angular-speed-rad-s 0.30 \
   --max-decisions 8
 ```
 
@@ -233,7 +235,7 @@ Open the UI from your browser:
 http://OFFLOAD_IP:8770
 ```
 
-Click `Start Explore` in the UI. The robot should begin with a slow 360 degree scan, build a partial occupancy map, detect frontiers, preview Nav2 paths, choose a frontier, and send a Nav2 navigation goal.
+Click `Start Explore` in the UI. The robot should begin with a faster right-turn 360 degree scan, build a partial occupancy map, detect frontiers, preview Nav2 paths, choose a frontier, and send a Nav2 navigation goal.
 
 By default this real-exploration command waits for the UI start request before moving the robot. Use `--no-wait-for-ui-start` only when you want the 360 degree scan to begin immediately after the terminal command starts.
 
@@ -253,7 +255,7 @@ python -m xlerobot_playground.real_agentic_exploration \
   --ros-navigation-map-source fused_scan \
   --ros-ready-timeout-s 30 \
   --ros-turn-scan-timeout-s 75 \
-  --ros-manual-spin-angular-speed-rad-s 0.10 \
+  --ros-manual-spin-angular-speed-rad-s 0.30 \
   --max-decisions 8
 ```
 
@@ -279,7 +281,7 @@ Expected action servers include:
 /navigate_to_pose
 ```
 
-During the initial scan, the robot should rotate slowly in place and the UI should move from an empty/not-started map to a partial occupancy map with candidate frontiers.
+During the initial scan, the robot should rotate to the right in place and the UI should move from an empty/not-started map to a partial occupancy map with candidate frontiers.
 
 If the map starts but the robot does not rotate, check whether the scan command is being published and forwarded:
 

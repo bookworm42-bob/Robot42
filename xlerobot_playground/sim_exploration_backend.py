@@ -4407,6 +4407,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--repo-root", default=str(resolve_xlerobot_repo_root()))
     parser.add_argument("--persist-path", default="./artifacts/xlerobot_exploration_map.json")
+    parser.add_argument("--restore-persisted-state", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--area", default="apartment")
     parser.add_argument("--session", default="house_v1")
     parser.add_argument("--source", default="operator")
@@ -4513,6 +4514,7 @@ def main(argv: list[str] | None = None) -> int:
         ExplorationBackendConfig(
             mode="sim",
             persist_path=args.persist_path,
+            restore_persisted_state=args.restore_persisted_state,
             occupancy_resolution=args.occupancy_resolution,
         )
     )

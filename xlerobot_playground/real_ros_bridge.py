@@ -609,7 +609,18 @@ class RealXLeRobotRosBridge(Node):
         if frame.imu_sample is None:
             return
         msg = Imu()
-        msg.header.stamp = stamp
+        imu_timestamp_s = frame.imu_sample.get("timestamp_s")
+        if imu_timestamp_s is None:
+            msg.header.stamp = stamp
+        else:
+            timestamp_s = float(imu_timestamp_s)
+            sec = int(math.floor(timestamp_s))
+            nanosec = int(round((timestamp_s - sec) * 1_000_000_000.0))
+            if nanosec >= 1_000_000_000:
+                sec += 1
+                nanosec -= 1_000_000_000
+            msg.header.stamp.sec = sec
+            msg.header.stamp.nanosec = nanosec
         msg.header.frame_id = self.config.head_camera_frame
         msg.orientation_covariance[0] = -1.0
         angular = frame.imu_sample.get("angular_velocity_rad_s", {})

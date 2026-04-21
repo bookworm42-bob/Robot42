@@ -122,6 +122,7 @@ class RosRuntimeConfig:
     turn_scan_settle_s: float = 1.0
     manual_spin_angular_speed_rad_s: float = 0.25
     manual_spin_publish_hz: float = 20.0
+    manual_spin_direction_sign: float = -1.0
     allow_multiple_action_servers: bool = False
     publish_internal_navigation_map: bool = True
 
@@ -557,9 +558,10 @@ class RosExplorationRuntime(Node):
         should_cancel: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
         twist = Twist()
-        direction = 1.0 if target_yaw_rad >= 0.0 else -1.0
+        target_direction = 1.0 if target_yaw_rad >= 0.0 else -1.0
+        command_direction = target_direction * (-1.0 if float(self.config.manual_spin_direction_sign) < 0.0 else 1.0)
         max_command_speed = abs(float(self.config.manual_spin_angular_speed_rad_s))
-        twist.angular.z = direction * max_command_speed
+        twist.angular.z = command_direction * max_command_speed
         fallback_duration_s = abs(target_yaw_rad) / max(max_command_speed, 1e-6)
         step_s = 1.0 / max(self.config.manual_spin_publish_hz, 1e-6)
         timeout_s = max(float(self.config.turn_scan_timeout_s), fallback_duration_s * 3.0, fallback_duration_s + 5.0)
@@ -584,9 +586,9 @@ class RosExplorationRuntime(Node):
                     break
                 if remaining_yaw < slowdown_zone_rad:
                     scaled_speed = max_command_speed * (remaining_yaw / slowdown_zone_rad)
-                    twist.angular.z = direction * max(minimum_command_speed, scaled_speed)
+                    twist.angular.z = command_direction * max(minimum_command_speed, scaled_speed)
                 else:
-                    twist.angular.z = direction * max_command_speed
+                    twist.angular.z = command_direction * max_command_speed
             self._cmd_vel_pub.publish(twist)
             rclpy.spin_once(self, timeout_sec=0.0)
             pose = self.current_pose_in_frame(self.config.odom_frame)
@@ -637,7 +639,7 @@ class RosExplorationRuntime(Node):
             "spin_stop_reason": stop_reason,
             "spin_feedback_frame": self.config.odom_frame if used_odom_feedback else "time_fallback",
             "actual_unwrapped_yaw_delta_rad": round(accumulated_yaw, 3) if used_odom_feedback else None,
-            "spin_command_angular_speed_rad_s": round(direction * max_command_speed, 3),
+            "spin_command_angular_speed_rad_s": round(command_direction * max_command_speed, 3),
             "spin_timeout_s": round(timeout_s, 3),
         }
 

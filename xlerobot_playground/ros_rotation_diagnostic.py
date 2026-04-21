@@ -14,12 +14,14 @@ try:
     from nav_msgs.msg import Odometry
     from rclpy.node import Node
     from rclpy.time import Time as RosTime
+    from sensor_msgs.msg import Imu
     from tf2_ros import Buffer, ConnectivityException, ExtrapolationException, LookupException, TransformListener
 except Exception as exc:  # pragma: no cover - runtime guard for non-ROS test envs.
     IMPORT_ERROR: Exception | None = exc
     rclpy = None
     Twist = None
     Odometry = None
+    Imu = None
     Node = object
     RosTime = None
     Buffer = None
@@ -54,17 +56,22 @@ class RotationDiagnosticNode(Node):
         base_frame: str,
         cmd_vel_topic: str,
         odom_topic: str,
+        imu_topic: str,
+        imu_axis: str,
         sample_hz: float,
     ) -> None:
         super().__init__("xlerobot_rotation_diagnostic")
         self.odom_frame = odom_frame
         self.base_frame = base_frame
+        self.imu_axis = str(imu_axis).strip().lower()
         self.sample_dt_s = 1.0 / max(float(sample_hz), 1e-6)
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self, spin_thread=False)
         self.cmd_vel_pub = self.create_publisher(Twist, cmd_vel_topic, 10)
         self.latest_odom_pose: dict[str, float] | None = None
+        self.latest_imu_sample: dict[str, float] | None = None
         self.create_subscription(Odometry, odom_topic, self._on_odom, 10)
+        self.create_subscription(Imu, imu_topic, self._on_imu, 50)
 
     def _on_odom(self, message: Any) -> None:
         position = message.pose.pose.position
@@ -73,6 +80,21 @@ class RotationDiagnosticNode(Node):
             "x": float(position.x),
             "y": float(position.y),
             "yaw_rad": yaw_from_quaternion_xyzw(rotation.x, rotation.y, rotation.z, rotation.w),
+        }
+
+    def _on_imu(self, message: Any) -> None:
+        stamp = getattr(message, "header", None)
+        stamp_s = time.time()
+        if stamp is not None:
+            stamp_s = float(getattr(stamp.stamp, "sec", 0)) + float(getattr(stamp.stamp, "nanosec", 0)) / 1_000_000_000.0
+        self.latest_imu_sample = {
+            "timestamp_s": stamp_s,
+            "angular_velocity_x_rad_s": float(message.angular_velocity.x),
+            "angular_velocity_y_rad_s": float(message.angular_velocity.y),
+            "angular_velocity_z_rad_s": float(message.angular_velocity.z),
+            "linear_acceleration_x_m_s2": float(message.linear_acceleration.x),
+            "linear_acceleration_y_m_s2": float(message.linear_acceleration.y),
+            "linear_acceleration_z_m_s2": float(message.linear_acceleration.z),
         }
 
     def lookup_pose(self) -> dict[str, float] | None:
@@ -111,8 +133,10 @@ class RotationDiagnosticNode(Node):
         target_abs_yaw_rad = abs(float(target_yaw_rad)) if target_yaw_rad is not None else None
         previous_tf_yaw: float | None = None
         previous_odom_yaw: float | None = None
+        previous_imu_stamp_s: float | None = None
         unwrapped_tf_yaw = 0.0
         unwrapped_odom_yaw = 0.0
+        unwrapped_imu_yaw = 0.0
         stop_reason = "duration_timeout"
         while time.time() < deadline:
             now = time.time()
@@ -121,6 +145,7 @@ class RotationDiagnosticNode(Node):
             rclpy.spin_once(self, timeout_sec=0.0)
             pose = self.lookup_pose()
             odom_pose = self.latest_odom_pose
+            imu_sample = self.latest_imu_sample
             sample: dict[str, Any] = {
                 "t_s": round(now - start, 4),
                 "cmd_angular_rad_s": angular_rad_s if send_motion else 0.0,
@@ -159,6 +184,39 @@ class RotationDiagnosticNode(Node):
                         "odom_yaw_deg": math.degrees(odom_yaw),
                         "odom_unwrapped_yaw_rad": unwrapped_odom_yaw,
                         "odom_unwrapped_yaw_deg": math.degrees(unwrapped_odom_yaw),
+                    }
+                )
+            if imu_sample is None:
+                sample["imu_available"] = False
+            else:
+                imu_stamp_s = float(imu_sample["timestamp_s"])
+                gyro_x = float(imu_sample["angular_velocity_x_rad_s"])
+                gyro_y = float(imu_sample["angular_velocity_y_rad_s"])
+                gyro_z = float(imu_sample["angular_velocity_z_rad_s"])
+                if self.imu_axis == "x":
+                    gyro_axis_value = gyro_x
+                elif self.imu_axis == "y":
+                    gyro_axis_value = gyro_y
+                else:
+                    gyro_axis_value = gyro_z
+                imu_dt_s = self.sample_dt_s if previous_imu_stamp_s is None else max(0.0, imu_stamp_s - previous_imu_stamp_s)
+                previous_imu_stamp_s = imu_stamp_s
+                unwrapped_imu_yaw += gyro_axis_value * imu_dt_s
+                sample.update(
+                    {
+                        "imu_available": True,
+                        "imu_timestamp_s": imu_stamp_s,
+                        "imu_dt_s": imu_dt_s,
+                        "imu_axis": self.imu_axis,
+                        "imu_angular_velocity_x_rad_s": gyro_x,
+                        "imu_angular_velocity_y_rad_s": gyro_y,
+                        "imu_angular_velocity_z_rad_s": gyro_z,
+                        "imu_angular_velocity_axis_rad_s": gyro_axis_value,
+                        "imu_linear_acceleration_x_m_s2": float(imu_sample["linear_acceleration_x_m_s2"]),
+                        "imu_linear_acceleration_y_m_s2": float(imu_sample["linear_acceleration_y_m_s2"]),
+                        "imu_linear_acceleration_z_m_s2": float(imu_sample["linear_acceleration_z_m_s2"]),
+                        "imu_unwrapped_yaw_rad": unwrapped_imu_yaw,
+                        "imu_unwrapped_yaw_deg": math.degrees(unwrapped_imu_yaw),
                     }
                 )
             samples.append(sample)
@@ -215,6 +273,43 @@ def summarize(samples: list[dict[str, Any]]) -> dict[str, Any]:
         "stop_reason": samples[-1].get("stop_reason") if samples else "no_samples",
         "tf": _summarize_source(samples, prefix="tf"),
         "odom_topic": _summarize_source(samples, prefix="odom"),
+        "imu": _summarize_imu(samples),
+    }
+
+
+def _summarize_imu(samples: list[dict[str, Any]]) -> dict[str, Any]:
+    valid = [sample for sample in samples if sample.get("imu_available")]
+    if not valid:
+        return {
+            "valid_sample_count": 0,
+            "message": "No IMU samples were available.",
+        }
+    start = valid[0]
+    end = valid[-1]
+    elapsed_s = max(float(end["t_s"]) - float(start["t_s"]), 1e-6)
+    yaw_delta_rad = float(end["imu_unwrapped_yaw_rad"]) - float(start["imu_unwrapped_yaw_rad"])
+    return {
+        "valid_sample_count": len(valid),
+        "elapsed_s": round(elapsed_s, 3),
+        "unwrapped_yaw_delta_rad": round(yaw_delta_rad, 4),
+        "unwrapped_yaw_delta_deg": round(math.degrees(yaw_delta_rad), 2),
+        "mean_yaw_rate_rad_s": round(yaw_delta_rad / elapsed_s, 4),
+        "start": {
+            "yaw_deg": start["imu_unwrapped_yaw_deg"],
+            "axis": start["imu_axis"],
+            "angular_velocity_axis_rad_s": start["imu_angular_velocity_axis_rad_s"],
+            "angular_velocity_x_rad_s": start["imu_angular_velocity_x_rad_s"],
+            "angular_velocity_y_rad_s": start["imu_angular_velocity_y_rad_s"],
+            "angular_velocity_z_rad_s": start["imu_angular_velocity_z_rad_s"],
+        },
+        "end": {
+            "yaw_deg": end["imu_unwrapped_yaw_deg"],
+            "axis": end["imu_axis"],
+            "angular_velocity_axis_rad_s": end["imu_angular_velocity_axis_rad_s"],
+            "angular_velocity_x_rad_s": end["imu_angular_velocity_x_rad_s"],
+            "angular_velocity_y_rad_s": end["imu_angular_velocity_y_rad_s"],
+            "angular_velocity_z_rad_s": end["imu_angular_velocity_z_rad_s"],
+        },
     }
 
 
@@ -235,6 +330,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--base-frame", default="base_link")
     parser.add_argument("--cmd-vel-topic", default="/cmd_vel")
     parser.add_argument("--odom-topic", default="/odom")
+    parser.add_argument("--imu-topic", default="/imu")
+    parser.add_argument("--imu-axis", choices=("x", "y", "z"), default="z")
     parser.add_argument("--angular-rad-s", type=float, default=0.10)
     parser.add_argument(
         "--target-yaw-deg",
@@ -244,9 +341,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--target-source",
-        choices=("tf", "odom"),
+        choices=("tf", "odom", "imu"),
         default="tf",
-        help="Pose source used by --target-yaw-deg. Use 'tf' for odom->base_link or 'odom' for /odom.",
+        help="Source used by --target-yaw-deg. Use 'tf' for odom->base_link, 'odom' for /odom, or 'imu' for integrated gyro z.",
     )
     parser.add_argument(
         "--send-motion",
@@ -267,6 +364,8 @@ def main(argv: list[str] | None = None) -> int:
         base_frame=args.base_frame,
         cmd_vel_topic=args.cmd_vel_topic,
         odom_topic=args.odom_topic,
+        imu_topic=args.imu_topic,
+        imu_axis=args.imu_axis,
         sample_hz=args.sample_hz,
     )
     try:
@@ -285,7 +384,11 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(summary, indent=2, sort_keys=True))
         print(f"Wrote samples: {Path(args.csv_out).expanduser()}")
         print(f"Wrote summary: {json_path}")
-        return 0 if summary.get("tf", {}).get("valid_pose_count", 0) or summary.get("odom_topic", {}).get("valid_pose_count", 0) else 2
+        return 0 if (
+            summary.get("tf", {}).get("valid_pose_count", 0)
+            or summary.get("odom_topic", {}).get("valid_pose_count", 0)
+            or summary.get("imu", {}).get("valid_sample_count", 0)
+        ) else 2
     finally:
         node.stop()
         node.destroy_node()

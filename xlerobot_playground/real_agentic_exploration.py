@@ -13,6 +13,7 @@ def build_parser() -> argparse.ArgumentParser:
         )
     )
     parser.add_argument("--persist-path", default="./artifacts/real_xlerobot_exploration_map.json")
+    parser.add_argument("--restore-persisted-state", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--session", default="real_house_v1")
     parser.add_argument("--area", default="real_space")
     parser.add_argument("--source", default="real_xlerobot")
@@ -53,7 +54,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ros-ready-timeout-s", type=float, default=30.0)
     parser.add_argument("--ros-turn-scan-timeout-s", type=float, default=75.0)
     parser.add_argument("--ros-turn-scan-settle-s", type=float, default=1.0)
-    parser.add_argument("--ros-manual-spin-angular-speed-rad-s", type=float, default=0.10)
+    parser.add_argument("--ros-manual-spin-angular-speed-rad-s", type=float, default=0.30)
     parser.add_argument("--ros-manual-spin-publish-hz", type=float, default=10.0)
     parser.add_argument("--nav2-planner-id", default="GridBased")
     parser.add_argument("--nav2-controller-id", default="FollowPath")
@@ -75,6 +76,7 @@ def translated_args(args: argparse.Namespace) -> list[str]:
     items = [
         "--persist-path",
         args.persist_path,
+        "--restore-persisted-state" if args.restore_persisted_state else "--no-restore-persisted-state",
         "--area",
         args.area,
         "--session",
