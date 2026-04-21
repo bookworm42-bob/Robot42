@@ -47,7 +47,7 @@ class OrbbecFilesystemConfig:
     output_dir: Path = Path("artifacts/orbbec_rgbd")
     rgb_filename: str = "latest.ppm"
     depth_filename: str = "latest_depth.pgm"
-    imu_filename: str = "latest.json"
+    imu_filename: str = "latest_imu.json"
     horizontal_fov_rad: float = DEFAULT_ORBBEC_HORIZONTAL_FOV_RAD
 
 
@@ -77,6 +77,7 @@ class RealRosBridgeConfig:
     camera_yaw_rad: float = 0.0
     publish_head_camera: bool = True
     publish_rate_hz: float = 10.0
+    imu_publish_rate_hz: float = 200.0
     cmd_vel_timeout_s: float = 0.5
     laser_min_range_m: float = 0.05
     laser_max_range_m: float = 6.0
@@ -400,10 +401,6 @@ class RobotBrainRgbdSource:
             depth, depth_width, depth_height = parse_depth_pgm_mm(self.client.get_bytes("/depth"))
         except Exception:
             pass
-        try:
-            imu_sample = parse_imu_json(self.client.get_bytes("/imu"))
-        except Exception:
-            pass
         return RgbdFrame(
             rgb=rgb,
             rgb_width=rgb_width,
@@ -448,6 +445,7 @@ class RealXLeRobotRosBridge(Node):
         super().__init__("xlerobot_real_ros_bridge")
         self.config = config
         brain_client = RobotBrainClient(config.robot_brain_url) if config.robot_brain_url else None
+        self.brain_client = brain_client
         if runtime is not None:
             self.runtime = runtime
         elif brain_client is not None:
@@ -481,6 +479,7 @@ class RealXLeRobotRosBridge(Node):
         self._last_linear = 0.0
         self._last_angular = 0.0
         self._last_motion_error = ""
+        self._last_imu_timestamp_s: float | None = None
 
         self.create_subscription(Twist, config.cmd_vel_topic, self._on_cmd_vel, 10)
         self.odom_publisher = None
@@ -496,6 +495,7 @@ class RealXLeRobotRosBridge(Node):
             self.head_depth_publisher = self.create_publisher(Image, "/camera/head/depth/image_raw", 10)
             self.head_camera_info_publisher = self.create_publisher(CameraInfo, "/camera/head/camera_info", 10)
         self.timer = self.create_timer(1.0 / max(config.publish_rate_hz, 1e-6), self.step)
+        self.imu_timer = self.create_timer(1.0 / max(config.imu_publish_rate_hz, 1e-6), self._poll_and_publish_imu)
         self.get_logger().info(
             "Real bridge ready: "
             f"robot={config.robot_kind} port1={config.port1} port2={config.port2} "
@@ -526,9 +526,32 @@ class RealXLeRobotRosBridge(Node):
         frame = self.rgbd_source.capture()
         stamp = self.get_clock().now().to_msg()
         self._publish_transforms(stamp=stamp, linear=linear, angular=angular)
-        self._publish_imu(frame=frame, stamp=stamp)
         self._publish_scan(frame=frame, stamp=stamp)
         self._publish_head_images(frame=frame, stamp=stamp)
+
+    def _capture_imu_sample(self) -> dict[str, Any] | None:
+        if self.brain_client is not None:
+            try:
+                return parse_imu_json(self.brain_client.get_bytes("/imu"))
+            except Exception:
+                return None
+        imu_path = self.config.orbbec.output_dir.expanduser().resolve() / self.config.orbbec.imu_filename
+        if not imu_path.exists():
+            return None
+        try:
+            return read_imu_json(imu_path)
+        except Exception:
+            return None
+
+    def _poll_and_publish_imu(self) -> None:
+        imu_sample = self._capture_imu_sample()
+        if imu_sample is None:
+            return
+        timestamp_s = float(imu_sample.get("timestamp_s", time.time()))
+        if self._last_imu_timestamp_s is not None and timestamp_s <= self._last_imu_timestamp_s:
+            return
+        self._last_imu_timestamp_s = timestamp_s
+        self._publish_imu_sample(imu_sample=imu_sample)
 
     def _drive_or_stop(self, *, linear: float, angular: float) -> bool:
         try:
@@ -605,12 +628,11 @@ class RealXLeRobotRosBridge(Node):
         transforms.extend([camera_tf, laser_tf])
         self.tf_broadcaster.sendTransform(transforms)
 
-    def _publish_imu(self, *, frame: RgbdFrame, stamp: Any) -> None:
-        if frame.imu_sample is None:
-            return
+    def _publish_imu_sample(self, *, imu_sample: dict[str, Any]) -> None:
         msg = Imu()
-        imu_timestamp_s = frame.imu_sample.get("timestamp_s")
+        imu_timestamp_s = imu_sample.get("timestamp_s")
         if imu_timestamp_s is None:
+            stamp = self.get_clock().now().to_msg()
             msg.header.stamp = stamp
         else:
             timestamp_s = float(imu_timestamp_s)
@@ -623,8 +645,8 @@ class RealXLeRobotRosBridge(Node):
             msg.header.stamp.nanosec = nanosec
         msg.header.frame_id = self.config.head_camera_frame
         msg.orientation_covariance[0] = -1.0
-        angular = frame.imu_sample.get("angular_velocity_rad_s", {})
-        linear = frame.imu_sample.get("linear_acceleration_m_s2", {})
+        angular = imu_sample.get("angular_velocity_rad_s", {})
+        linear = imu_sample.get("linear_acceleration_m_s2", {})
         msg.angular_velocity.x = float(angular.get("x", 0.0))
         msg.angular_velocity.y = float(angular.get("y", 0.0))
         msg.angular_velocity.z = float(angular.get("z", 0.0))
@@ -637,7 +659,7 @@ class RealXLeRobotRosBridge(Node):
         msg.linear_acceleration_covariance[0] = 0.1
         msg.linear_acceleration_covariance[4] = 0.1
         msg.linear_acceleration_covariance[8] = 0.1
-        orientation = frame.imu_sample.get("orientation_xyzw")
+        orientation = imu_sample.get("orientation_xyzw")
         if isinstance(orientation, dict):
             msg.orientation = _quaternion_msg(
                 float(orientation.get("x", 0.0)),
@@ -803,6 +825,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--camera-yaw-rad", type=float, default=0.0)
     parser.add_argument("--publish-head-camera", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--publish-rate-hz", type=float, default=10.0)
+    parser.add_argument("--imu-publish-rate-hz", type=float, default=200.0)
     parser.add_argument("--cmd-vel-timeout-s", type=float, default=0.5)
     parser.add_argument("--laser-min-range-m", type=float, default=0.05)
     parser.add_argument("--laser-max-range-m", type=float, default=6.0)
@@ -813,8 +836,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--orbbec-depth-filename", default="latest_depth.pgm")
     parser.add_argument(
         "--orbbec-imu-filename",
-        default="latest.json",
-        help="JSON file that carries the latest Orbbec IMU sample. Default reuses latest.json metadata.",
+        default="latest_imu.json",
+        help="JSON file that carries the latest Orbbec IMU sample. Default uses latest_imu.json.",
     )
     parser.add_argument("--orbbec-horizontal-fov-rad", type=float, default=DEFAULT_ORBBEC_HORIZONTAL_FOV_RAD)
     parser.add_argument(
@@ -854,6 +877,7 @@ def config_from_args(args: argparse.Namespace) -> RealRosBridgeConfig:
         camera_yaw_rad=args.camera_yaw_rad,
         publish_head_camera=args.publish_head_camera,
         publish_rate_hz=args.publish_rate_hz,
+        imu_publish_rate_hz=args.imu_publish_rate_hz,
         cmd_vel_timeout_s=args.cmd_vel_timeout_s,
         laser_min_range_m=args.laser_min_range_m,
         laser_max_range_m=args.laser_max_range_m,

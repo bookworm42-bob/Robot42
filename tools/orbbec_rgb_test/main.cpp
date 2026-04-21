@@ -294,6 +294,44 @@ void write_latest_metadata(
     fs::rename(tmp_path, path);
 }
 
+void write_latest_imu_atomic(const fs::path &path, const LatestImuSample &imu_sample) {
+    const auto tmp_path = path.string() + ".tmp";
+    std::ofstream out(tmp_path);
+    if(!out) {
+        throw std::runtime_error("Could not open IMU metadata file: " + tmp_path);
+    }
+    out << "{\n"
+        << "  \"imu\": {\n"
+        << "    \"has_accel\": " << (imu_sample.has_accel ? "true" : "false") << ",\n"
+        << "    \"has_gyro\": " << (imu_sample.has_gyro ? "true" : "false") << ",\n";
+    if(imu_sample.has_accel) {
+        out << "    \"linear_acceleration_m_s2\": {\n"
+            << "      \"x\": " << imu_sample.accel_value.x << ",\n"
+            << "      \"y\": " << imu_sample.accel_value.y << ",\n"
+            << "      \"z\": " << imu_sample.accel_value.z << "\n"
+            << "    },\n"
+            << "    \"accel_frame_index\": " << imu_sample.accel_frame_index << ",\n"
+            << "    \"accel_timestamp_us\": " << imu_sample.accel_timestamp_us << ",\n"
+            << "    \"accel_temperature_c\": " << imu_sample.accel_temperature << ",\n";
+    }
+    if(imu_sample.has_gyro) {
+        out << "    \"angular_velocity_rad_s\": {\n"
+            << "      \"x\": " << imu_sample.gyro_value.x << ",\n"
+            << "      \"y\": " << imu_sample.gyro_value.y << ",\n"
+            << "      \"z\": " << imu_sample.gyro_value.z << "\n"
+            << "    },\n"
+            << "    \"gyro_frame_index\": " << imu_sample.gyro_frame_index << ",\n"
+            << "    \"gyro_timestamp_us\": " << imu_sample.gyro_timestamp_us << ",\n"
+            << "    \"gyro_temperature_c\": " << imu_sample.gyro_temperature << ",\n";
+    }
+    const uint64_t latest_imu_timestamp_us = std::max(imu_sample.accel_timestamp_us, imu_sample.gyro_timestamp_us);
+    out << "    \"system_timestamp_us\": " << latest_imu_timestamp_us << "\n"
+        << "  }\n"
+        << "}\n";
+    out.close();
+    fs::rename(tmp_path, path);
+}
+
 int main(int argc, char **argv) try {
     const Options options = parse_args(argc, argv);
     fs::create_directories(options.output_dir);
@@ -367,6 +405,14 @@ int main(int argc, char **argv) try {
                     latest_imu_sample.gyro_timestamp_us = gyro_frame->getTimeStampUs();
                     latest_imu_sample.gyro_temperature = gyro_frame->getTemperature();
                     latest_imu_sample.gyro_value = gyro_frame->getValue();
+                }
+                if(latest_imu_sample.has_accel || latest_imu_sample.has_gyro) {
+                    try {
+                        write_latest_imu_atomic(options.output_dir / "latest_imu.json", latest_imu_sample);
+                    }
+                    catch(const std::exception &e) {
+                        std::cerr << "Failed to write latest_imu.json: " << e.what() << "\n";
+                    }
                 }
             });
             imu_running = true;

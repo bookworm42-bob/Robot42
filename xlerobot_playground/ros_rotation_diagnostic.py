@@ -75,17 +75,24 @@ class RotationDiagnosticNode(Node):
         imu_topic: str,
         imu_axis: str,
         sample_hz: float,
+        imu_bias_calibration_s: float,
+        imu_bias_min_samples: int,
     ) -> None:
         super().__init__("xlerobot_rotation_diagnostic")
         self.odom_frame = odom_frame
         self.base_frame = base_frame
         self.imu_axis = str(imu_axis).strip().lower()
         self.sample_dt_s = 1.0 / max(float(sample_hz), 1e-6)
+        self.imu_bias_calibration_s = max(float(imu_bias_calibration_s), 0.0)
+        self.imu_bias_min_samples = max(int(imu_bias_min_samples), 1)
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self, spin_thread=False)
         self.cmd_vel_pub = self.create_publisher(Twist, cmd_vel_topic, 10)
         self.latest_odom_pose: dict[str, float] | None = None
         self.latest_imu_sample: dict[str, float] | None = None
+        self.imu_bias_x_rad_s = 0.0
+        self.imu_bias_y_rad_s = 0.0
+        self.imu_bias_z_rad_s = 0.0
         self.create_subscription(Odometry, odom_topic, self._on_odom, 10)
         self.create_subscription(Imu, imu_topic, self._on_imu, 50)
 
@@ -103,6 +110,16 @@ class RotationDiagnosticNode(Node):
         stamp_s = time.time()
         if stamp is not None:
             stamp_s = float(getattr(stamp.stamp, "sec", 0)) + float(getattr(stamp.stamp, "nanosec", 0)) / 1_000_000_000.0
+        orientation_yaw_rad = None
+        covariance = getattr(message, "orientation_covariance", None)
+        if covariance is not None and len(covariance) >= 1 and float(covariance[0]) >= 0.0:
+            orientation = message.orientation
+            orientation_yaw_rad = yaw_from_quaternion_xyzw(
+                float(orientation.x),
+                float(orientation.y),
+                float(orientation.z),
+                float(orientation.w),
+            )
         self.latest_imu_sample = {
             "timestamp_s": stamp_s,
             "angular_velocity_x_rad_s": float(message.angular_velocity.x),
@@ -111,6 +128,7 @@ class RotationDiagnosticNode(Node):
             "linear_acceleration_x_m_s2": float(message.linear_acceleration.x),
             "linear_acceleration_y_m_s2": float(message.linear_acceleration.y),
             "linear_acceleration_z_m_s2": float(message.linear_acceleration.z),
+            "orientation_yaw_rad": orientation_yaw_rad,
         }
 
     def lookup_pose(self) -> dict[str, float] | None:
@@ -134,6 +152,48 @@ class RotationDiagnosticNode(Node):
     def stop(self) -> None:
         self.cmd_vel_pub.publish(Twist())
 
+    def calibrate_imu_bias(self) -> dict[str, float] | None:
+        if self.imu_bias_calibration_s <= 1e-6:
+            return {
+                "bias_x_rad_s": self.imu_bias_x_rad_s,
+                "bias_y_rad_s": self.imu_bias_y_rad_s,
+                "bias_z_rad_s": self.imu_bias_z_rad_s,
+                "sample_count": 0,
+                "elapsed_s": 0.0,
+            }
+        start = time.time()
+        deadline = start + self.imu_bias_calibration_s
+        sum_x = 0.0
+        sum_y = 0.0
+        sum_z = 0.0
+        count = 0
+        last_timestamp_s: float | None = None
+        while time.time() < deadline:
+            rclpy.spin_once(self, timeout_sec=min(self.sample_dt_s, 0.05))
+            imu_sample = self.latest_imu_sample
+            if imu_sample is None:
+                continue
+            timestamp_s = float(imu_sample["timestamp_s"])
+            if last_timestamp_s is not None and timestamp_s <= last_timestamp_s:
+                continue
+            last_timestamp_s = timestamp_s
+            sum_x += float(imu_sample["angular_velocity_x_rad_s"])
+            sum_y += float(imu_sample["angular_velocity_y_rad_s"])
+            sum_z += float(imu_sample["angular_velocity_z_rad_s"])
+            count += 1
+        if count < self.imu_bias_min_samples:
+            return None
+        self.imu_bias_x_rad_s = sum_x / count
+        self.imu_bias_y_rad_s = sum_y / count
+        self.imu_bias_z_rad_s = sum_z / count
+        return {
+            "bias_x_rad_s": self.imu_bias_x_rad_s,
+            "bias_y_rad_s": self.imu_bias_y_rad_s,
+            "bias_z_rad_s": self.imu_bias_z_rad_s,
+            "sample_count": count,
+            "elapsed_s": round(time.time() - start, 3),
+        }
+
     def collect(
         self,
         *,
@@ -144,15 +204,18 @@ class RotationDiagnosticNode(Node):
         target_source: str = "tf",
     ) -> list[dict[str, Any]]:
         samples: list[dict[str, Any]] = []
+        imu_bias = self.calibrate_imu_bias()
         start = time.time()
         deadline = start + max(float(duration_s), 0.0)
         target_abs_yaw_rad = abs(float(target_yaw_rad)) if target_yaw_rad is not None else None
         previous_tf_yaw: float | None = None
         previous_odom_yaw: float | None = None
         previous_imu_stamp_s: float | None = None
+        previous_imu_orientation_yaw: float | None = None
         unwrapped_tf_yaw = 0.0
         unwrapped_odom_yaw = 0.0
         unwrapped_imu_yaw = 0.0
+        unwrapped_imu_orientation_yaw = 0.0
         stop_reason = "duration_timeout"
         while time.time() < deadline:
             now = time.time()
@@ -166,6 +229,14 @@ class RotationDiagnosticNode(Node):
                 "t_s": round(now - start, 4),
                 "cmd_angular_rad_s": angular_rad_s if send_motion else 0.0,
             }
+            if imu_bias is not None:
+                sample.update(
+                    {
+                        "imu_bias_x_rad_s": imu_bias["bias_x_rad_s"],
+                        "imu_bias_y_rad_s": imu_bias["bias_y_rad_s"],
+                        "imu_bias_z_rad_s": imu_bias["bias_z_rad_s"],
+                    }
+                )
             if pose is None:
                 sample["tf_pose_available"] = False
             else:
@@ -206,9 +277,13 @@ class RotationDiagnosticNode(Node):
                 sample["imu_available"] = False
             else:
                 imu_stamp_s = float(imu_sample["timestamp_s"])
-                gyro_x = float(imu_sample["angular_velocity_x_rad_s"])
-                gyro_y = float(imu_sample["angular_velocity_y_rad_s"])
-                gyro_z = float(imu_sample["angular_velocity_z_rad_s"])
+                raw_gyro_x = float(imu_sample["angular_velocity_x_rad_s"])
+                raw_gyro_y = float(imu_sample["angular_velocity_y_rad_s"])
+                raw_gyro_z = float(imu_sample["angular_velocity_z_rad_s"])
+                orientation_yaw_rad = imu_sample.get("orientation_yaw_rad")
+                gyro_x = raw_gyro_x - self.imu_bias_x_rad_s
+                gyro_y = raw_gyro_y - self.imu_bias_y_rad_s
+                gyro_z = raw_gyro_z - self.imu_bias_z_rad_s
                 gyro_axis_value = imu_value_from_source(
                     source=self.imu_axis,
                     gyro_x=gyro_x,
@@ -218,12 +293,21 @@ class RotationDiagnosticNode(Node):
                 imu_dt_s = self.sample_dt_s if previous_imu_stamp_s is None else max(0.0, imu_stamp_s - previous_imu_stamp_s)
                 previous_imu_stamp_s = imu_stamp_s
                 unwrapped_imu_yaw += gyro_axis_value * imu_dt_s
+                orientation_available = orientation_yaw_rad is not None
+                if orientation_available:
+                    orientation_yaw_value = float(orientation_yaw_rad)
+                    if previous_imu_orientation_yaw is not None:
+                        unwrapped_imu_orientation_yaw += angle_delta(orientation_yaw_value, previous_imu_orientation_yaw)
+                    previous_imu_orientation_yaw = orientation_yaw_value
                 sample.update(
                     {
                         "imu_available": True,
                         "imu_timestamp_s": imu_stamp_s,
                         "imu_dt_s": imu_dt_s,
                         "imu_axis": self.imu_axis,
+                        "imu_raw_angular_velocity_x_rad_s": raw_gyro_x,
+                        "imu_raw_angular_velocity_y_rad_s": raw_gyro_y,
+                        "imu_raw_angular_velocity_z_rad_s": raw_gyro_z,
                         "imu_angular_velocity_x_rad_s": gyro_x,
                         "imu_angular_velocity_y_rad_s": gyro_y,
                         "imu_angular_velocity_z_rad_s": gyro_z,
@@ -233,11 +317,19 @@ class RotationDiagnosticNode(Node):
                         "imu_linear_acceleration_z_m_s2": float(imu_sample["linear_acceleration_z_m_s2"]),
                         "imu_unwrapped_yaw_rad": unwrapped_imu_yaw,
                         "imu_unwrapped_yaw_deg": math.degrees(unwrapped_imu_yaw),
+                        "imu_orientation_available": orientation_available,
+                        "imu_orientation_yaw_rad": float(orientation_yaw_rad) if orientation_available else None,
+                        "imu_orientation_yaw_deg": math.degrees(float(orientation_yaw_rad)) if orientation_available else None,
+                        "imu_orientation_unwrapped_yaw_rad": unwrapped_imu_orientation_yaw,
+                        "imu_orientation_unwrapped_yaw_deg": math.degrees(unwrapped_imu_orientation_yaw),
                     }
                 )
             samples.append(sample)
             if target_abs_yaw_rad is not None:
-                unwrapped_key = f"{target_source}_unwrapped_yaw_rad"
+                if target_source == "imu" and sample.get("imu_orientation_available"):
+                    unwrapped_key = "imu_orientation_unwrapped_yaw_rad"
+                else:
+                    unwrapped_key = f"{target_source}_unwrapped_yaw_rad"
                 if unwrapped_key in sample and abs(float(sample[unwrapped_key])) >= target_abs_yaw_rad:
                     stop_reason = f"target_{target_source}_yaw_reached"
                     break
@@ -284,13 +376,20 @@ def _summarize_source(samples: list[dict[str, Any]], *, prefix: str) -> dict[str
 
 
 def summarize(samples: list[dict[str, Any]]) -> dict[str, Any]:
-    return {
+    summary = {
         "sample_count": len(samples),
         "stop_reason": samples[-1].get("stop_reason") if samples else "no_samples",
         "tf": _summarize_source(samples, prefix="tf"),
         "odom_topic": _summarize_source(samples, prefix="odom"),
         "imu": _summarize_imu(samples),
     }
+    if samples and "imu_bias_x_rad_s" in samples[0]:
+        summary["imu_bias"] = {
+            "bias_x_rad_s": round(float(samples[0]["imu_bias_x_rad_s"]), 6),
+            "bias_y_rad_s": round(float(samples[0]["imu_bias_y_rad_s"]), 6),
+            "bias_z_rad_s": round(float(samples[0]["imu_bias_z_rad_s"]), 6),
+        }
+    return summary
 
 
 def _summarize_imu(samples: list[dict[str, Any]]) -> dict[str, Any]:
@@ -305,7 +404,7 @@ def _summarize_imu(samples: list[dict[str, Any]]) -> dict[str, Any]:
     elapsed_s = max(float(end["t_s"]) - float(start["t_s"]), 1e-6)
     yaw_delta_rad = float(end["imu_unwrapped_yaw_rad"]) - float(start["imu_unwrapped_yaw_rad"])
     yaw_delta_deg = float(end["imu_unwrapped_yaw_deg"]) - float(start["imu_unwrapped_yaw_deg"])
-    return {
+    summary = {
         "valid_sample_count": len(valid),
         "elapsed_s": round(elapsed_s, 3),
         "reported_turn_deg": round(yaw_delta_deg, 2),
@@ -330,7 +429,26 @@ def _summarize_imu(samples: list[dict[str, Any]]) -> dict[str, Any]:
             "angular_velocity_z_rad_s": end["imu_angular_velocity_z_rad_s"],
         },
     }
-
+    orientation_valid = [sample for sample in valid if sample.get("imu_orientation_available")]
+    if orientation_valid:
+        start_orientation = orientation_valid[0]
+        end_orientation = orientation_valid[-1]
+        orientation_delta_rad = float(end_orientation["imu_orientation_unwrapped_yaw_rad"]) - float(
+            start_orientation["imu_orientation_unwrapped_yaw_rad"]
+        )
+        orientation_delta_deg = float(end_orientation["imu_orientation_unwrapped_yaw_deg"]) - float(
+            start_orientation["imu_orientation_unwrapped_yaw_deg"]
+        )
+        summary["orientation"] = {
+            "valid_sample_count": len(orientation_valid),
+            "reported_turn_deg": round(orientation_delta_deg, 2),
+            "reported_turn_rad": round(orientation_delta_rad, 4),
+            "start_yaw_deg": round(float(start_orientation["imu_orientation_yaw_deg"]), 2),
+            "end_yaw_deg": round(float(end_orientation["imu_orientation_yaw_deg"]), 2),
+        }
+        summary["reported_turn_deg"] = round(orientation_delta_deg, 2)
+        summary["reported_turn_rad"] = round(orientation_delta_rad, 4)
+    return summary
 
 def write_csv(path: Path, samples: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -345,6 +463,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Record odometry yaw during passive or commanded in-place rotation.")
     parser.add_argument("--duration-s", type=float, default=20.0)
     parser.add_argument("--sample-hz", type=float, default=10.0)
+    parser.add_argument("--imu-bias-calibration-s", type=float, default=2.0)
+    parser.add_argument("--imu-bias-min-samples", type=int, default=20)
     parser.add_argument("--odom-frame", default="odom")
     parser.add_argument("--base-frame", default="base_link")
     parser.add_argument("--cmd-vel-topic", default="/cmd_vel")
@@ -391,6 +511,8 @@ def main(argv: list[str] | None = None) -> int:
         imu_topic=args.imu_topic,
         imu_axis=args.imu_axis,
         sample_hz=args.sample_hz,
+        imu_bias_calibration_s=args.imu_bias_calibration_s,
+        imu_bias_min_samples=args.imu_bias_min_samples,
     )
     try:
         samples = node.collect(

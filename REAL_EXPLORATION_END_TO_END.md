@@ -61,6 +61,7 @@ sudo ./build/orbbec_rgb_test/orbbec_rgb_test \
   --frames 0 \
   --latest-only \
   --enable-depth \
+  --enable-imu \
   --output-dir artifacts/orbbec_rgbd
 ```
 
@@ -71,6 +72,7 @@ sudo ./build/orbbec_rgb_test/orbbec_rgb_test \
   --frames 0 \
   --latest-only \
   --enable-depth \
+  --enable-imu \
   --depth-width 640 \
   --depth-height 576 \
   --depth-fps 30 \
@@ -119,6 +121,7 @@ source /home/alin/Robot42/.venv-maniskill/bin/activate
 python -m xlerobot_playground.real_ros_bridge \
   --robot-brain-url http://192.168.1.133:8765 \
   --publish-rate-hz 10 \
+  --imu-publish-rate-hz 200 \
   --cmd-vel-timeout-s 0.5 \
   --max-linear-m-s 0.03 \
   --max-angular-rad-s 0.30 \
@@ -139,7 +142,32 @@ ros2 topic echo /imu --once
 curl http://ROBOT_BRAIN_IP:8765/health
 ```
 
-### Terminal OC-2: RGB-D Visual Odometry
+### Terminal OC-2: IMU Yaw Filter
+
+```bash
+cd /home/alin/Robot42
+source /opt/ros/humble/setup.bash
+source /home/alin/Robot42/.venv-maniskill/bin/activate
+
+python -m xlerobot_playground.imu_yaw_filter \
+  --imu-topic /imu \
+  --output-topic /imu/filtered_yaw \
+  --input-frame-convention camera_optical \
+  --yaw-source gyro_y \
+  --bias-calibration-s 0.5 \
+  --yaw-rate-lowpass-alpha 0.2
+```
+
+This matches the OrbbecViewer CSV path: integrate corrected `gyro_y`.
+Keep the robot still for the first 0.5 seconds after startup so the yaw filter calibrates gyro bias cleanly.
+
+Quick checks:
+
+```bash
+ros2 topic echo /imu/filtered_yaw --once
+```
+
+### Terminal OC-3: RGB-D Visual Odometry
 
 ```bash
 cd /home/alin/Robot42
@@ -150,13 +178,14 @@ python -m xlerobot_playground.rgbd_visual_odometry \
   --rgb-topic /camera/head/image_raw \
   --depth-topic /camera/head/depth/image_raw \
   --camera-info-topic /camera/head/camera_info \
-  --imu-topic /imu \
+  --imu-topic /imu/filtered_yaw \
   --odom-topic /odom \
-  --imu-frame-convention camera_optical \
+  --imu-frame-convention base_link \
+  --imu-bias-calibration-s 0.0 \
   --publish-rate-hz 15
 ```
 
-For Gemini 2, keep `--imu-frame-convention camera_optical`. The node converts raw camera optical IMU vectors into robot `base_link` axes before using yaw rate or planar acceleration.
+This consumes the filtered yaw IMU topic, which is already bias-corrected and expressed in `base_link`.
 
 Quick checks:
 
@@ -165,7 +194,7 @@ ros2 topic echo /odom --once
 ros2 run tf2_ros tf2_echo odom base_link
 ```
 
-### Terminal OC-3: Nav2 Params
+### Terminal OC-4: Nav2 Params
 
 Generate the conservative Nav2 params once:
 
@@ -188,7 +217,7 @@ python -m xlerobot_playground.real_nav2_config \
   --local-costmap-height 2
 ```
 
-### Terminal OC-4: Nav2
+### Terminal OC-5: Nav2
 
 ```bash
 cd /home/alin/Robot42
@@ -209,7 +238,7 @@ ros2 action list | grep compute_path_to_pose
 ros2 action list | grep navigate_to_pose
 ```
 
-### Terminal OC-5: Real Exploration UI And Loop
+### Terminal OC-6: Real Exploration UI And Loop
 
 Start with heuristic policy first. This tests mapping, frontiers, path previews, Nav2 goal execution, and UI without spending LLM calls.
 

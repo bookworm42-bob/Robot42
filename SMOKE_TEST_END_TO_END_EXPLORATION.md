@@ -46,6 +46,7 @@ cmake --build build/orbbec_rgb_test
   --frames 0 \
   --latest-only \
   --enable-depth \
+  --enable-imu \
   --output-dir artifacts/orbbec_rgbd
 ```
 
@@ -123,6 +124,7 @@ source /opt/ros/humble/setup.bash
 python -m xlerobot_playground.real_ros_bridge \
   --robot-brain-url http://ROBOT_BRAIN_IP:8765 \
   --publish-rate-hz 10 \
+  --imu-publish-rate-hz 200 \
   --camera-x-m 0.0 \
   --camera-y-m 0.0 \
   --camera-z-m 0.35 \
@@ -139,7 +141,31 @@ ros2 topic echo /scan --once
 ros2 topic echo /imu --once
 ```
 
-### Terminal OFF-2: RGB-D Visual Odometry
+### Terminal OFF-2: IMU Yaw Filter
+
+```bash
+cd /home/alin/Robot42
+source /opt/ros/humble/setup.bash
+
+python -m xlerobot_playground.imu_yaw_filter \
+  --imu-topic /imu \
+  --output-topic /imu/filtered_yaw \
+  --input-frame-convention camera_optical \
+  --yaw-source gyro_y \
+  --bias-calibration-s 0.5 \
+  --yaw-rate-lowpass-alpha 0.2
+```
+
+This matches the OrbbecViewer CSV path: integrate corrected `gyro_y`.
+Keep the robot still for the first 0.5 seconds after startup so the yaw filter calibrates gyro bias cleanly.
+
+In another offload terminal, do not continue until this works:
+
+```bash
+ros2 topic echo /imu/filtered_yaw --once
+```
+
+### Terminal OFF-3: RGB-D Visual Odometry
 
 Start this only after the `real_ros_bridge` camera topics above are alive. This process creates `/odom` from RGB-D and publishes `odom -> base_link`.
 
@@ -151,10 +177,14 @@ python -m xlerobot_playground.rgbd_visual_odometry \
   --rgb-topic /camera/head/image_raw \
   --depth-topic /camera/head/depth/image_raw \
   --camera-info-topic /camera/head/camera_info \
-  --imu-topic /imu \
+  --imu-topic /imu/filtered_yaw \
   --odom-topic /odom \
+  --imu-frame-convention base_link \
+  --imu-bias-calibration-s 0.0 \
   --publish-rate-hz 15
 ```
+
+This consumes the filtered yaw IMU topic, which is already bias-corrected and expressed in `base_link`.
 
 In another offload terminal, do not continue until these work:
 
@@ -163,7 +193,7 @@ ros2 topic echo /odom --once
 ros2 run tf2_ros tf2_echo odom base_link
 ```
 
-### Terminal OFF-3: SLAM Toolbox Or Fake Map
+### Terminal OFF-4: SLAM Toolbox Or Fake Map
 
 For the current tiny smoke-test experiment, use the fake map path first. Skip SLAM Toolbox and let the Nav2 router publish a small all-free map. This is enough for:
 
@@ -188,7 +218,7 @@ ros2 launch slam_toolbox online_async_launch.py \
 
 Use SLAM Toolbox later when the real `/scan` and odometry path are stable.
 
-### Terminal OFF-4: Nav2
+### Terminal OFF-5: Nav2
 
 ```bash
 cd /home/alin/Robot42
@@ -200,7 +230,7 @@ ros2 launch nav2_bringup navigation_launch.py \
   params_file:=/home/alin/Robot42/artifacts/nav2/xlerobot_nav2_params.yaml
 ```
 
-### Terminal OFF-5: Nav2 HTTP Router With Fake Map
+### Terminal OFF-6: Nav2 HTTP Router With Fake Map
 
 ```bash
 cd /home/alin/Robot42

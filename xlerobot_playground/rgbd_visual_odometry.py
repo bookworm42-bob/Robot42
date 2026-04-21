@@ -69,6 +69,8 @@ class RgbdVoConfig:
     vo_translation_weight: float = 0.85
     imu_stale_after_s: float = 0.5
     imu_frame_convention: str = "camera_optical"
+    imu_bias_calibration_s: float = 2.0
+    imu_bias_min_samples: int = 20
     camera_x_m: float = 0.0
     camera_y_m: float = 0.0
     camera_yaw_rad: float = 0.0
@@ -293,6 +295,16 @@ class RgbdVisualOdometryNode(Node):
         self.planar_velocity_x_m_s = 0.0
         self.planar_velocity_y_m_s = 0.0
         self._last_prediction_stamp_s: float | None = None
+        self._imu_bias_started_s: float | None = None
+        self._imu_bias_last_stamp_s: float | None = None
+        self._imu_bias_sample_count = 0
+        self._imu_bias_sum_x = 0.0
+        self._imu_bias_sum_y = 0.0
+        self._imu_bias_sum_z = 0.0
+        self._imu_bias_ready = self.config.imu_bias_calibration_s <= 1e-6
+        self._imu_bias_x_rad_s = 0.0
+        self._imu_bias_y_rad_s = 0.0
+        self._imu_bias_z_rad_s = 0.0
         self.accepted_updates = 0
         self.rejected_updates = 0
         self.create_subscription(Image, config.rgb_topic, self._on_rgb, 10)
@@ -317,8 +329,37 @@ class RgbdVisualOdometryNode(Node):
 
     def _on_imu(self, message: Any) -> None:
         self.latest_imu = message
+        if self._imu_bias_ready or message.header.stamp is None:
+            return
+        stamp_s = stamp_to_seconds(message.header.stamp)
+        if self._imu_bias_started_s is None:
+            self._imu_bias_started_s = stamp_s
+        if self._imu_bias_last_stamp_s is not None and stamp_s <= self._imu_bias_last_stamp_s:
+            return
+        self._imu_bias_last_stamp_s = stamp_s
+        self._imu_bias_sum_x += float(message.angular_velocity.x)
+        self._imu_bias_sum_y += float(message.angular_velocity.y)
+        self._imu_bias_sum_z += float(message.angular_velocity.z)
+        self._imu_bias_sample_count += 1
+        elapsed_s = stamp_s - self._imu_bias_started_s
+        if (
+            elapsed_s >= self.config.imu_bias_calibration_s
+            and self._imu_bias_sample_count >= self.config.imu_bias_min_samples
+        ):
+            self._imu_bias_x_rad_s = self._imu_bias_sum_x / self._imu_bias_sample_count
+            self._imu_bias_y_rad_s = self._imu_bias_sum_y / self._imu_bias_sample_count
+            self._imu_bias_z_rad_s = self._imu_bias_sum_z / self._imu_bias_sample_count
+            self._imu_bias_ready = True
+            self.get_logger().info(
+                "IMU gyro bias calibrated: "
+                f"x={self._imu_bias_x_rad_s:.6f} y={self._imu_bias_y_rad_s:.6f} z={self._imu_bias_z_rad_s:.6f} "
+                f"from {self._imu_bias_sample_count} samples over {elapsed_s:.2f}s"
+            )
 
     def _predict_from_imu(self, *, stamp_s: float) -> tuple[float, float, float]:
+        if not self._imu_bias_ready:
+            self._last_prediction_stamp_s = stamp_s
+            return 0.0, 0.0, 0.0
         if self.latest_imu is None or self.latest_imu.header.stamp is None:
             self._last_prediction_stamp_s = stamp_s
             return 0.0, 0.0, 0.0
@@ -350,9 +391,9 @@ class RgbdVisualOdometryNode(Node):
         )
         _, _, yaw_rate_rad_s = imu_to_base_components(
             frame_convention=self.config.imu_frame_convention,
-            x=float(self.latest_imu.angular_velocity.x),
-            y=float(self.latest_imu.angular_velocity.y),
-            z=float(self.latest_imu.angular_velocity.z),
+            x=float(self.latest_imu.angular_velocity.x) - self._imu_bias_x_rad_s,
+            y=float(self.latest_imu.angular_velocity.y) - self._imu_bias_y_rad_s,
+            z=float(self.latest_imu.angular_velocity.z) - self._imu_bias_z_rad_s,
         )
         delta_yaw_rad = yaw_rate_rad_s * dt
         delta_x_m = self.planar_velocity_x_m_s * dt + 0.5 * ax * dt * dt
@@ -424,12 +465,12 @@ class RgbdVisualOdometryNode(Node):
         odom.pose.covariance[35] = 0.10
         odom.twist.twist.linear.x = float(self.planar_velocity_x_m_s)
         odom.twist.twist.linear.y = float(self.planar_velocity_y_m_s)
-        if self.latest_imu is not None:
+        if self.latest_imu is not None and self._imu_bias_ready:
             _, _, yaw_rate_rad_s = imu_to_base_components(
                 frame_convention=self.config.imu_frame_convention,
-                x=float(self.latest_imu.angular_velocity.x),
-                y=float(self.latest_imu.angular_velocity.y),
-                z=float(self.latest_imu.angular_velocity.z),
+                x=float(self.latest_imu.angular_velocity.x) - self._imu_bias_x_rad_s,
+                y=float(self.latest_imu.angular_velocity.y) - self._imu_bias_y_rad_s,
+                z=float(self.latest_imu.angular_velocity.z) - self._imu_bias_z_rad_s,
             )
             odom.twist.twist.angular.z = yaw_rate_rad_s
         self.odom_publisher.publish(odom)
@@ -477,6 +518,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--imu-max-planar-speed-m-s", type=float, default=0.75)
     parser.add_argument("--vo-translation-weight", type=float, default=0.85)
     parser.add_argument("--imu-stale-after-s", type=float, default=0.5)
+    parser.add_argument("--imu-bias-calibration-s", type=float, default=2.0)
+    parser.add_argument("--imu-bias-min-samples", type=int, default=20)
     parser.add_argument(
         "--imu-frame-convention",
         choices=("camera_optical", "base_link"),
@@ -510,6 +553,8 @@ def config_from_args(args: argparse.Namespace) -> RgbdVoConfig:
         imu_max_planar_speed_m_s=args.imu_max_planar_speed_m_s,
         vo_translation_weight=args.vo_translation_weight,
         imu_stale_after_s=args.imu_stale_after_s,
+        imu_bias_calibration_s=args.imu_bias_calibration_s,
+        imu_bias_min_samples=args.imu_bias_min_samples,
         imu_frame_convention=args.imu_frame_convention,
         camera_x_m=args.camera_x_m,
         camera_y_m=args.camera_y_m,

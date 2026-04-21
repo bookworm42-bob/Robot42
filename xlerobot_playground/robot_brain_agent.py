@@ -33,7 +33,7 @@ class RobotBrainAgentConfig:
     rgb_filename: str = "latest.ppm"
     depth_filename: str = "latest_depth.pgm"
     metadata_filename: str = "latest.json"
-    imu_filename: str = "latest.json"
+    imu_filename: str = "latest_imu.json"
 
 
 class RobotBrainAgent:
