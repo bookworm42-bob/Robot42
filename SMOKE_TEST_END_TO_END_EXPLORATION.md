@@ -110,6 +110,7 @@ First verify the offload computer can fetch camera data from the robot brain:
 curl --max-time 3 http://ROBOT_BRAIN_IP:8765/health
 curl --max-time 3 http://ROBOT_BRAIN_IP:8765/rgb --output /tmp/xlerobot_rgb.ppm
 curl --max-time 3 http://ROBOT_BRAIN_IP:8765/depth --output /tmp/xlerobot_depth.pgm
+curl --max-time 3 http://ROBOT_BRAIN_IP:8765/imu
 ls -lh /tmp/xlerobot_rgb.ppm /tmp/xlerobot_depth.pgm
 ```
 
@@ -135,6 +136,7 @@ ros2 topic echo /camera/head/camera_info --once
 ros2 topic echo /camera/head/image_raw --once
 ros2 topic echo /camera/head/depth/image_raw --once
 ros2 topic echo /scan --once
+ros2 topic echo /imu --once
 ```
 
 ### Terminal OFF-2: RGB-D Visual Odometry
@@ -149,6 +151,7 @@ python -m xlerobot_playground.rgbd_visual_odometry \
   --rgb-topic /camera/head/image_raw \
   --depth-topic /camera/head/depth/image_raw \
   --camera-info-topic /camera/head/camera_info \
+  --imu-topic /imu \
   --odom-topic /odom \
   --publish-rate-hz 15
 ```

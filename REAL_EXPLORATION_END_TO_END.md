@@ -100,6 +100,7 @@ Quick health checks from the robot brain:
 curl http://127.0.0.1:8765/health
 curl http://127.0.0.1:8765/rgb --output /tmp/brain_rgb.ppm
 curl http://127.0.0.1:8765/depth --output /tmp/brain_depth.pgm
+curl http://127.0.0.1:8765/imu
 ```
 
 ## Offload Computer
@@ -125,13 +126,14 @@ python -m xlerobot_playground.real_ros_bridge \
   --camera-yaw-rad 0.0
 ```
 
-This publishes camera images, depth-derived `/scan`, camera transforms, and forwards ROS `/cmd_vel` to the robot brain.
+This publishes camera images, depth-derived `/scan`, `/imu`, camera transforms, and forwards ROS `/cmd_vel` to the robot brain.
 
 Quick checks:
 
 ```bash
 ros2 topic echo /camera/head/camera_info --once
 ros2 topic echo /scan --once
+ros2 topic echo /imu --once
 curl http://ROBOT_BRAIN_IP:8765/health
 ```
 
@@ -146,6 +148,7 @@ python -m xlerobot_playground.rgbd_visual_odometry \
   --rgb-topic /camera/head/image_raw \
   --depth-topic /camera/head/depth/image_raw \
   --camera-info-topic /camera/head/camera_info \
+  --imu-topic /imu \
   --odom-topic /odom \
   --publish-rate-hz 15
 ```

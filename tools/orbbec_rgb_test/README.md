@@ -22,9 +22,9 @@ Use `--frames 0 --latest-only` for continuous capture while the VR backend is ru
 For the real exploration ROS bridge, run the sidecar with depth enabled and point the bridge at the same directory:
 
 ```sh
-./build/orbbec_rgb_test/orbbec_rgb_test --frames 0 --latest-only --enable-depth --output-dir artifacts/orbbec_rgbd
+./build/orbbec_rgb_test/orbbec_rgb_test --frames 0 --latest-only --enable-depth --enable-imu --output-dir artifacts/orbbec_rgbd
 ```
 
-This writes `latest.ppm`, `latest_depth.pgm`, and `latest.json`.
+This writes `latest.ppm`, `latest_depth.pgm`, and `latest.json`. When `--enable-imu` is set, `latest.json` also includes the latest accelerometer and gyroscope sample under the `imu` key.
 
 Depth defaults to the camera's first matching Y16 profile. If you need to force a specific depth mode, pass `--depth-width`, `--depth-height`, and `--depth-fps`.

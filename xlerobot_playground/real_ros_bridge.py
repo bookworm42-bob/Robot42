@@ -22,7 +22,7 @@ try:
     from geometry_msgs.msg import Quaternion, TransformStamped, Twist
     from nav_msgs.msg import Odometry
     from rclpy.node import Node
-    from sensor_msgs.msg import CameraInfo, Image, LaserScan
+    from sensor_msgs.msg import CameraInfo, Image, Imu, LaserScan
     from tf2_ros import TransformBroadcaster
 except Exception as exc:  # pragma: no cover - exercised as a runtime guard.
     IMPORT_ERROR = exc
@@ -34,6 +34,7 @@ except Exception as exc:  # pragma: no cover - exercised as a runtime guard.
     Node = object
     CameraInfo = None
     Image = None
+    Imu = None
     LaserScan = None
     TransformBroadcaster = None
 
@@ -46,6 +47,7 @@ class OrbbecFilesystemConfig:
     output_dir: Path = Path("artifacts/orbbec_rgbd")
     rgb_filename: str = "latest.ppm"
     depth_filename: str = "latest_depth.pgm"
+    imu_filename: str = "latest.json"
     horizontal_fov_rad: float = DEFAULT_ORBBEC_HORIZONTAL_FOV_RAD
 
 
@@ -64,6 +66,7 @@ class RealRosBridgeConfig:
     odom_source: str = "none"
     odom_topic: str = "/odom"
     scan_topic: str = "/scan"
+    imu_topic: str = "/imu"
     base_frame: str = "base_link"
     odom_frame: str = "odom"
     head_camera_frame: str = "head_camera_link"
@@ -91,6 +94,7 @@ class RgbdFrame:
     depth_mm: tuple[tuple[int, ...], ...] | None
     depth_width: int | None
     depth_height: int | None
+    imu_sample: dict[str, Any] | None
     timestamp_s: float
 
 
@@ -245,6 +249,69 @@ def parse_rgb_ppm(data: bytes) -> tuple[bytes, int, int]:
     return payload[:expected], width, height
 
 
+def read_imu_json(path: Path) -> dict[str, Any] | None:
+    return parse_imu_json(path.read_bytes())
+
+
+def parse_imu_json(data: bytes) -> dict[str, Any] | None:
+    payload = json.loads(data.decode("utf-8"))
+    imu = payload.get("imu") if isinstance(payload, dict) else None
+    if isinstance(imu, dict):
+        payload = imu
+    if not isinstance(payload, dict):
+        raise ValueError("Expected IMU metadata to be a JSON object.")
+    angular = _extract_xyz(payload, "angular_velocity_rad_s", aliases=("gyro", "angular_velocity"))
+    linear = _extract_xyz(payload, "linear_acceleration_m_s2", aliases=("accel", "linear_acceleration"))
+    if angular is None and linear is None:
+        return None
+    sample: dict[str, Any] = {
+        "timestamp_s": _extract_timestamp_s(payload),
+        "angular_velocity_rad_s": angular or {"x": 0.0, "y": 0.0, "z": 0.0},
+        "linear_acceleration_m_s2": linear or {"x": 0.0, "y": 0.0, "z": 0.0},
+    }
+    orientation = _extract_xyzw(payload, "orientation_xyzw", aliases=("orientation",))
+    if orientation is not None:
+        sample["orientation_xyzw"] = orientation
+    return sample
+
+
+def _extract_timestamp_s(payload: dict[str, Any]) -> float:
+    for key in ("timestamp_s", "time_s"):
+        if key in payload:
+            return float(payload[key])
+    for key in ("system_timestamp_us", "device_timestamp_us", "timestamp_us"):
+        if key in payload:
+            return float(payload[key]) / 1_000_000.0
+    return time.time()
+
+
+def _extract_xyz(payload: dict[str, Any], key: str, *, aliases: tuple[str, ...] = ()) -> dict[str, float] | None:
+    for candidate in (key, *aliases):
+        value = payload.get(candidate)
+        if isinstance(value, dict) and all(axis in value for axis in ("x", "y", "z")):
+            return {axis: float(value[axis]) for axis in ("x", "y", "z")}
+    flat = {}
+    found = False
+    for axis in ("x", "y", "z"):
+        for prefix in (key, *aliases):
+            flat_key = f"{prefix}_{axis}"
+            if flat_key in payload:
+                flat[axis] = float(payload[flat_key])
+                found = True
+                break
+    if found and len(flat) == 3:
+        return flat
+    return None
+
+
+def _extract_xyzw(payload: dict[str, Any], key: str, *, aliases: tuple[str, ...] = ()) -> dict[str, float] | None:
+    for candidate in (key, *aliases):
+        value = payload.get(candidate)
+        if isinstance(value, dict) and all(axis in value for axis in ("x", "y", "z", "w")):
+            return {axis: float(value[axis]) for axis in ("x", "y", "z", "w")}
+    return None
+
+
 class OrbbecFilesystemRgbdSource:
     """Reads frames produced by the native Orbbec RGB-D sidecar.
 
@@ -264,12 +331,19 @@ class OrbbecFilesystemRgbdSource:
         depth = None
         depth_width = None
         depth_height = None
+        imu_sample = None
         rgb_path = output_dir / self.config.rgb_filename
         depth_path = output_dir / self.config.depth_filename
+        imu_path = output_dir / self.config.imu_filename
         if rgb_path.exists():
             rgb, rgb_width, rgb_height = read_rgb_ppm(rgb_path)
         if depth_path.exists():
             depth, depth_width, depth_height = read_depth_pgm_mm(depth_path)
+        if imu_path.exists():
+            try:
+                imu_sample = read_imu_json(imu_path)
+            except Exception:
+                imu_sample = None
         return RgbdFrame(
             rgb=rgb,
             rgb_width=rgb_width,
@@ -277,6 +351,7 @@ class OrbbecFilesystemRgbdSource:
             depth_mm=depth,
             depth_width=depth_width,
             depth_height=depth_height,
+            imu_sample=imu_sample,
             timestamp_s=time.time(),
         )
 
@@ -316,12 +391,17 @@ class RobotBrainRgbdSource:
         depth = None
         depth_width = None
         depth_height = None
+        imu_sample = None
         try:
             rgb, rgb_width, rgb_height = parse_rgb_ppm(self.client.get_bytes("/rgb"))
         except Exception:
             pass
         try:
             depth, depth_width, depth_height = parse_depth_pgm_mm(self.client.get_bytes("/depth"))
+        except Exception:
+            pass
+        try:
+            imu_sample = parse_imu_json(self.client.get_bytes("/imu"))
         except Exception:
             pass
         return RgbdFrame(
@@ -331,6 +411,7 @@ class RobotBrainRgbdSource:
             depth_mm=depth,
             depth_width=depth_width,
             depth_height=depth_height,
+            imu_sample=imu_sample,
             timestamp_s=time.time(),
         )
 
@@ -406,6 +487,7 @@ class RealXLeRobotRosBridge(Node):
         if config.odom_source == "commanded":
             self.odom_publisher = self.create_publisher(Odometry, config.odom_topic, 10)
         self.scan_publisher = self.create_publisher(LaserScan, config.scan_topic, 10)
+        self.imu_publisher = self.create_publisher(Imu, config.imu_topic, 10)
         self.head_rgb_publisher = None
         self.head_depth_publisher = None
         self.head_camera_info_publisher = None
@@ -444,6 +526,7 @@ class RealXLeRobotRosBridge(Node):
         frame = self.rgbd_source.capture()
         stamp = self.get_clock().now().to_msg()
         self._publish_transforms(stamp=stamp, linear=linear, angular=angular)
+        self._publish_imu(frame=frame, stamp=stamp)
         self._publish_scan(frame=frame, stamp=stamp)
         self._publish_head_images(frame=frame, stamp=stamp)
 
@@ -521,6 +604,40 @@ class RealXLeRobotRosBridge(Node):
         laser_tf.transform.rotation = _quaternion_msg(0.0, 0.0, 0.0, 1.0)
         transforms.extend([camera_tf, laser_tf])
         self.tf_broadcaster.sendTransform(transforms)
+
+    def _publish_imu(self, *, frame: RgbdFrame, stamp: Any) -> None:
+        if frame.imu_sample is None:
+            return
+        msg = Imu()
+        msg.header.stamp = stamp
+        msg.header.frame_id = self.config.head_camera_frame
+        msg.orientation_covariance[0] = -1.0
+        angular = frame.imu_sample.get("angular_velocity_rad_s", {})
+        linear = frame.imu_sample.get("linear_acceleration_m_s2", {})
+        msg.angular_velocity.x = float(angular.get("x", 0.0))
+        msg.angular_velocity.y = float(angular.get("y", 0.0))
+        msg.angular_velocity.z = float(angular.get("z", 0.0))
+        msg.linear_acceleration.x = float(linear.get("x", 0.0))
+        msg.linear_acceleration.y = float(linear.get("y", 0.0))
+        msg.linear_acceleration.z = float(linear.get("z", 0.0))
+        msg.angular_velocity_covariance[0] = 0.01
+        msg.angular_velocity_covariance[4] = 0.01
+        msg.angular_velocity_covariance[8] = 0.01
+        msg.linear_acceleration_covariance[0] = 0.1
+        msg.linear_acceleration_covariance[4] = 0.1
+        msg.linear_acceleration_covariance[8] = 0.1
+        orientation = frame.imu_sample.get("orientation_xyzw")
+        if isinstance(orientation, dict):
+            msg.orientation = _quaternion_msg(
+                float(orientation.get("x", 0.0)),
+                float(orientation.get("y", 0.0)),
+                float(orientation.get("z", 0.0)),
+                float(orientation.get("w", 1.0)),
+            )
+            msg.orientation_covariance[0] = 0.05
+            msg.orientation_covariance[4] = 0.05
+            msg.orientation_covariance[8] = 0.05
+        self.imu_publisher.publish(msg)
 
     def _publish_scan(self, *, frame: RgbdFrame, stamp: Any) -> None:
         if frame.depth_mm is None:
@@ -664,6 +781,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--odom-topic", default="/odom")
     parser.add_argument("--scan-topic", default="/scan")
+    parser.add_argument("--imu-topic", default="/imu")
     parser.add_argument("--base-frame", default="base_link")
     parser.add_argument("--odom-frame", default="odom")
     parser.add_argument("--head-camera-frame", default="head_camera_link")
@@ -682,6 +800,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--orbbec-output-dir", default="artifacts/orbbec_rgbd")
     parser.add_argument("--orbbec-rgb-filename", default="latest.ppm")
     parser.add_argument("--orbbec-depth-filename", default="latest_depth.pgm")
+    parser.add_argument(
+        "--orbbec-imu-filename",
+        default="latest.json",
+        help="JSON file that carries the latest Orbbec IMU sample. Default reuses latest.json metadata.",
+    )
     parser.add_argument("--orbbec-horizontal-fov-rad", type=float, default=DEFAULT_ORBBEC_HORIZONTAL_FOV_RAD)
     parser.add_argument(
         "--robot-brain-url",
@@ -709,6 +832,7 @@ def config_from_args(args: argparse.Namespace) -> RealRosBridgeConfig:
         odom_source=args.odom_source,
         odom_topic=args.odom_topic,
         scan_topic=args.scan_topic,
+        imu_topic=args.imu_topic,
         base_frame=args.base_frame,
         odom_frame=args.odom_frame,
         head_camera_frame=args.head_camera_frame,
@@ -728,6 +852,7 @@ def config_from_args(args: argparse.Namespace) -> RealRosBridgeConfig:
             output_dir=Path(args.orbbec_output_dir),
             rgb_filename=args.orbbec_rgb_filename,
             depth_filename=args.orbbec_depth_filename,
+            imu_filename=args.orbbec_imu_filename,
             horizontal_fov_rad=args.orbbec_horizontal_fov_rad,
         ),
         robot_brain_url=args.robot_brain_url,

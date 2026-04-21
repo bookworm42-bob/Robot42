@@ -24,7 +24,7 @@ try:
     from geometry_msgs.msg import Quaternion, TransformStamped
     from nav_msgs.msg import Odometry
     from rclpy.node import Node
-    from sensor_msgs.msg import CameraInfo, Image
+    from sensor_msgs.msg import CameraInfo, Image, Imu
     from tf2_ros import TransformBroadcaster
 except Exception as exc:  # pragma: no cover - runtime guard.
     IMPORT_ERROR = exc
@@ -35,6 +35,7 @@ except Exception as exc:  # pragma: no cover - runtime guard.
     Node = object
     CameraInfo = None
     Image = None
+    Imu = None
     TransformBroadcaster = None
 
 
@@ -51,6 +52,7 @@ class RgbdVoConfig:
     rgb_topic: str = "/camera/head/image_raw"
     depth_topic: str = "/camera/head/depth/image_raw"
     camera_info_topic: str = "/camera/head/camera_info"
+    imu_topic: str = "/imu"
     odom_topic: str = "/odom"
     odom_frame: str = "odom"
     base_frame: str = "base_link"
@@ -62,6 +64,10 @@ class RgbdVoConfig:
     min_inliers: int = 12
     max_translation_step_m: float = 0.25
     max_yaw_step_rad: float = math.radians(30.0)
+    imu_velocity_damping_per_s: float = 0.35
+    imu_max_planar_speed_m_s: float = 0.75
+    vo_translation_weight: float = 0.85
+    imu_stale_after_s: float = 0.5
     camera_x_m: float = 0.0
     camera_y_m: float = 0.0
     camera_yaw_rad: float = 0.0
@@ -116,6 +122,23 @@ def compose_planar(pose: PlanarPose, delta_forward_m: float, delta_yaw_rad: floa
         y=pose.y + delta_forward_m * math.sin(mid_yaw),
         yaw=angle_wrap(pose.yaw + delta_yaw_rad),
     )
+
+
+def compose_planar_local(pose: PlanarPose, *, delta_x_m: float, delta_y_m: float, delta_yaw_rad: float) -> PlanarPose:
+    mid_yaw = pose.yaw + delta_yaw_rad * 0.5
+    cos_yaw = math.cos(mid_yaw)
+    sin_yaw = math.sin(mid_yaw)
+    world_dx = delta_x_m * cos_yaw - delta_y_m * sin_yaw
+    world_dy = delta_x_m * sin_yaw + delta_y_m * cos_yaw
+    return PlanarPose(
+        x=pose.x + world_dx,
+        y=pose.y + world_dy,
+        yaw=angle_wrap(pose.yaw + delta_yaw_rad),
+    )
+
+
+def stamp_to_seconds(stamp: Any) -> float:
+    return float(stamp.sec) + float(stamp.nanosec) / 1_000_000_000.0
 
 
 def intrinsics_from_camera_info(message: Any) -> CameraIntrinsics:
@@ -245,19 +268,24 @@ class RgbdVisualOdometryNode(Node):
         self.odom_publisher = self.create_publisher(Odometry, config.odom_topic, 10)
         self.latest_rgb: Any | None = None
         self.latest_depth: Any | None = None
+        self.latest_imu: Any | None = None
         self.intrinsics: CameraIntrinsics | None = None
         self.previous_frame: VisualOdomFrame | None = None
         self.pose = PlanarPose(0.0, 0.0, 0.0)
+        self.planar_velocity_x_m_s = 0.0
+        self.planar_velocity_y_m_s = 0.0
+        self._last_prediction_stamp_s: float | None = None
         self.accepted_updates = 0
         self.rejected_updates = 0
         self.create_subscription(Image, config.rgb_topic, self._on_rgb, 10)
         self.create_subscription(Image, config.depth_topic, self._on_depth, 10)
         self.create_subscription(CameraInfo, config.camera_info_topic, self._on_camera_info, 10)
+        self.create_subscription(Imu, config.imu_topic, self._on_imu, 50)
         self.create_timer(1.0 / max(config.publish_rate_hz, 1e-6), self.step)
         self.get_logger().info(
             "RGB-D visual odometry ready: "
             f"rgb={config.rgb_topic} depth={config.depth_topic} camera_info={config.camera_info_topic} "
-            f"odom={config.odom_topic}"
+            f"imu={config.imu_topic} odom={config.odom_topic}"
         )
 
     def _on_rgb(self, message: Any) -> None:
@@ -269,8 +297,44 @@ class RgbdVisualOdometryNode(Node):
     def _on_camera_info(self, message: Any) -> None:
         self.intrinsics = intrinsics_from_camera_info(message)
 
+    def _on_imu(self, message: Any) -> None:
+        self.latest_imu = message
+
+    def _predict_from_imu(self, *, stamp_s: float) -> tuple[float, float, float]:
+        if self.latest_imu is None or self.latest_imu.header.stamp is None:
+            self._last_prediction_stamp_s = stamp_s
+            return 0.0, 0.0, 0.0
+        imu_stamp_s = stamp_to_seconds(self.latest_imu.header.stamp)
+        if abs(stamp_s - imu_stamp_s) > self.config.imu_stale_after_s:
+            self._last_prediction_stamp_s = stamp_s
+            return 0.0, 0.0, 0.0
+        previous_stamp_s = self._last_prediction_stamp_s
+        self._last_prediction_stamp_s = stamp_s
+        if previous_stamp_s is None:
+            return 0.0, 0.0, 0.0
+        dt = max(0.0, min(stamp_s - previous_stamp_s, 0.5))
+        if dt <= 1e-6:
+            return 0.0, 0.0, 0.0
+        ax = float(self.latest_imu.linear_acceleration.x)
+        ay = float(self.latest_imu.linear_acceleration.y)
+        damping = max(0.0, 1.0 - self.config.imu_velocity_damping_per_s * dt)
+        self.planar_velocity_x_m_s = max(
+            -self.config.imu_max_planar_speed_m_s,
+            min(self.config.imu_max_planar_speed_m_s, (self.planar_velocity_x_m_s + ax * dt) * damping),
+        )
+        self.planar_velocity_y_m_s = max(
+            -self.config.imu_max_planar_speed_m_s,
+            min(self.config.imu_max_planar_speed_m_s, (self.planar_velocity_y_m_s + ay * dt) * damping),
+        )
+        delta_yaw_rad = float(self.latest_imu.angular_velocity.z) * dt
+        delta_x_m = self.planar_velocity_x_m_s * dt + 0.5 * ax * dt * dt
+        delta_y_m = self.planar_velocity_y_m_s * dt + 0.5 * ay * dt * dt
+        return delta_x_m, delta_y_m, delta_yaw_rad
+
     def step(self) -> None:
         stamp = self.get_clock().now().to_msg()
+        stamp_s = stamp_to_seconds(stamp)
+        predicted_dx_m, predicted_dy_m, predicted_yaw_rad = self._predict_from_imu(stamp_s=stamp_s)
         if self.latest_rgb is not None and self.latest_depth is not None and self.intrinsics is not None:
             try:
                 frame = VisualOdomFrame(
@@ -279,12 +343,27 @@ class RgbdVisualOdometryNode(Node):
                     stamp=self.latest_rgb.header.stamp,
                     intrinsics=self.intrinsics,
                 )
+                stamp_s = stamp_to_seconds(frame.stamp)
+                predicted_dx_m, predicted_dy_m, predicted_yaw_rad = self._predict_from_imu(stamp_s=stamp_s)
                 if self.previous_frame is not None:
                     estimate = self.estimator.estimate(self.previous_frame, frame)
                     if estimate is not None:
-                        base_forward_m = estimate.translation_m
-                        base_yaw_rad = estimate.yaw_rad
-                        self.pose = compose_planar(self.pose, base_forward_m, base_yaw_rad)
+                        visual_dx_m = estimate.translation_m
+                        fused_dx_m = (
+                            self.config.vo_translation_weight * visual_dx_m
+                            + (1.0 - self.config.vo_translation_weight) * predicted_dx_m
+                        )
+                        fused_dy_m = (1.0 - self.config.vo_translation_weight) * predicted_dy_m
+                        fused_yaw_rad = predicted_yaw_rad if self.latest_imu is not None else estimate.yaw_rad
+                        self.pose = compose_planar_local(
+                            self.pose,
+                            delta_x_m=fused_dx_m,
+                            delta_y_m=fused_dy_m,
+                            delta_yaw_rad=fused_yaw_rad,
+                        )
+                        dt = max(stamp_s - stamp_to_seconds(self.previous_frame.stamp), 1e-6)
+                        self.planar_velocity_x_m_s = fused_dx_m / dt
+                        self.planar_velocity_y_m_s = fused_dy_m / dt
                         self.accepted_updates += 1
                     else:
                         self.rejected_updates += 1
@@ -293,6 +372,13 @@ class RgbdVisualOdometryNode(Node):
             except Exception as exc:
                 self.rejected_updates += 1
                 self.get_logger().warning(f"RGB-D VO update rejected: {exc}")
+        elif abs(predicted_dx_m) > 1e-6 or abs(predicted_dy_m) > 1e-6 or abs(predicted_yaw_rad) > 1e-6:
+            self.pose = compose_planar_local(
+                self.pose,
+                delta_x_m=predicted_dx_m,
+                delta_y_m=predicted_dy_m,
+                delta_yaw_rad=predicted_yaw_rad,
+            )
         self._publish_odom(stamp)
 
     def _publish_odom(self, stamp: Any) -> None:
@@ -308,6 +394,10 @@ class RgbdVisualOdometryNode(Node):
         odom.pose.covariance[0] = 0.05
         odom.pose.covariance[7] = 0.05
         odom.pose.covariance[35] = 0.10
+        odom.twist.twist.linear.x = float(self.planar_velocity_x_m_s)
+        odom.twist.twist.linear.y = float(self.planar_velocity_y_m_s)
+        if self.latest_imu is not None:
+            odom.twist.twist.angular.z = float(self.latest_imu.angular_velocity.z)
         self.odom_publisher.publish(odom)
 
         transform = TransformStamped()
@@ -337,6 +427,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rgb-topic", default="/camera/head/image_raw")
     parser.add_argument("--depth-topic", default="/camera/head/depth/image_raw")
     parser.add_argument("--camera-info-topic", default="/camera/head/camera_info")
+    parser.add_argument("--imu-topic", default="/imu")
     parser.add_argument("--odom-topic", default="/odom")
     parser.add_argument("--odom-frame", default="odom")
     parser.add_argument("--base-frame", default="base_link")
@@ -348,6 +439,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-inliers", type=int, default=12)
     parser.add_argument("--max-translation-step-m", type=float, default=0.25)
     parser.add_argument("--max-yaw-step-deg", type=float, default=30.0)
+    parser.add_argument("--imu-velocity-damping-per-s", type=float, default=0.35)
+    parser.add_argument("--imu-max-planar-speed-m-s", type=float, default=0.75)
+    parser.add_argument("--vo-translation-weight", type=float, default=0.85)
+    parser.add_argument("--imu-stale-after-s", type=float, default=0.5)
     parser.add_argument("--camera-x-m", type=float, default=0.0)
     parser.add_argument("--camera-y-m", type=float, default=0.0)
     parser.add_argument("--camera-yaw-rad", type=float, default=0.0)
@@ -359,6 +454,7 @@ def config_from_args(args: argparse.Namespace) -> RgbdVoConfig:
         rgb_topic=args.rgb_topic,
         depth_topic=args.depth_topic,
         camera_info_topic=args.camera_info_topic,
+        imu_topic=args.imu_topic,
         odom_topic=args.odom_topic,
         odom_frame=args.odom_frame,
         base_frame=args.base_frame,
@@ -370,6 +466,10 @@ def config_from_args(args: argparse.Namespace) -> RgbdVoConfig:
         min_inliers=args.min_inliers,
         max_translation_step_m=args.max_translation_step_m,
         max_yaw_step_rad=math.radians(args.max_yaw_step_deg),
+        imu_velocity_damping_per_s=args.imu_velocity_damping_per_s,
+        imu_max_planar_speed_m_s=args.imu_max_planar_speed_m_s,
+        vo_translation_weight=args.vo_translation_weight,
+        imu_stale_after_s=args.imu_stale_after_s,
         camera_x_m=args.camera_x_m,
         camera_y_m=args.camera_y_m,
         camera_yaw_rad=args.camera_yaw_rad,

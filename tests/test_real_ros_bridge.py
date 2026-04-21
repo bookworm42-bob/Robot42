@@ -13,6 +13,7 @@ from xlerobot_playground.real_ros_bridge import (
     build_parser,
     config_from_args,
     _format_runtime_error,
+    parse_imu_json,
     parse_depth_pgm_mm,
     parse_rgb_ppm,
     read_depth_pgm_mm,
@@ -39,6 +40,7 @@ class _FakeBrainClient:
         self.payloads = {
             "/rgb": b"P6\n1 1\n255\nabc",
             "/depth": b"P5\n1 1\n65535\n" + (1234).to_bytes(2, "big"),
+            "/imu": b'{"imu":{"angular_velocity_rad_s":{"x":0.1,"y":0.2,"z":0.3},"linear_acceleration_m_s2":{"x":1.0,"y":2.0,"z":3.0},"system_timestamp_us":1234567}}',
         }
 
     def get_bytes(self, path: str) -> bytes:
@@ -81,6 +83,7 @@ class RealRosBridgeTests(unittest.TestCase):
         config = config_from_args(args)
 
         self.assertEqual(config.robot_brain_url, "http://robot-brain.local:8765")
+        self.assertEqual(config.imu_topic, "/imu")
 
     def test_runtime_error_formatter_includes_robot_brain_http_body(self) -> None:
         exc = HTTPError(
@@ -165,6 +168,15 @@ class RealRosBridgeTests(unittest.TestCase):
         self.assertEqual(depth, ((1234,),))
         self.assertEqual((depth_width, depth_height), (1, 1))
 
+    def test_parse_imu_json_reads_nested_metadata_contract(self) -> None:
+        sample = parse_imu_json(
+            b'{"imu":{"angular_velocity_rad_s":{"x":0.1,"y":0.2,"z":0.3},"linear_acceleration_m_s2":{"x":1.0,"y":2.0,"z":3.0},"system_timestamp_us":1234567}}'
+        )
+
+        self.assertEqual(sample["angular_velocity_rad_s"]["z"], 0.3)
+        self.assertEqual(sample["linear_acceleration_m_s2"]["x"], 1.0)
+        self.assertAlmostEqual(sample["timestamp_s"], 1.234567)
+
     def test_filesystem_source_can_return_rgb_without_depth(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             output_dir = Path(tmpdir)
@@ -187,6 +199,7 @@ class RealRosBridgeTests(unittest.TestCase):
         self.assertEqual(frame.rgb_width, 1)
         self.assertEqual(frame.depth_mm, ((1234,),))
         self.assertEqual(frame.depth_width, 1)
+        self.assertEqual(frame.imu_sample["angular_velocity_rad_s"]["z"], 0.3)
 
 
 if __name__ == "__main__":

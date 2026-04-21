@@ -33,6 +33,7 @@ class RobotBrainAgentConfig:
     rgb_filename: str = "latest.ppm"
     depth_filename: str = "latest_depth.pgm"
     metadata_filename: str = "latest.json"
+    imu_filename: str = "latest.json"
 
 
 class RobotBrainAgent:
@@ -104,6 +105,8 @@ class RobotBrainAgent:
             return self.config.orbbec_output_dir / self.config.depth_filename
         if route == "/metadata":
             return self.config.orbbec_output_dir / self.config.metadata_filename
+        if route == "/imu":
+            return self.config.orbbec_output_dir / self.config.imu_filename
         return None
 
 
@@ -140,6 +143,7 @@ def make_handler(agent: RobotBrainAgent) -> type[BaseHTTPRequestHandler]:
                 "/rgb": "image/x-portable-pixmap",
                 "/depth": "image/x-portable-graymap",
                 "/metadata": "application/json",
+                "/imu": "application/json",
             }.get(self.path, "application/octet-stream")
             data = path.read_bytes()
             self.send_response(200)
@@ -218,6 +222,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rgb-filename", default="latest.ppm")
     parser.add_argument("--depth-filename", default="latest_depth.pgm")
     parser.add_argument("--metadata-filename", default="latest.json")
+    parser.add_argument(
+        "--imu-filename",
+        default="latest.json",
+        help="JSON file that carries the latest Orbbec IMU sample. Default reuses latest.json metadata.",
+    )
     return parser
 
 
@@ -239,6 +248,7 @@ def config_from_args(args: argparse.Namespace) -> RobotBrainAgentConfig:
         rgb_filename=args.rgb_filename,
         depth_filename=args.depth_filename,
         metadata_filename=args.metadata_filename,
+        imu_filename=args.imu_filename,
     )
 
 

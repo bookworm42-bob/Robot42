@@ -8,6 +8,7 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -28,6 +29,20 @@ struct Options {
     int log_every = 1;
     bool latest_only = false;
     bool enable_depth = false;
+    bool enable_imu = false;
+};
+
+struct LatestImuSample {
+    bool has_accel = false;
+    bool has_gyro = false;
+    uint64_t accel_frame_index = 0;
+    uint64_t gyro_frame_index = 0;
+    uint64_t accel_timestamp_us = 0;
+    uint64_t gyro_timestamp_us = 0;
+    float accel_temperature = 0.0f;
+    float gyro_temperature = 0.0f;
+    OBAccelValue accel_value{};
+    OBGyroValue gyro_value{};
 };
 
 int parse_int(const std::string &value, const std::string &name) {
@@ -94,12 +109,15 @@ Options parse_args(int argc, char **argv) {
         else if(arg == "--enable-depth") {
             options.enable_depth = true;
         }
+        else if(arg == "--enable-imu") {
+            options.enable_imu = true;
+        }
         else if(arg == "--help" || arg == "-h") {
             std::cout << "Usage: orbbec_rgb_test [--output-dir DIR] [--frames N]\n"
                       << "                       [--warmup-frames N] [--timeout-ms MS]\n"
                       << "                       [--width PX] [--height PX] [--fps FPS]\n"
                       << "                       [--depth-width PX] [--depth-height PX] [--depth-fps FPS]\n"
-                      << "                       [--log-every N] [--latest-only] [--enable-depth]\n";
+                      << "                       [--log-every N] [--latest-only] [--enable-depth] [--enable-imu]\n";
             std::exit(EXIT_SUCCESS);
         }
         else {
@@ -211,6 +229,7 @@ void write_latest_metadata(
     const fs::path &path,
     const std::shared_ptr<ob::ColorFrame> &frame,
     const std::shared_ptr<ob::DepthFrame> &depth_frame,
+    const LatestImuSample *imu_sample,
     int captured_frames,
     const std::string &source_format
 ) {
@@ -239,6 +258,35 @@ void write_latest_metadata(
     }
     else {
         out << "\n";
+    }
+    if(imu_sample && (imu_sample->has_accel || imu_sample->has_gyro)) {
+        out << ",\n"
+            << "  \"imu\": {\n"
+            << "    \"has_accel\": " << (imu_sample->has_accel ? "true" : "false") << ",\n"
+            << "    \"has_gyro\": " << (imu_sample->has_gyro ? "true" : "false") << ",\n";
+        if(imu_sample->has_accel) {
+            out << "    \"linear_acceleration_m_s2\": {\n"
+                << "      \"x\": " << imu_sample->accel_value.x << ",\n"
+                << "      \"y\": " << imu_sample->accel_value.y << ",\n"
+                << "      \"z\": " << imu_sample->accel_value.z << "\n"
+                << "    },\n"
+                << "    \"accel_frame_index\": " << imu_sample->accel_frame_index << ",\n"
+                << "    \"accel_timestamp_us\": " << imu_sample->accel_timestamp_us << ",\n"
+                << "    \"accel_temperature_c\": " << imu_sample->accel_temperature << ",\n";
+        }
+        if(imu_sample->has_gyro) {
+            out << "    \"angular_velocity_rad_s\": {\n"
+                << "      \"x\": " << imu_sample->gyro_value.x << ",\n"
+                << "      \"y\": " << imu_sample->gyro_value.y << ",\n"
+                << "      \"z\": " << imu_sample->gyro_value.z << "\n"
+                << "    },\n"
+                << "    \"gyro_frame_index\": " << imu_sample->gyro_frame_index << ",\n"
+                << "    \"gyro_timestamp_us\": " << imu_sample->gyro_timestamp_us << ",\n"
+                << "    \"gyro_temperature_c\": " << imu_sample->gyro_temperature << ",\n";
+        }
+        const uint64_t latest_imu_timestamp_us = std::max(imu_sample->accel_timestamp_us, imu_sample->gyro_timestamp_us);
+        out << "    \"system_timestamp_us\": " << latest_imu_timestamp_us << "\n"
+            << "  }\n";
     }
     out
         << "}\n";
@@ -288,6 +336,45 @@ int main(int argc, char **argv) try {
     }
 
     auto converter = std::make_shared<ob::FormatConvertFilter>();
+
+    std::shared_ptr<ob::Pipeline> imu_pipeline = nullptr;
+    std::mutex imu_mutex;
+    LatestImuSample latest_imu_sample;
+    bool imu_running = false;
+    if(options.enable_imu) {
+        try {
+            imu_pipeline = std::make_shared<ob::Pipeline>(device);
+            auto imu_config = std::make_shared<ob::Config>();
+            imu_config->enableGyroStream();
+            imu_config->enableAccelStream();
+            imu_config->setFrameAggregateOutputMode(OB_FRAME_AGGREGATE_OUTPUT_ALL_TYPE_FRAME_REQUIRE);
+            imu_pipeline->start(imu_config, [&](std::shared_ptr<ob::FrameSet> frame_set) {
+                auto accel_frame_raw = frame_set->getFrame(OB_FRAME_ACCEL);
+                auto gyro_frame_raw = frame_set->getFrame(OB_FRAME_GYRO);
+                std::lock_guard<std::mutex> lock(imu_mutex);
+                if(accel_frame_raw) {
+                    auto accel_frame = accel_frame_raw->as<ob::AccelFrame>();
+                    latest_imu_sample.has_accel = true;
+                    latest_imu_sample.accel_frame_index = accel_frame->getIndex();
+                    latest_imu_sample.accel_timestamp_us = accel_frame->getTimeStampUs();
+                    latest_imu_sample.accel_temperature = accel_frame->getTemperature();
+                    latest_imu_sample.accel_value = accel_frame->getValue();
+                }
+                if(gyro_frame_raw) {
+                    auto gyro_frame = gyro_frame_raw->as<ob::GyroFrame>();
+                    latest_imu_sample.has_gyro = true;
+                    latest_imu_sample.gyro_frame_index = gyro_frame->getIndex();
+                    latest_imu_sample.gyro_timestamp_us = gyro_frame->getTimeStampUs();
+                    latest_imu_sample.gyro_temperature = gyro_frame->getTemperature();
+                    latest_imu_sample.gyro_value = gyro_frame->getValue();
+                }
+            });
+            imu_running = true;
+        }
+        catch(const ob::Error &e) {
+            std::cerr << "IMU stream unavailable: " << e.what() << "\n";
+        }
+    }
     pipeline.start(config);
 
     for(int i = 0; i < options.warmup_frames; ++i) {
@@ -336,7 +423,16 @@ int main(int argc, char **argv) try {
             }
             write_depth_pgm_atomic(latest_depth_path, depth_frame);
         }
-        write_latest_metadata(options.output_dir / "latest.json", rgb_frame, depth_frame, captured, source_format);
+        LatestImuSample imu_snapshot;
+        const LatestImuSample *imu_ptr = nullptr;
+        if(imu_running) {
+            std::lock_guard<std::mutex> lock(imu_mutex);
+            imu_snapshot = latest_imu_sample;
+            if(imu_snapshot.has_accel || imu_snapshot.has_gyro) {
+                imu_ptr = &imu_snapshot;
+            }
+        }
+        write_latest_metadata(options.output_dir / "latest.json", rgb_frame, depth_frame, imu_ptr, captured, source_format);
 
         if(options.log_every > 0 && captured % options.log_every == 0) {
             std::cout << "Captured RGB frame " << captured
@@ -352,6 +448,9 @@ int main(int argc, char **argv) try {
     }
 
     pipeline.stop();
+    if(imu_running && imu_pipeline) {
+        imu_pipeline->stop();
+    }
 
     const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started_at).count();
     std::cout << "Captured " << captured << " frames in " << elapsed << "s\n";

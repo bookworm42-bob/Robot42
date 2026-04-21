@@ -82,6 +82,7 @@ class RobotBrainAgentTests(unittest.TestCase):
             self.assertEqual(agent.file_path("/rgb"), Path(tmpdir) / "latest.ppm")
             self.assertEqual(agent.file_path("/depth"), Path(tmpdir) / "latest_depth.pgm")
             self.assertEqual(agent.file_path("/metadata"), Path(tmpdir) / "latest.json")
+            self.assertEqual(agent.file_path("/imu"), Path(tmpdir) / "latest.json")
             self.assertIsNone(agent.file_path("/missing"))
 
 
