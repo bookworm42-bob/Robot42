@@ -19,6 +19,8 @@ from xlerobot_playground.real_exploration_runtime import (
 IMPORT_ERROR: Exception | None = None
 try:
     import rclpy
+    from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+    from rclpy.executors import MultiThreadedExecutor
     from geometry_msgs.msg import Quaternion, TransformStamped, Twist
     from nav_msgs.msg import Odometry
     from rclpy.node import Node
@@ -27,6 +29,8 @@ try:
 except Exception as exc:  # pragma: no cover - exercised as a runtime guard.
     IMPORT_ERROR = exc
     rclpy = None
+    MutuallyExclusiveCallbackGroup = None
+    MultiThreadedExecutor = None
     Quaternion = None
     TransformStamped = None
     Twist = None
@@ -401,6 +405,10 @@ class RobotBrainRgbdSource:
             depth, depth_width, depth_height = parse_depth_pgm_mm(self.client.get_bytes("/depth"))
         except Exception:
             pass
+        try:
+            imu_sample = parse_imu_json(self.client.get_bytes("/imu"))
+        except Exception:
+            pass
         return RgbdFrame(
             rgb=rgb,
             rgb_width=rgb_width,
@@ -431,6 +439,21 @@ class RobotBrainVelocityRuntime:
             self.stop()
         except Exception:
             pass
+
+
+def _motion_result_error(response: Any) -> str | None:
+    if not isinstance(response, dict):
+        return None
+    succeeded = response.get("succeeded")
+    if succeeded is None or bool(succeeded):
+        return None
+    message = str(response.get("message", "")).strip()
+    metadata = response.get("metadata")
+    if message and metadata:
+        return f"{message} metadata={metadata}"
+    if message:
+        return message
+    return json.dumps(response, sort_keys=True)
 
 
 class RealXLeRobotRosBridge(Node):
@@ -480,8 +503,17 @@ class RealXLeRobotRosBridge(Node):
         self._last_angular = 0.0
         self._last_motion_error = ""
         self._last_imu_timestamp_s: float | None = None
+        self._cmd_vel_callback_group = MutuallyExclusiveCallbackGroup()
+        self._step_callback_group = MutuallyExclusiveCallbackGroup()
+        self._imu_callback_group = MutuallyExclusiveCallbackGroup()
 
-        self.create_subscription(Twist, config.cmd_vel_topic, self._on_cmd_vel, 10)
+        self.create_subscription(
+            Twist,
+            config.cmd_vel_topic,
+            self._on_cmd_vel,
+            10,
+            callback_group=self._cmd_vel_callback_group,
+        )
         self.odom_publisher = None
         if config.odom_source == "commanded":
             self.odom_publisher = self.create_publisher(Odometry, config.odom_topic, 10)
@@ -494,8 +526,16 @@ class RealXLeRobotRosBridge(Node):
             self.head_rgb_publisher = self.create_publisher(Image, "/camera/head/image_raw", 10)
             self.head_depth_publisher = self.create_publisher(Image, "/camera/head/depth/image_raw", 10)
             self.head_camera_info_publisher = self.create_publisher(CameraInfo, "/camera/head/camera_info", 10)
-        self.timer = self.create_timer(1.0 / max(config.publish_rate_hz, 1e-6), self.step)
-        self.imu_timer = self.create_timer(1.0 / max(config.imu_publish_rate_hz, 1e-6), self._poll_and_publish_imu)
+        self.timer = self.create_timer(
+            1.0 / max(config.publish_rate_hz, 1e-6),
+            self.step,
+            callback_group=self._step_callback_group,
+        )
+        self.imu_timer = self.create_timer(
+            1.0 / max(config.imu_publish_rate_hz, 1e-6),
+            self._poll_and_publish_imu,
+            callback_group=self._imu_callback_group,
+        )
         self.get_logger().info(
             "Real bridge ready: "
             f"robot={config.robot_kind} port1={config.port1} port2={config.port2} "
@@ -557,9 +597,15 @@ class RealXLeRobotRosBridge(Node):
         try:
             if abs(linear) <= 1e-6 and abs(angular) <= 1e-6:
                 if abs(self._last_linear) > 1e-6 or abs(self._last_angular) > 1e-6:
-                    self.runtime.stop()
+                    response = self.runtime.stop()
+                    motion_error = _motion_result_error(response)
+                    if motion_error is not None:
+                        raise RuntimeError(f"Stop rejected by runtime: {motion_error}")
             else:
-                self.runtime.drive_velocity(linear_m_s=linear, angular_rad_s=angular)
+                response = self.runtime.drive_velocity(linear_m_s=linear, angular_rad_s=angular)
+                motion_error = _motion_result_error(response)
+                if motion_error is not None:
+                    raise RuntimeError(f"Motion rejected by runtime: {motion_error}")
         except Exception as exc:
             message = _format_runtime_error(exc)
             if message != self._last_motion_error:
@@ -899,11 +945,14 @@ def main(argv: list[str] | None = None) -> int:
     require_ros_dependencies()
     rclpy.init()
     bridge = RealXLeRobotRosBridge(config_from_args(args))
+    executor = MultiThreadedExecutor(num_threads=3)
+    executor.add_node(bridge)
     try:
-        rclpy.spin(bridge)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:
+        executor.shutdown()
         bridge.close()
         rclpy.shutdown()
     return 0

@@ -64,6 +64,43 @@ def imu_value_from_source(*, source: str, gyro_x: float, gyro_y: float, gyro_z: 
     raise ValueError(f"Unsupported IMU source: {source}")
 
 
+def feedback_unwrapped_yaw_rad(sample: dict[str, Any], *, source: str) -> float | None:
+    normalized = str(source).strip().lower()
+    if normalized == "imu" and sample.get("imu_orientation_available"):
+        value = sample.get("imu_orientation_unwrapped_yaw_rad")
+        return float(value) if value is not None else None
+    key = f"{normalized}_unwrapped_yaw_rad"
+    value = sample.get(key)
+    return float(value) if value is not None else None
+
+
+def compute_control_angular_velocity(
+    *,
+    requested_angular_rad_s: float,
+    target_yaw_rad: float | None,
+    feedback_yaw_rad: float | None,
+    minimum_command_rad_s: float = 0.12,
+    slowdown_zone_rad: float = math.radians(50.0),
+    stop_tolerance_rad: float = math.radians(2.0),
+) -> tuple[float, bool]:
+    command_direction = 1.0 if requested_angular_rad_s >= 0.0 else -1.0
+    max_command_speed = abs(float(requested_angular_rad_s))
+    if max_command_speed <= 1e-6:
+        return 0.0, True
+    if target_yaw_rad is None or feedback_yaw_rad is None:
+        return command_direction * max_command_speed, False
+    remaining_yaw_rad = max(abs(float(target_yaw_rad)) - abs(float(feedback_yaw_rad)), 0.0)
+    if remaining_yaw_rad <= max(float(stop_tolerance_rad), 0.0):
+        return 0.0, True
+    if remaining_yaw_rad < max(float(slowdown_zone_rad), 1e-6):
+        scaled_speed = max_command_speed * (remaining_yaw_rad / max(float(slowdown_zone_rad), 1e-6))
+        commanded_speed = max(minimum_command_rad_s, scaled_speed)
+    else:
+        commanded_speed = max_command_speed
+    commanded_speed = min(commanded_speed, max_command_speed)
+    return command_direction * commanded_speed, False
+
+
 class RotationDiagnosticNode(Node):
     def __init__(
         self,
@@ -219,15 +256,12 @@ class RotationDiagnosticNode(Node):
         stop_reason = "duration_timeout"
         while time.time() < deadline:
             now = time.time()
-            if send_motion:
-                self.publish_spin(angular_rad_s)
             rclpy.spin_once(self, timeout_sec=0.0)
             pose = self.lookup_pose()
             odom_pose = self.latest_odom_pose
             imu_sample = self.latest_imu_sample
             sample: dict[str, Any] = {
                 "t_s": round(now - start, 4),
-                "cmd_angular_rad_s": angular_rad_s if send_motion else 0.0,
             }
             if imu_bias is not None:
                 sample.update(
@@ -324,15 +358,29 @@ class RotationDiagnosticNode(Node):
                         "imu_orientation_unwrapped_yaw_deg": math.degrees(unwrapped_imu_orientation_yaw),
                     }
                 )
+            feedback_yaw_rad = feedback_unwrapped_yaw_rad(sample, source=target_source)
+            command_angular_rad_s = 0.0
+            target_reached = False
+            if send_motion:
+                command_angular_rad_s, target_reached = compute_control_angular_velocity(
+                    requested_angular_rad_s=angular_rad_s,
+                    target_yaw_rad=target_yaw_rad,
+                    feedback_yaw_rad=feedback_yaw_rad,
+                )
+                self.publish_spin(command_angular_rad_s)
+            sample["cmd_angular_rad_s"] = command_angular_rad_s
+            if feedback_yaw_rad is not None:
+                sample["target_feedback_unwrapped_yaw_rad"] = feedback_yaw_rad
+                sample["target_feedback_unwrapped_yaw_deg"] = math.degrees(feedback_yaw_rad)
+                if target_abs_yaw_rad is not None:
+                    sample["target_feedback_remaining_yaw_rad"] = max(target_abs_yaw_rad - abs(feedback_yaw_rad), 0.0)
+                    sample["target_feedback_remaining_yaw_deg"] = math.degrees(
+                        sample["target_feedback_remaining_yaw_rad"]
+                    )
             samples.append(sample)
-            if target_abs_yaw_rad is not None:
-                if target_source == "imu" and sample.get("imu_orientation_available"):
-                    unwrapped_key = "imu_orientation_unwrapped_yaw_rad"
-                else:
-                    unwrapped_key = f"{target_source}_unwrapped_yaw_rad"
-                if unwrapped_key in sample and abs(float(sample[unwrapped_key])) >= target_abs_yaw_rad:
-                    stop_reason = f"target_{target_source}_yaw_reached"
-                    break
+            if target_abs_yaw_rad is not None and target_reached:
+                stop_reason = f"target_{target_source}_yaw_reached"
+                break
             time.sleep(self.sample_dt_s)
         self.stop()
         for _ in range(5):

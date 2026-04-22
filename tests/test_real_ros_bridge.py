@@ -10,6 +10,7 @@ from xlerobot_playground.real_ros_bridge import (
     OrbbecFilesystemConfig,
     OrbbecFilesystemRgbdSource,
     RobotBrainRgbdSource,
+    _motion_result_error,
     build_parser,
     config_from_args,
     _format_runtime_error,
@@ -95,6 +96,19 @@ class RealRosBridgeTests(unittest.TestCase):
         )
 
         self.assertEqual(_format_runtime_error(exc), "HTTP 500: (6, 'Device not configured')")
+
+    def test_motion_result_error_reports_rejected_remote_command(self) -> None:
+        self.assertEqual(
+            _motion_result_error(
+                {
+                    "succeeded": False,
+                    "message": "Real motion commands are disabled.",
+                    "metadata": {"requested_angular_rad_s": 0.3},
+                }
+            ),
+            "Real motion commands are disabled. metadata={'requested_angular_rad_s': 0.3}",
+        )
+        self.assertIsNone(_motion_result_error({"succeeded": True, "message": "ok"}))
 
     def test_twist_to_base_velocity_uses_forward_and_yaw_only(self) -> None:
         self.assertEqual(twist_to_base_velocity(_Twist()), (0.04, 0.12))
