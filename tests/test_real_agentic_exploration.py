@@ -20,8 +20,10 @@ class RealAgenticExplorationTests(unittest.TestCase):
         self.assertIn("--wait-for-ui-start", translated)
         self.assertIn("--ros-navigation-map-source", translated)
         self.assertEqual(translated[translated.index("--ros-navigation-map-source") + 1], "fused_scan")
+        self.assertEqual(translated[translated.index("--ros-imu-topic") + 1], "/imu/filtered_yaw")
         self.assertEqual(translated[translated.index("--source") + 1], "real_xlerobot")
-        self.assertEqual(translated[translated.index("--ros-manual-spin-angular-speed-rad-s") + 1], "0.1")
+        self.assertEqual(translated[translated.index("--ros-manual-spin-angular-speed-rad-s") + 1], "0.3")
+        self.assertIn("--no-pause-for-operator-approval", translated)
 
     def test_explicit_llm_and_ui_options_are_preserved(self) -> None:
         args = build_parser().parse_args(
@@ -48,6 +50,20 @@ class RealAgenticExplorationTests(unittest.TestCase):
         self.assertIn("--no-serve-review-ui", translated)
         self.assertEqual(translated[translated.index("--review-host") + 1], "127.0.0.1")
         self.assertEqual(translated[translated.index("--review-port") + 1], "8899")
+
+    def test_pause_for_operator_approval_is_translated(self) -> None:
+        args = build_parser().parse_args(["--pause-for-operator-approval"])
+
+        translated = translated_args(args)
+
+        self.assertIn("--pause-for-operator-approval", translated)
+
+    def test_stop_after_initial_scan_is_translated(self) -> None:
+        args = build_parser().parse_args(["--stop-after-initial-scan"])
+
+        translated = translated_args(args)
+
+        self.assertIn("--stop-after-initial-scan", translated)
 
     def test_ros_session_initializes_scan_fusion_state_before_first_scan(self) -> None:
         class FakeRuntime:

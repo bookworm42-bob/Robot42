@@ -118,6 +118,12 @@ def yaw_to_quaternion_xyzw(yaw_rad: float) -> tuple[float, float, float, float]:
     return 0.0, 0.0, math.sin(half), math.cos(half)
 
 
+def yaw_from_quaternion_xyzw(x: float, y: float, z: float, w: float) -> float:
+    siny_cosp = 2.0 * (w * z + x * y)
+    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+    return math.atan2(siny_cosp, cosy_cosp)
+
+
 def compose_planar(pose: PlanarPose, delta_forward_m: float, delta_yaw_rad: float) -> PlanarPose:
     mid_yaw = pose.yaw + delta_yaw_rad * 0.5
     return PlanarPose(
@@ -305,6 +311,10 @@ class RgbdVisualOdometryNode(Node):
         self._imu_bias_x_rad_s = 0.0
         self._imu_bias_y_rad_s = 0.0
         self._imu_bias_z_rad_s = 0.0
+        self._latest_imu_stamp_s: float | None = None
+        self._latest_imu_orientation_yaw_rad: float | None = None
+        self._latest_imu_orientation_unwrapped_yaw_rad: float | None = None
+        self._imu_orientation_origin_yaw_rad: float | None = None
         self.accepted_updates = 0
         self.rejected_updates = 0
         self.create_subscription(Image, config.rgb_topic, self._on_rgb, 10)
@@ -329,9 +339,31 @@ class RgbdVisualOdometryNode(Node):
 
     def _on_imu(self, message: Any) -> None:
         self.latest_imu = message
-        if self._imu_bias_ready or message.header.stamp is None:
+        if message.header.stamp is None:
             return
         stamp_s = stamp_to_seconds(message.header.stamp)
+        self._latest_imu_stamp_s = stamp_s
+        covariance = getattr(message, "orientation_covariance", None)
+        if covariance is not None and len(covariance) >= 1 and float(covariance[0]) >= 0.0:
+            orientation = message.orientation
+            yaw_rad = yaw_from_quaternion_xyzw(
+                float(orientation.x),
+                float(orientation.y),
+                float(orientation.z),
+                float(orientation.w),
+            )
+            if self._latest_imu_orientation_yaw_rad is None:
+                self._latest_imu_orientation_unwrapped_yaw_rad = yaw_rad
+                self._imu_orientation_origin_yaw_rad = yaw_rad
+            else:
+                assert self._latest_imu_orientation_unwrapped_yaw_rad is not None
+                self._latest_imu_orientation_unwrapped_yaw_rad += math.atan2(
+                    math.sin(yaw_rad - self._latest_imu_orientation_yaw_rad),
+                    math.cos(yaw_rad - self._latest_imu_orientation_yaw_rad),
+                )
+            self._latest_imu_orientation_yaw_rad = yaw_rad
+        if self._imu_bias_ready:
+            return
         if self._imu_bias_started_s is None:
             self._imu_bias_started_s = stamp_s
         if self._imu_bias_last_stamp_s is not None and stamp_s <= self._imu_bias_last_stamp_s:
@@ -355,6 +387,15 @@ class RgbdVisualOdometryNode(Node):
                 f"x={self._imu_bias_x_rad_s:.6f} y={self._imu_bias_y_rad_s:.6f} z={self._imu_bias_z_rad_s:.6f} "
                 f"from {self._imu_bias_sample_count} samples over {elapsed_s:.2f}s"
             )
+
+    def _relative_imu_yaw_rad(self, *, stamp_s: float) -> float | None:
+        if self._latest_imu_stamp_s is None:
+            return None
+        if abs(float(stamp_s) - self._latest_imu_stamp_s) > self.config.imu_stale_after_s:
+            return None
+        if self._latest_imu_orientation_unwrapped_yaw_rad is None or self._imu_orientation_origin_yaw_rad is None:
+            return None
+        return self._latest_imu_orientation_unwrapped_yaw_rad - self._imu_orientation_origin_yaw_rad
 
     def _predict_from_imu(self, *, stamp_s: float) -> tuple[float, float, float]:
         if not self._imu_bias_ready:
@@ -404,6 +445,7 @@ class RgbdVisualOdometryNode(Node):
         stamp = self.get_clock().now().to_msg()
         stamp_s = stamp_to_seconds(stamp)
         predicted_dx_m, predicted_dy_m, predicted_yaw_rad = self._predict_from_imu(stamp_s=stamp_s)
+        absolute_imu_yaw_rad = self._relative_imu_yaw_rad(stamp_s=stamp_s)
         if self.latest_rgb is not None and self.latest_depth is not None and self.intrinsics is not None:
             try:
                 frame = VisualOdomFrame(
@@ -414,6 +456,7 @@ class RgbdVisualOdometryNode(Node):
                 )
                 stamp_s = stamp_to_seconds(frame.stamp)
                 predicted_dx_m, predicted_dy_m, predicted_yaw_rad = self._predict_from_imu(stamp_s=stamp_s)
+                absolute_imu_yaw_rad = self._relative_imu_yaw_rad(stamp_s=stamp_s)
                 if self.previous_frame is not None:
                     estimate = self.estimator.estimate(self.previous_frame, frame)
                     if estimate is not None:
@@ -423,7 +466,12 @@ class RgbdVisualOdometryNode(Node):
                             + (1.0 - self.config.vo_translation_weight) * predicted_dx_m
                         )
                         fused_dy_m = (1.0 - self.config.vo_translation_weight) * predicted_dy_m
-                        fused_yaw_rad = predicted_yaw_rad if self.latest_imu is not None else estimate.yaw_rad
+                        if absolute_imu_yaw_rad is not None:
+                            fused_yaw_rad = angle_wrap(absolute_imu_yaw_rad - self.pose.yaw)
+                        elif self.latest_imu is not None:
+                            fused_yaw_rad = predicted_yaw_rad
+                        else:
+                            fused_yaw_rad = estimate.yaw_rad
                         self.pose = compose_planar_local(
                             self.pose,
                             delta_x_m=fused_dx_m,
@@ -441,12 +489,22 @@ class RgbdVisualOdometryNode(Node):
             except Exception as exc:
                 self.rejected_updates += 1
                 self.get_logger().warning(f"RGB-D VO update rejected: {exc}")
-        elif abs(predicted_dx_m) > 1e-6 or abs(predicted_dy_m) > 1e-6 or abs(predicted_yaw_rad) > 1e-6:
+        elif (
+            abs(predicted_dx_m) > 1e-6
+            or abs(predicted_dy_m) > 1e-6
+            or abs(predicted_yaw_rad) > 1e-6
+            or absolute_imu_yaw_rad is not None
+        ):
+            delta_yaw_rad = (
+                angle_wrap(absolute_imu_yaw_rad - self.pose.yaw)
+                if absolute_imu_yaw_rad is not None
+                else predicted_yaw_rad
+            )
             self.pose = compose_planar_local(
                 self.pose,
                 delta_x_m=predicted_dx_m,
                 delta_y_m=predicted_dy_m,
-                delta_yaw_rad=predicted_yaw_rad,
+                delta_yaw_rad=delta_yaw_rad,
             )
         self._publish_odom(stamp)
 

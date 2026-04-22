@@ -128,7 +128,8 @@ python -m xlerobot_playground.real_ros_bridge \
   --camera-x-m 0.0 \
   --camera-y-m 0.0 \
   --camera-z-m 0.35 \
-  --camera-yaw-rad 0.0
+  --camera-yaw-rad 0.0 \
+  --allow-motion-commands
 ```
 
 This publishes camera images, depth-derived `/scan`, `/imu`, camera transforms, and forwards ROS `/cmd_vel` to the robot brain.
@@ -258,7 +259,9 @@ python -m xlerobot_playground.real_agentic_exploration \
   --ros-ready-timeout-s 30 \
   --ros-turn-scan-timeout-s 75 \
   --ros-manual-spin-angular-speed-rad-s 0.30 \
-  --max-decisions 8
+  --max-decisions 8 \
+  --ros-imu-topic /imu/filtered_yaw \
+  --stop-after-initial-scan
 ```
 
 Open the UI from your browser:

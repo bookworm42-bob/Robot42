@@ -46,6 +46,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ros-map-topic", default="/map")
     parser.add_argument("--ros-scan-topic", default="/scan")
     parser.add_argument("--ros-rgb-topic", default="/camera/head/image_raw")
+    parser.add_argument("--ros-imu-topic", default="/imu/filtered_yaw")
     parser.add_argument("--ros-cmd-vel-topic", default="/cmd_vel")
     parser.add_argument("--ros-map-frame", default="map")
     parser.add_argument("--ros-odom-frame", default="odom")
@@ -56,6 +57,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ros-turn-scan-settle-s", type=float, default=1.0)
     parser.add_argument("--ros-manual-spin-angular-speed-rad-s", type=float, default=0.30)
     parser.add_argument("--ros-manual-spin-publish-hz", type=float, default=10.0)
+    parser.add_argument("--pause-for-operator-approval", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--stop-after-initial-scan", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--nav2-planner-id", default="GridBased")
     parser.add_argument("--nav2-controller-id", default="FollowPath")
     parser.add_argument("--nav2-behavior-tree", default=default_nav2_behavior_tree())
@@ -113,6 +116,8 @@ def translated_args(args: argparse.Namespace) -> list[str]:
         args.ros_scan_topic,
         "--ros-rgb-topic",
         args.ros_rgb_topic,
+        "--ros-imu-topic",
+        args.ros_imu_topic,
         "--ros-cmd-vel-topic",
         args.ros_cmd_vel_topic,
         "--ros-map-frame",
@@ -170,6 +175,16 @@ def translated_args(args: argparse.Namespace) -> list[str]:
         ("--serve-review-ui", "--no-serve-review-ui", args.serve_review_ui),
         ("--open-browser", "--no-open-browser", args.open_browser),
         ("--wait-for-ui-start", "--no-wait-for-ui-start", args.wait_for_ui_start),
+        (
+            "--pause-for-operator-approval",
+            "--no-pause-for-operator-approval",
+            args.pause_for_operator_approval,
+        ),
+        (
+            "--stop-after-initial-scan",
+            "--no-stop-after-initial-scan",
+            args.stop_after_initial_scan,
+        ),
         ("--nav2-recovery-enabled", "--no-nav2-recovery-enabled", args.nav2_recovery_enabled),
         ("--ros-allow-multiple-action-servers", "--no-ros-allow-multiple-action-servers", args.ros_allow_multiple_action_servers),
         ("--semantic-waypoints-enabled", "--no-semantic-waypoints-enabled", args.semantic_waypoints_enabled),

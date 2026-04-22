@@ -119,6 +119,7 @@ class SimExplorationConfig:
     ros_map_topic: str = "/map"
     ros_scan_topic: str = "/scan"
     ros_rgb_topic: str = "/camera/head/image_raw"
+    ros_imu_topic: str = "/imu/filtered_yaw"
     ros_cmd_vel_topic: str = "/cmd_vel"
     ros_map_frame: str = "map"
     ros_odom_frame: str = "odom"
@@ -142,6 +143,8 @@ class SimExplorationConfig:
     semantic_llm_api_key: str | None = None
     semantic_vlm_async: bool = True
     wait_for_ui_start: bool = False
+    pause_for_operator_approval: bool = False
+    stop_after_initial_scan: bool = False
     use_keyboard_controls: bool = False
     keyboard_speed: str = "normal"
 
@@ -2884,6 +2887,7 @@ class RosExplorationSession:
                     map_topic=config.ros_map_topic,
                     scan_topic=config.ros_scan_topic,
                     rgb_topic=config.ros_rgb_topic,
+                    imu_topic=config.ros_imu_topic,
                     cmd_vel_topic=config.ros_cmd_vel_topic,
                     map_frame=config.ros_map_frame,
                     odom_frame=config.ros_odom_frame,
@@ -2924,6 +2928,17 @@ class RosExplorationSession:
     def run(self) -> dict[str, Any]:
         self._initialize_scan_state()
         self._publish_live_map("Initial ROS/Nav2 scan complete.")
+        if self.config.stop_after_initial_scan:
+            self.backend.update_external_task(
+                self.task_id,
+                message="Initial 360 degree scan complete. Stopping before frontier navigation as requested.",
+            )
+            self.status = "finished"
+            return self._build_map_payload()
+        if not self._pause_for_operator_approval(
+            "Initial 360 degree scan complete. Review the map and click Resume to continue."
+        ):
+            return self._build_map_payload()
 
         while self.decision_index < self.config.max_decisions:
             if not self._wait_until_task_active():
@@ -3025,6 +3040,11 @@ class RosExplorationSession:
                     message=f"Marked {record.frontier_id} visited after Nav2 failed to reach it: {nav_result.reason}",
                     frontier_id=record.frontier_id,
                 )
+                if not self._pause_for_operator_approval(
+                    f"Step {self.decision_index} complete. {record.frontier_id} was marked visited after Nav2 failed. "
+                    "Review the state and click Resume to continue."
+                ):
+                    break
                 continue
 
             self._perform_turnaround_scan(reason=f"arrive_frontier::{record.frontier_id}")
@@ -3040,6 +3060,11 @@ class RosExplorationSession:
                 message=f"Explored {record.frontier_id} from live ROS/Nav2 state.",
                 frontier_id=record.frontier_id,
             )
+            if not self._pause_for_operator_approval(
+                f"Step {self.decision_index} complete. Explored {record.frontier_id}. "
+                "Review the state and click Resume to continue."
+            ):
+                break
 
         return self._build_map_payload()
 
@@ -3472,6 +3497,17 @@ class RosExplorationSession:
                 self._sync_manual_occupancy_edits()
                 return True
             time.sleep(0.1)
+
+    def _pause_for_operator_approval(self, message: str) -> bool:
+        if not self.config.pause_for_operator_approval:
+            return True
+        self.backend.pause_task(self.task_id)
+        self.backend.update_external_task(
+            self.task_id,
+            message=message,
+        )
+        self.status = "paused"
+        return self._wait_until_task_active()
 
     def _pause_requested_or_canceled(self) -> bool:
         task = self.backend.get_task(self.task_id)
@@ -4265,6 +4301,7 @@ class RosExplorationSession:
                     "map_topic": self.config.ros_map_topic,
                     "scan_topic": self.config.ros_scan_topic,
                     "rgb_topic": self.config.ros_rgb_topic,
+                    "imu_topic": self.config.ros_imu_topic,
                     "navigation_map_source": self.config.ros_navigation_map_source,
                     "base_frame": self.config.ros_base_frame,
                     "odom_frame": self.config.ros_odom_frame,
@@ -4469,6 +4506,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ros-map-topic", default="/map")
     parser.add_argument("--ros-scan-topic", default="/scan")
     parser.add_argument("--ros-rgb-topic", default="/camera/head/image_raw")
+    parser.add_argument("--ros-imu-topic", default="/imu/filtered_yaw")
     parser.add_argument("--ros-cmd-vel-topic", default="/cmd_vel")
     parser.add_argument("--ros-map-frame", default="map")
     parser.add_argument("--ros-adapter-url", default=None)
@@ -4496,6 +4534,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--semantic-llm-api-key", default=None)
     parser.add_argument("--semantic-vlm-async", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--wait-for-ui-start", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--pause-for-operator-approval",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Pause after the initial scan and after each completed exploration step until the operator clicks Resume.",
+    )
+    parser.add_argument(
+        "--stop-after-initial-scan",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Perform the initial 360 degree scan, publish the map state, and exit before frontier navigation.",
+    )
     parser.add_argument(
         "--experimental-free-space-semantic-waypoints",
         action=argparse.BooleanOptionalAction,
@@ -4569,6 +4619,7 @@ def main(argv: list[str] | None = None) -> int:
             ros_map_topic=args.ros_map_topic,
             ros_scan_topic=args.ros_scan_topic,
             ros_rgb_topic=args.ros_rgb_topic,
+            ros_imu_topic=args.ros_imu_topic,
             ros_cmd_vel_topic=args.ros_cmd_vel_topic,
             ros_map_frame=args.ros_map_frame,
             ros_adapter_url=args.ros_adapter_url,
@@ -4592,6 +4643,8 @@ def main(argv: list[str] | None = None) -> int:
             semantic_llm_api_key=args.semantic_llm_api_key,
             semantic_vlm_async=args.semantic_vlm_async,
             wait_for_ui_start=args.wait_for_ui_start,
+            pause_for_operator_approval=args.pause_for_operator_approval,
+            stop_after_initial_scan=args.stop_after_initial_scan,
         ),
         backend,
     )

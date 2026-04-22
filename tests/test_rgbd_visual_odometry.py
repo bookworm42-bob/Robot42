@@ -9,6 +9,7 @@ from xlerobot_playground.rgbd_visual_odometry import (
     build_parser,
     compose_planar,
     config_from_args,
+    yaw_from_quaternion_xyzw,
     yaw_to_quaternion_xyzw,
 )
 
@@ -31,6 +32,11 @@ class RgbdVisualOdometryHelperTests(unittest.TestCase):
 
         self.assertEqual((x, y, z), (0.0, 0.0, 0.0))
         self.assertEqual(w, 1.0)
+
+    def test_yaw_from_quaternion_round_trip(self) -> None:
+        x, y, z, w = yaw_to_quaternion_xyzw(math.radians(90.0))
+
+        self.assertAlmostEqual(yaw_from_quaternion_xyzw(x, y, z, w), math.radians(90.0))
 
     def test_parser_config_converts_degrees(self) -> None:
         args = build_parser().parse_args(["--max-yaw-step-deg", "15", "--min-matches", "8"])
