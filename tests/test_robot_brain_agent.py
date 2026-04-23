@@ -49,7 +49,8 @@ class RobotBrainAgentTests(unittest.TestCase):
         self.assertEqual(config.port, 8765)
         self.assertFalse(config.debug_motion)
         self.assertEqual(config.calibration_prompt_response, "")
-        self.assertEqual(config.imu_filename, "latest_imu.json")
+        self.assertEqual(config.imu_udp_host, "127.0.0.1")
+        self.assertEqual(config.imu_udp_port, 8766)
 
     def test_parser_accepts_debug_motion(self) -> None:
         args = build_parser().parse_args(["--debug-motion"])
@@ -83,8 +84,20 @@ class RobotBrainAgentTests(unittest.TestCase):
             self.assertEqual(agent.file_path("/rgb"), Path(tmpdir) / "latest.ppm")
             self.assertEqual(agent.file_path("/depth"), Path(tmpdir) / "latest_depth.pgm")
             self.assertEqual(agent.file_path("/metadata"), Path(tmpdir) / "latest.json")
-            self.assertEqual(agent.file_path("/imu"), Path(tmpdir) / "latest_imu.json")
+            self.assertIsNone(agent.file_path("/imu"))
             self.assertIsNone(agent.file_path("/missing"))
+
+    def test_agent_keeps_latest_imu_in_memory(self) -> None:
+        agent = RobotBrainAgent(RobotBrainAgentConfig(), runtime=FakeRuntime())
+
+        agent.ingest_imu_datagram(
+            b'{"timestamp_s":1.25,"angular_velocity_rad_s":{"x":0.1,"y":0.2,"z":0.3},"linear_acceleration_m_s2":{"x":1.0,"y":2.0,"z":3.0},"gyro_frame_index":7}'
+        )
+
+        snapshot = agent.imu_snapshot()
+        self.assertIsNotNone(snapshot)
+        self.assertEqual(snapshot["angular_velocity_rad_s"]["z"], 0.3)
+        self.assertEqual(snapshot["gyro_frame_index"], 7)
 
 
 if __name__ == "__main__":

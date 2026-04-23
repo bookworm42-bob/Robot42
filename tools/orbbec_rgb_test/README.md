@@ -22,9 +22,16 @@ Use `--frames 0 --latest-only` for continuous capture while the VR backend is ru
 For the real exploration ROS bridge, run the sidecar with depth enabled and point the bridge at the same directory:
 
 ```sh
-./build/orbbec_rgb_test/orbbec_rgb_test --frames 0 --latest-only --enable-depth --enable-imu --output-dir artifacts/orbbec_rgbd
+./build/orbbec_rgb_test/orbbec_rgb_test \
+  --frames 0 \
+  --latest-only \
+  --enable-depth \
+  --enable-imu \
+  --imu-udp-host 127.0.0.1 \
+  --imu-udp-port 8766 \
+  --output-dir artifacts/orbbec_rgbd
 ```
 
-This writes `latest.ppm`, `latest_depth.pgm`, `latest.json`, and, with `--enable-imu`, a dedicated high-rate `latest_imu.json`. `latest.json` carries the latest IMU sample under the `imu` key for frame-aligned metadata, while `latest_imu.json` is updated directly from the IMU callback and is the better source for high-rate accelerometer and gyroscope reads.
+This writes `latest.ppm`, `latest_depth.pgm`, and `latest.json`. With `--enable-imu`, the sidecar also pushes each IMU callback as a non-blocking UDP datagram to the robot brain, which then serves `/imu` as an in-memory debug snapshot and `/ws/imu` as the high-rate stream. `latest.json` still carries the latest IMU sample under the `imu` key for frame-aligned metadata, but `latest_imu.json` is no longer part of the high-rate path.
 
 Depth defaults to the camera's first matching Y16 profile. If you need to force a specific depth mode, pass `--depth-width`, `--depth-height`, and `--depth-fps`.

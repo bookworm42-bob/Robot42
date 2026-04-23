@@ -50,6 +50,90 @@ def clamp(value: float, lower: float, upper: float) -> float:
     return max(lower, min(upper, value))
 
 
+def tilt_from_acceleration(*, accel_x_m_s2: float, accel_y_m_s2: float, accel_z_m_s2: float) -> tuple[float, float]:
+    lateral_norm = math.sqrt(float(accel_y_m_s2) ** 2 + float(accel_z_m_s2) ** 2)
+    pitch_rad = math.atan2(float(accel_x_m_s2), max(lateral_norm, 1e-9))
+    roll_rad = math.atan2(-float(accel_y_m_s2), float(accel_z_m_s2))
+    return roll_rad, pitch_rad
+
+
+def gravity_components_from_tilt(*, roll_rad: float, pitch_rad: float, gravity_m_s2: float) -> tuple[float, float, float]:
+    cos_roll = math.cos(float(roll_rad))
+    sin_roll = math.sin(float(roll_rad))
+    cos_pitch = math.cos(float(pitch_rad))
+    sin_pitch = math.sin(float(pitch_rad))
+    return (
+        float(gravity_m_s2) * sin_pitch,
+        -float(gravity_m_s2) * sin_roll * cos_pitch,
+        float(gravity_m_s2) * cos_roll * cos_pitch,
+    )
+
+
+def update_tilt_estimate(
+    *,
+    previous_roll_rad: float | None,
+    previous_pitch_rad: float | None,
+    gyro_roll_rate_rad_s: float,
+    gyro_pitch_rate_rad_s: float,
+    accel_x_m_s2: float,
+    accel_y_m_s2: float,
+    accel_z_m_s2: float,
+    dt_s: float,
+    accel_correction_alpha: float,
+) -> tuple[float, float]:
+    accel_roll_rad, accel_pitch_rad = tilt_from_acceleration(
+        accel_x_m_s2=accel_x_m_s2,
+        accel_y_m_s2=accel_y_m_s2,
+        accel_z_m_s2=accel_z_m_s2,
+    )
+    if previous_roll_rad is None or previous_pitch_rad is None or dt_s <= 1e-6:
+        return accel_roll_rad, accel_pitch_rad
+    alpha = max(0.0, min(float(accel_correction_alpha), 1.0))
+    predicted_roll_rad = float(previous_roll_rad) + float(gyro_roll_rate_rad_s) * float(dt_s)
+    predicted_pitch_rad = float(previous_pitch_rad) + float(gyro_pitch_rate_rad_s) * float(dt_s)
+    return (
+        (1.0 - alpha) * predicted_roll_rad + alpha * accel_roll_rad,
+        (1.0 - alpha) * predicted_pitch_rad + alpha * accel_pitch_rad,
+    )
+
+
+def tilt_correction_alpha_for_motion(
+    *,
+    stationary_alpha: float,
+    commanded_linear_m_s: float,
+    moving_alpha: float = 0.0,
+) -> float:
+    if abs(float(commanded_linear_m_s)) > 1e-6:
+        return max(0.0, min(float(moving_alpha), 1.0))
+    return max(0.0, min(float(stationary_alpha), 1.0))
+
+def stationary_state_from_imu(
+    *,
+    accel_x_m_s2: float,
+    accel_y_m_s2: float,
+    accel_z_m_s2: float,
+    gyro_roll_rate_rad_s: float,
+    gyro_pitch_rate_rad_s: float,
+    gyro_yaw_rate_rad_s: float,
+    gravity_m_s2: float,
+    accel_norm_tolerance_m_s2: float,
+    gyro_norm_tolerance_rad_s: float,
+) -> tuple[bool, float, float]:
+    accel_norm_m_s2 = math.sqrt(
+        float(accel_x_m_s2) ** 2 + float(accel_y_m_s2) ** 2 + float(accel_z_m_s2) ** 2
+    )
+    gyro_norm_rad_s = math.sqrt(
+        float(gyro_roll_rate_rad_s) ** 2
+        + float(gyro_pitch_rate_rad_s) ** 2
+        + float(gyro_yaw_rate_rad_s) ** 2
+    )
+    is_stationary = (
+        abs(accel_norm_m_s2 - float(gravity_m_s2)) <= max(float(accel_norm_tolerance_m_s2), 0.0)
+        and gyro_norm_rad_s <= max(float(gyro_norm_tolerance_rad_s), 0.0)
+    )
+    return is_stationary, accel_norm_m_s2, gyro_norm_rad_s
+
+
 def integrate_acceleration_step(
     *,
     distance_m: float,
@@ -107,6 +191,13 @@ class ForwardAccelDiagnosticNode(Node):
         acceleration_deadband_m_s2: float,
         velocity_damping_per_s: float,
         max_estimated_velocity_m_s: float,
+        tilt_accel_correction_alpha: float,
+        tilt_accel_correction_alpha_when_moving: float,
+        gravity_m_s2: float,
+        accel_stationary_tolerance_m_s2: float,
+        gyro_stationary_tolerance_rad_s: float,
+        enable_zupt: bool,
+        allow_zupt_while_commanded_motion: bool,
     ) -> None:
         super().__init__("xlerobot_forward_accel_diagnostic")
         self.odom_frame = odom_frame
@@ -118,6 +209,15 @@ class ForwardAccelDiagnosticNode(Node):
         self.acceleration_deadband_m_s2 = max(float(acceleration_deadband_m_s2), 0.0)
         self.velocity_damping_per_s = max(float(velocity_damping_per_s), 0.0)
         self.max_estimated_velocity_m_s = max(float(max_estimated_velocity_m_s), 1e-6)
+        self.tilt_accel_correction_alpha = max(0.0, min(float(tilt_accel_correction_alpha), 1.0))
+        self.tilt_accel_correction_alpha_when_moving = max(
+            0.0, min(float(tilt_accel_correction_alpha_when_moving), 1.0)
+        )
+        self.gravity_m_s2 = max(float(gravity_m_s2), 1e-6)
+        self.accel_stationary_tolerance_m_s2 = max(float(accel_stationary_tolerance_m_s2), 0.0)
+        self.gyro_stationary_tolerance_rad_s = max(float(gyro_stationary_tolerance_rad_s), 0.0)
+        self.enable_zupt = bool(enable_zupt)
+        self.allow_zupt_while_commanded_motion = bool(allow_zupt_while_commanded_motion)
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self, spin_thread=False)
         self.cmd_vel_pub = self.create_publisher(Twist, cmd_vel_topic, 10)
@@ -126,8 +226,142 @@ class ForwardAccelDiagnosticNode(Node):
         self.accel_bias_forward_m_s2 = 0.0
         self.accel_bias_lateral_m_s2 = 0.0
         self.accel_bias_vertical_m_s2 = 0.0
+        self.gyro_bias_roll_rad_s = 0.0
+        self.gyro_bias_pitch_rad_s = 0.0
+        self.gyro_bias_yaw_rad_s = 0.0
+        self._run_bias_applied = False
+        self._run_active = False
+        self._integration_last_stamp_s: float | None = None
+        self._estimated_distance_m = 0.0
+        self._estimated_velocity_m_s = 0.0
+        self._estimated_roll_rad: float | None = None
+        self._estimated_pitch_rad: float | None = None
+        self._latest_integration_sample: dict[str, Any] | None = None
+        self._commanded_linear_m_s = 0.0
         self.create_subscription(Odometry, odom_topic, self._on_odom, 10)
         self.create_subscription(Imu, imu_topic, self._on_imu, 200)
+
+    def _reset_run_state(self, *, accel_bias: dict[str, float] | None) -> None:
+        self._run_bias_applied = accel_bias is not None
+        self._run_active = True
+        self._integration_last_stamp_s = None
+        self._estimated_distance_m = 0.0
+        self._estimated_velocity_m_s = 0.0
+        self._estimated_roll_rad = None if accel_bias is None else float(accel_bias["tilt_roll_rad"])
+        self._estimated_pitch_rad = None if accel_bias is None else float(accel_bias["tilt_pitch_rad"])
+        self._latest_integration_sample = None
+        self._commanded_linear_m_s = 0.0
+
+    def _integrate_imu_sample(self, imu_sample: dict[str, float]) -> None:
+        if not self._run_active:
+            return
+        imu_stamp_s = float(imu_sample["timestamp_s"])
+        if self._integration_last_stamp_s is not None and imu_stamp_s <= self._integration_last_stamp_s:
+            return
+        dt_s = (
+            self.sample_dt_s
+            if self._integration_last_stamp_s is None
+            else max(0.0, imu_stamp_s - self._integration_last_stamp_s)
+        )
+        self._integration_last_stamp_s = imu_stamp_s
+        raw_forward_m_s2 = float(imu_sample["base_linear_acceleration_x_m_s2"])
+        raw_lateral_m_s2 = float(imu_sample["base_linear_acceleration_y_m_s2"])
+        raw_vertical_m_s2 = float(imu_sample["base_linear_acceleration_z_m_s2"])
+        raw_gyro_roll_rad_s = float(imu_sample["base_angular_velocity_x_rad_s"])
+        raw_gyro_pitch_rad_s = float(imu_sample["base_angular_velocity_y_rad_s"])
+        raw_gyro_yaw_rad_s = float(imu_sample["base_angular_velocity_z_rad_s"])
+        corrected_gyro_roll_rad_s = raw_gyro_roll_rad_s - self.gyro_bias_roll_rad_s
+        corrected_gyro_pitch_rad_s = raw_gyro_pitch_rad_s - self.gyro_bias_pitch_rad_s
+        corrected_gyro_yaw_rad_s = raw_gyro_yaw_rad_s - self.gyro_bias_yaw_rad_s
+        is_stationary, accel_norm_m_s2, gyro_norm_rad_s = stationary_state_from_imu(
+            accel_x_m_s2=raw_forward_m_s2,
+            accel_y_m_s2=raw_lateral_m_s2,
+            accel_z_m_s2=raw_vertical_m_s2,
+            gyro_roll_rate_rad_s=corrected_gyro_roll_rad_s,
+            gyro_pitch_rate_rad_s=corrected_gyro_pitch_rad_s,
+            gyro_yaw_rate_rad_s=corrected_gyro_yaw_rad_s,
+            gravity_m_s2=self.gravity_m_s2,
+            accel_norm_tolerance_m_s2=self.accel_stationary_tolerance_m_s2,
+            gyro_norm_tolerance_rad_s=self.gyro_stationary_tolerance_rad_s,
+        )
+        tilt_alpha = (
+            self.tilt_accel_correction_alpha if is_stationary else self.tilt_accel_correction_alpha_when_moving
+        )
+        self._estimated_roll_rad, self._estimated_pitch_rad = update_tilt_estimate(
+            previous_roll_rad=self._estimated_roll_rad,
+            previous_pitch_rad=self._estimated_pitch_rad,
+            gyro_roll_rate_rad_s=corrected_gyro_roll_rad_s,
+            gyro_pitch_rate_rad_s=corrected_gyro_pitch_rad_s,
+            accel_x_m_s2=raw_forward_m_s2,
+            accel_y_m_s2=raw_lateral_m_s2,
+            accel_z_m_s2=raw_vertical_m_s2,
+            dt_s=dt_s,
+            accel_correction_alpha=tilt_alpha,
+        )
+        gravity_forward_m_s2, gravity_lateral_m_s2, gravity_vertical_m_s2 = gravity_components_from_tilt(
+            roll_rad=self._estimated_roll_rad,
+            pitch_rad=self._estimated_pitch_rad,
+            gravity_m_s2=self.gravity_m_s2,
+        )
+        compensated_forward_m_s2 = raw_forward_m_s2 - gravity_forward_m_s2
+        compensated_lateral_m_s2 = raw_lateral_m_s2 - gravity_lateral_m_s2
+        compensated_vertical_m_s2 = raw_vertical_m_s2 - gravity_vertical_m_s2
+        corrected_forward_m_s2 = compensated_forward_m_s2 - self.accel_bias_forward_m_s2
+        zupt_applied = self.enable_zupt and is_stationary and (
+            self.allow_zupt_while_commanded_motion or abs(self._commanded_linear_m_s) <= 1e-6
+        )
+        if zupt_applied:
+            self._estimated_velocity_m_s = 0.0
+            used_forward_m_s2 = 0.0
+        else:
+            (
+                self._estimated_distance_m,
+                self._estimated_velocity_m_s,
+                used_forward_m_s2,
+            ) = integrate_acceleration_step(
+                distance_m=self._estimated_distance_m,
+                velocity_m_s=self._estimated_velocity_m_s,
+                acceleration_m_s2=corrected_forward_m_s2,
+                dt_s=dt_s,
+                acceleration_deadband_m_s2=self.acceleration_deadband_m_s2,
+                velocity_damping_per_s=self.velocity_damping_per_s,
+                max_velocity_m_s=self.max_estimated_velocity_m_s,
+            )
+        self._latest_integration_sample = {
+            "imu_available": True,
+            "imu_timestamp_s": imu_stamp_s,
+            "imu_dt_s": dt_s,
+            "imu_raw_linear_acceleration_x_m_s2": float(imu_sample["linear_acceleration_x_m_s2"]),
+            "imu_raw_linear_acceleration_y_m_s2": float(imu_sample["linear_acceleration_y_m_s2"]),
+            "imu_raw_linear_acceleration_z_m_s2": float(imu_sample["linear_acceleration_z_m_s2"]),
+            "imu_base_linear_acceleration_x_m_s2": raw_forward_m_s2,
+            "imu_base_linear_acceleration_y_m_s2": raw_lateral_m_s2,
+            "imu_base_linear_acceleration_z_m_s2": raw_vertical_m_s2,
+            "imu_base_angular_velocity_roll_rad_s": raw_gyro_roll_rad_s,
+            "imu_base_angular_velocity_pitch_rad_s": raw_gyro_pitch_rad_s,
+            "imu_base_angular_velocity_yaw_rad_s": raw_gyro_yaw_rad_s,
+            "imu_corrected_gyro_roll_rad_s": corrected_gyro_roll_rad_s,
+            "imu_corrected_gyro_pitch_rad_s": corrected_gyro_pitch_rad_s,
+            "imu_corrected_gyro_yaw_rad_s": corrected_gyro_yaw_rad_s,
+            "imu_estimated_roll_rad": self._estimated_roll_rad,
+            "imu_estimated_pitch_rad": self._estimated_pitch_rad,
+            "imu_tilt_accel_correction_alpha": tilt_alpha,
+            "imu_stationary": is_stationary,
+            "imu_zupt_applied": zupt_applied,
+            "imu_commanded_linear_m_s": self._commanded_linear_m_s,
+            "imu_accel_norm_m_s2": accel_norm_m_s2,
+            "imu_gyro_norm_rad_s": gyro_norm_rad_s,
+            "imu_gravity_forward_m_s2": gravity_forward_m_s2,
+            "imu_gravity_lateral_m_s2": gravity_lateral_m_s2,
+            "imu_gravity_vertical_m_s2": gravity_vertical_m_s2,
+            "imu_compensated_forward_acceleration_m_s2": compensated_forward_m_s2,
+            "imu_compensated_lateral_acceleration_m_s2": compensated_lateral_m_s2,
+            "imu_compensated_vertical_acceleration_m_s2": compensated_vertical_m_s2,
+            "imu_corrected_forward_acceleration_m_s2": corrected_forward_m_s2,
+            "imu_used_forward_acceleration_m_s2": used_forward_m_s2,
+            "imu_estimated_forward_velocity_m_s": self._estimated_velocity_m_s,
+            "imu_estimated_forward_distance_m": self._estimated_distance_m,
+        }
 
     def _on_odom(self, message: Any) -> None:
         position = message.pose.pose.position
@@ -152,15 +386,31 @@ class ForwardAccelDiagnosticNode(Node):
             y=linear_y,
             z=linear_z,
         )
+        angular_x = float(message.angular_velocity.x)
+        angular_y = float(message.angular_velocity.y)
+        angular_z = float(message.angular_velocity.z)
+        base_gyro_x, base_gyro_y, base_gyro_z = imu_to_base_components(
+            frame_convention=self.imu_frame_convention,
+            x=angular_x,
+            y=angular_y,
+            z=angular_z,
+        )
         self.latest_imu_sample = {
             "timestamp_s": stamp_s,
             "linear_acceleration_x_m_s2": linear_x,
             "linear_acceleration_y_m_s2": linear_y,
             "linear_acceleration_z_m_s2": linear_z,
+            "angular_velocity_x_rad_s": angular_x,
+            "angular_velocity_y_rad_s": angular_y,
+            "angular_velocity_z_rad_s": angular_z,
             "base_linear_acceleration_x_m_s2": float(base_x),
             "base_linear_acceleration_y_m_s2": float(base_y),
             "base_linear_acceleration_z_m_s2": float(base_z),
+            "base_angular_velocity_x_rad_s": float(base_gyro_x),
+            "base_angular_velocity_y_rad_s": float(base_gyro_y),
+            "base_angular_velocity_z_rad_s": float(base_gyro_z),
         }
+        self._integrate_imu_sample(self.latest_imu_sample)
 
     def lookup_pose(self) -> dict[str, float] | None:
         try:
@@ -176,15 +426,23 @@ class ForwardAccelDiagnosticNode(Node):
         }
 
     def publish_forward(self, linear_m_s: float) -> None:
+        self._commanded_linear_m_s = float(linear_m_s)
         twist = Twist()
         twist.linear.x = float(linear_m_s)
         self.cmd_vel_pub.publish(twist)
 
     def stop(self) -> None:
+        self._commanded_linear_m_s = 0.0
         self.cmd_vel_pub.publish(Twist())
 
     def calibrate_accel_bias(self) -> dict[str, float] | None:
+        print(
+            f"[forward_accel_diag] Starting accel bias calibration for {self.accel_bias_calibration_s:.2f}s "
+            f"(min_samples={self.accel_bias_min_samples})",
+            flush=True,
+        )
         if self.accel_bias_calibration_s <= 1e-6:
+            print("[forward_accel_diag] Accel bias calibration disabled; using zero bias.", flush=True)
             return {
                 "bias_forward_m_s2": self.accel_bias_forward_m_s2,
                 "bias_lateral_m_s2": self.accel_bias_lateral_m_s2,
@@ -197,8 +455,15 @@ class ForwardAccelDiagnosticNode(Node):
         sum_forward = 0.0
         sum_lateral = 0.0
         sum_vertical = 0.0
+        sum_gyro_roll = 0.0
+        sum_gyro_pitch = 0.0
+        sum_gyro_yaw = 0.0
+        sum_roll_rad = 0.0
+        sum_pitch_rad = 0.0
         count = 0
         last_timestamp_s: float | None = None
+        estimated_roll_rad: float | None = None
+        estimated_pitch_rad: float | None = None
         while time.time() < deadline:
             rclpy.spin_once(self, timeout_sec=min(self.sample_dt_s, 0.05))
             imu_sample = self.latest_imu_sample
@@ -207,23 +472,78 @@ class ForwardAccelDiagnosticNode(Node):
             timestamp_s = float(imu_sample["timestamp_s"])
             if last_timestamp_s is not None and timestamp_s <= last_timestamp_s:
                 continue
+            dt_s = self.sample_dt_s if last_timestamp_s is None else max(0.0, timestamp_s - last_timestamp_s)
+            raw_base_forward = float(imu_sample["base_linear_acceleration_x_m_s2"])
+            raw_base_lateral = float(imu_sample["base_linear_acceleration_y_m_s2"])
+            raw_base_vertical = float(imu_sample["base_linear_acceleration_z_m_s2"])
+            raw_base_gyro_roll = float(imu_sample["base_angular_velocity_x_rad_s"])
+            raw_base_gyro_pitch = float(imu_sample["base_angular_velocity_y_rad_s"])
+            raw_base_gyro_yaw = float(imu_sample["base_angular_velocity_z_rad_s"])
+            estimated_roll_rad, estimated_pitch_rad = update_tilt_estimate(
+                previous_roll_rad=estimated_roll_rad,
+                previous_pitch_rad=estimated_pitch_rad,
+                gyro_roll_rate_rad_s=raw_base_gyro_roll,
+                gyro_pitch_rate_rad_s=raw_base_gyro_pitch,
+                accel_x_m_s2=raw_base_forward,
+                accel_y_m_s2=raw_base_lateral,
+                accel_z_m_s2=raw_base_vertical,
+                dt_s=dt_s,
+                accel_correction_alpha=self.tilt_accel_correction_alpha,
+            )
+            gravity_forward, gravity_lateral, gravity_vertical = gravity_components_from_tilt(
+                roll_rad=estimated_roll_rad,
+                pitch_rad=estimated_pitch_rad,
+                gravity_m_s2=self.gravity_m_s2,
+            )
             last_timestamp_s = timestamp_s
-            sum_forward += float(imu_sample["base_linear_acceleration_x_m_s2"])
-            sum_lateral += float(imu_sample["base_linear_acceleration_y_m_s2"])
-            sum_vertical += float(imu_sample["base_linear_acceleration_z_m_s2"])
+            sum_forward += raw_base_forward - gravity_forward
+            sum_lateral += raw_base_lateral - gravity_lateral
+            sum_vertical += raw_base_vertical - gravity_vertical
+            sum_gyro_roll += raw_base_gyro_roll
+            sum_gyro_pitch += raw_base_gyro_pitch
+            sum_gyro_yaw += raw_base_gyro_yaw
+            sum_roll_rad += estimated_roll_rad
+            sum_pitch_rad += estimated_pitch_rad
             count += 1
         if count < self.accel_bias_min_samples:
+            print(
+                f"[forward_accel_diag] Accel bias calibration failed: collected {count} samples, "
+                f"needed at least {self.accel_bias_min_samples}. Continuing without bias subtraction.",
+                flush=True,
+            )
             return None
         self.accel_bias_forward_m_s2 = sum_forward / count
         self.accel_bias_lateral_m_s2 = sum_lateral / count
         self.accel_bias_vertical_m_s2 = sum_vertical / count
-        return {
+        self.gyro_bias_roll_rad_s = sum_gyro_roll / count
+        self.gyro_bias_pitch_rad_s = sum_gyro_pitch / count
+        self.gyro_bias_yaw_rad_s = sum_gyro_yaw / count
+        result = {
             "bias_forward_m_s2": self.accel_bias_forward_m_s2,
             "bias_lateral_m_s2": self.accel_bias_lateral_m_s2,
             "bias_vertical_m_s2": self.accel_bias_vertical_m_s2,
+            "gyro_bias_roll_rad_s": self.gyro_bias_roll_rad_s,
+            "gyro_bias_pitch_rad_s": self.gyro_bias_pitch_rad_s,
+            "gyro_bias_yaw_rad_s": self.gyro_bias_yaw_rad_s,
+            "tilt_roll_rad": sum_roll_rad / count,
+            "tilt_pitch_rad": sum_pitch_rad / count,
             "sample_count": count,
             "elapsed_s": round(time.time() - start, 3),
         }
+        print(
+            "[forward_accel_diag] Accel bias calibration complete: "
+            f"samples={count} elapsed_s={result['elapsed_s']} "
+            f"forward={self.accel_bias_forward_m_s2:.6f} "
+            f"lateral={self.accel_bias_lateral_m_s2:.6f} "
+            f"vertical={self.accel_bias_vertical_m_s2:.6f} "
+            f"gyro_roll={self.gyro_bias_roll_rad_s:.6f} "
+            f"gyro_pitch={self.gyro_bias_pitch_rad_s:.6f} "
+            f"gyro_yaw={self.gyro_bias_yaw_rad_s:.6f} "
+            f"tilt_roll={result['tilt_roll_rad']:.6f} "
+            f"tilt_pitch={result['tilt_pitch_rad']:.6f}",
+            flush=True,
+        )
+        return result
 
     def collect(
         self,
@@ -235,21 +555,34 @@ class ForwardAccelDiagnosticNode(Node):
     ) -> list[dict[str, Any]]:
         samples: list[dict[str, Any]] = []
         accel_bias = self.calibrate_accel_bias()
+        if accel_bias is None:
+            print("[forward_accel_diag] Running without accel bias correction.", flush=True)
+        else:
+            print("[forward_accel_diag] Running with accel bias correction enabled.", flush=True)
+        self._reset_run_state(accel_bias=accel_bias)
+        self._commanded_linear_m_s = float(linear_m_s) if send_motion else 0.0
+        if not self.enable_zupt:
+            print("[forward_accel_diag] Pure integration mode: ZUPT disabled.", flush=True)
+        elif self.allow_zupt_while_commanded_motion:
+            print("[forward_accel_diag] ZUPT enabled for all stationary samples.", flush=True)
+        else:
+            print("[forward_accel_diag] ZUPT enabled only when commanded motion is zero.", flush=True)
         start = time.time()
         deadline = start + max(float(duration_s), 0.0)
         target_abs_distance_m = abs(float(target_distance_m)) if target_distance_m is not None else None
-        previous_imu_stamp_s: float | None = None
-        estimated_distance_m = 0.0
-        estimated_velocity_m_s = 0.0
         tf_start_pose: dict[str, float] | None = None
         odom_start_pose: dict[str, float] | None = None
         stop_reason = "duration_timeout"
+        next_sample_s = start
+        target_direction_sign = 1.0 if (target_distance_m is None or float(target_distance_m) >= 0.0) else -1.0
         while time.time() < deadline:
+            rclpy.spin_once(self, timeout_sec=0.001)
             now = time.time()
-            rclpy.spin_once(self, timeout_sec=0.0)
+            if now < next_sample_s:
+                continue
+            next_sample_s += self.sample_dt_s
             pose = self.lookup_pose()
             odom_pose = self.latest_odom_pose
-            imu_sample = self.latest_imu_sample
             if tf_start_pose is None and pose is not None:
                 tf_start_pose = dict(pose)
             if odom_start_pose is None and odom_pose is not None:
@@ -263,6 +596,9 @@ class ForwardAccelDiagnosticNode(Node):
                         "accel_bias_forward_m_s2": accel_bias["bias_forward_m_s2"],
                         "accel_bias_lateral_m_s2": accel_bias["bias_lateral_m_s2"],
                         "accel_bias_vertical_m_s2": accel_bias["bias_vertical_m_s2"],
+                        "gyro_bias_roll_rad_s": accel_bias["gyro_bias_roll_rad_s"],
+                        "gyro_bias_pitch_rad_s": accel_bias["gyro_bias_pitch_rad_s"],
+                        "gyro_bias_yaw_rad_s": accel_bias["gyro_bias_yaw_rad_s"],
                     }
                 )
             if pose is None:
@@ -307,50 +643,20 @@ class ForwardAccelDiagnosticNode(Node):
                     )
                     sample["odom_forward_distance_m"] = odom_forward_m
                     sample["odom_lateral_distance_m"] = odom_lateral_m
-            if imu_sample is None:
+            if self._latest_integration_sample is None:
                 sample["imu_available"] = False
             else:
-                imu_stamp_s = float(imu_sample["timestamp_s"])
-                dt_s = self.sample_dt_s if previous_imu_stamp_s is None else max(0.0, imu_stamp_s - previous_imu_stamp_s)
-                previous_imu_stamp_s = imu_stamp_s
-                raw_forward_m_s2 = float(imu_sample["base_linear_acceleration_x_m_s2"])
-                raw_lateral_m_s2 = float(imu_sample["base_linear_acceleration_y_m_s2"])
-                raw_vertical_m_s2 = float(imu_sample["base_linear_acceleration_z_m_s2"])
-                corrected_forward_m_s2 = raw_forward_m_s2 - self.accel_bias_forward_m_s2
-                estimated_distance_m, estimated_velocity_m_s, used_forward_m_s2 = integrate_acceleration_step(
-                    distance_m=estimated_distance_m,
-                    velocity_m_s=estimated_velocity_m_s,
-                    acceleration_m_s2=corrected_forward_m_s2,
-                    dt_s=dt_s,
-                    acceleration_deadband_m_s2=self.acceleration_deadband_m_s2,
-                    velocity_damping_per_s=self.velocity_damping_per_s,
-                    max_velocity_m_s=self.max_estimated_velocity_m_s,
-                )
-                sample.update(
-                    {
-                        "imu_available": True,
-                        "imu_timestamp_s": imu_stamp_s,
-                        "imu_dt_s": dt_s,
-                        "imu_raw_linear_acceleration_x_m_s2": float(imu_sample["linear_acceleration_x_m_s2"]),
-                        "imu_raw_linear_acceleration_y_m_s2": float(imu_sample["linear_acceleration_y_m_s2"]),
-                        "imu_raw_linear_acceleration_z_m_s2": float(imu_sample["linear_acceleration_z_m_s2"]),
-                        "imu_base_linear_acceleration_x_m_s2": raw_forward_m_s2,
-                        "imu_base_linear_acceleration_y_m_s2": raw_lateral_m_s2,
-                        "imu_base_linear_acceleration_z_m_s2": raw_vertical_m_s2,
-                        "imu_corrected_forward_acceleration_m_s2": corrected_forward_m_s2,
-                        "imu_used_forward_acceleration_m_s2": used_forward_m_s2,
-                        "imu_estimated_forward_velocity_m_s": estimated_velocity_m_s,
-                        "imu_estimated_forward_distance_m": estimated_distance_m,
-                    }
-                )
+                sample.update(self._latest_integration_sample)
             command_linear_m_s = 0.0
             target_reached = False
             if send_motion:
                 command_linear_m_s = float(linear_m_s)
                 if target_abs_distance_m is not None:
-                    remaining_m = max(target_abs_distance_m - abs(estimated_distance_m), 0.0)
+                    signed_progress_m = float(self._estimated_distance_m) * target_direction_sign
+                    remaining_m = max(target_abs_distance_m - max(signed_progress_m, 0.0), 0.0)
+                    sample["target_signed_progress_m"] = signed_progress_m
                     sample["target_remaining_distance_m"] = remaining_m
-                    if remaining_m <= 0.0:
+                    if signed_progress_m >= target_abs_distance_m:
                         command_linear_m_s = 0.0
                         target_reached = True
                 self.publish_forward(command_linear_m_s)
@@ -359,7 +665,7 @@ class ForwardAccelDiagnosticNode(Node):
             if target_abs_distance_m is not None and target_reached:
                 stop_reason = "target_accel_distance_reached"
                 break
-            time.sleep(self.sample_dt_s)
+        self._run_active = False
         self.stop()
         for _ in range(5):
             rclpy.spin_once(self, timeout_sec=0.02)
@@ -398,6 +704,15 @@ def _summarize_accel(samples: list[dict[str, Any]]) -> dict[str, Any]:
     end = valid[-1]
     peak_used_accel = max(abs(float(sample.get("imu_used_forward_acceleration_m_s2", 0.0))) for sample in valid)
     peak_velocity = max(abs(float(sample.get("imu_estimated_forward_velocity_m_s", 0.0))) for sample in valid)
+    stationary_sample_count = sum(1 for sample in valid if sample.get("imu_stationary"))
+    zupt_sample_count = sum(1 for sample in valid if sample.get("imu_zupt_applied"))
+    observed_rate_hz: float | None = None
+    if len(valid) >= 2:
+        first_stamp_s = float(valid[0].get("imu_timestamp_s", 0.0))
+        last_stamp_s = float(valid[-1].get("imu_timestamp_s", 0.0))
+        elapsed_stamp_s = last_stamp_s - first_stamp_s
+        if elapsed_stamp_s > 1e-6:
+            observed_rate_hz = (len(valid) - 1) / elapsed_stamp_s
     return {
         "valid_sample_count": len(valid),
         "elapsed_s": round(max(float(end["t_s"]) - float(valid[0]["t_s"]), 1e-6), 3),
@@ -405,6 +720,12 @@ def _summarize_accel(samples: list[dict[str, Any]]) -> dict[str, Any]:
         "reported_velocity_m_s": round(float(end.get("imu_estimated_forward_velocity_m_s", 0.0)), 4),
         "peak_used_forward_acceleration_m_s2": round(peak_used_accel, 4),
         "peak_estimated_velocity_m_s": round(peak_velocity, 4),
+        "stationary_sample_count": stationary_sample_count,
+        "moving_sample_count": len(valid) - stationary_sample_count,
+        "stationary_fraction": round(stationary_sample_count / len(valid), 4),
+        "zupt_applied_sample_count": zupt_sample_count,
+        "zupt_applied_fraction": round(zupt_sample_count / len(valid), 4),
+        "observed_imu_rate_hz": None if observed_rate_hz is None else round(observed_rate_hz, 3),
     }
 
 
@@ -415,12 +736,17 @@ def summarize(samples: list[dict[str, Any]]) -> dict[str, Any]:
         "accelerometer": _summarize_accel(samples),
         "tf": _summarize_pose_source(samples, prefix="tf"),
         "odom_topic": _summarize_pose_source(samples, prefix="odom"),
+        "accelerometer_bias_applied": bool(samples and "accel_bias_forward_m_s2" in samples[0]),
+        "tilt_compensation_applied": any("imu_gravity_forward_m_s2" in sample for sample in samples),
     }
     if samples and "accel_bias_forward_m_s2" in samples[0]:
         summary["accelerometer_bias"] = {
             "forward_m_s2": round(float(samples[0]["accel_bias_forward_m_s2"]), 6),
             "lateral_m_s2": round(float(samples[0]["accel_bias_lateral_m_s2"]), 6),
             "vertical_m_s2": round(float(samples[0]["accel_bias_vertical_m_s2"]), 6),
+            "gyro_roll_rad_s": round(float(samples[0]["gyro_bias_roll_rad_s"]), 6),
+            "gyro_pitch_rad_s": round(float(samples[0]["gyro_bias_pitch_rad_s"]), 6),
+            "gyro_yaw_rad_s": round(float(samples[0]["gyro_bias_yaw_rad_s"]), 6),
         }
     return summary
 
@@ -439,12 +765,32 @@ def build_parser() -> argparse.ArgumentParser:
         description="Drive forward and estimate distance from raw accelerometer integration while logging TF and /odom for comparison."
     )
     parser.add_argument("--duration-s", type=float, default=20.0)
-    parser.add_argument("--sample-hz", type=float, default=50.0)
-    parser.add_argument("--accel-bias-calibration-s", type=float, default=1.0)
+    parser.add_argument(
+        "--sample-hz",
+        type=float,
+        default=50.0,
+        help="Snapshot/logging and command publish cadence. IMU integration runs at IMU callback rate.",
+    )
+    parser.add_argument("--accel-bias-calibration-s", type=float, default=3.0)
     parser.add_argument("--accel-bias-min-samples", type=int, default=50)
-    parser.add_argument("--acceleration-deadband-m-s2", type=float, default=0.08)
-    parser.add_argument("--velocity-damping-per-s", type=float, default=0.35)
+    parser.add_argument("--acceleration-deadband-m-s2", type=float, default=0.0)
+    parser.add_argument("--velocity-damping-per-s", type=float, default=0.0)
     parser.add_argument("--max-estimated-velocity-m-s", type=float, default=0.75)
+    parser.add_argument("--tilt-accel-correction-alpha", type=float, default=0.02)
+    parser.add_argument("--tilt-accel-correction-alpha-when-moving", type=float, default=0.002)
+    parser.add_argument("--gravity-m-s2", type=float, default=9.80665)
+    parser.add_argument("--accel-stationary-tolerance-m-s2", type=float, default=0.10)
+    parser.add_argument("--gyro-stationary-tolerance-rad-s", type=float, default=0.05)
+    parser.add_argument(
+        "--enable-zupt",
+        action="store_true",
+        help="Enable zero-velocity resets on stationary-classified IMU samples.",
+    )
+    parser.add_argument(
+        "--zupt-while-commanded-motion",
+        action="store_true",
+        help="Keep zero-velocity resets enabled even while a non-zero forward command is active.",
+    )
     parser.add_argument("--odom-frame", default="odom")
     parser.add_argument("--base-frame", default="base_link")
     parser.add_argument("--cmd-vel-topic", default="/cmd_vel")
@@ -490,6 +836,13 @@ def main(argv: list[str] | None = None) -> int:
         acceleration_deadband_m_s2=args.acceleration_deadband_m_s2,
         velocity_damping_per_s=args.velocity_damping_per_s,
         max_estimated_velocity_m_s=args.max_estimated_velocity_m_s,
+        tilt_accel_correction_alpha=args.tilt_accel_correction_alpha,
+        tilt_accel_correction_alpha_when_moving=args.tilt_accel_correction_alpha_when_moving,
+        gravity_m_s2=args.gravity_m_s2,
+        accel_stationary_tolerance_m_s2=args.accel_stationary_tolerance_m_s2,
+        gyro_stationary_tolerance_rad_s=args.gyro_stationary_tolerance_rad_s,
+        enable_zupt=args.enable_zupt,
+        allow_zupt_while_commanded_motion=args.zupt_while_commanded_motion,
     )
     try:
         samples = node.collect(

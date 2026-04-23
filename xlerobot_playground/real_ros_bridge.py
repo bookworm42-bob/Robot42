@@ -1,20 +1,31 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 from dataclasses import dataclass
 import json
 import math
 from pathlib import Path
+import threading
 import time
 from typing import Any, Protocol, Sequence
 from urllib import error, request
 from urllib.parse import urljoin
 
 from multido_xlerobot.bootstrap import resolve_xlerobot_repo_root
+from xlerobot_playground.imu_transport import build_websocket_url, parse_imu_json
 from xlerobot_playground.real_exploration_runtime import (
     RealXLeRobotDirectRuntime,
     RealXLeRobotRuntimeConfig,
 )
+
+try:
+    import aiohttp
+except Exception as exc:  # pragma: no cover - runtime dependency guard.
+    aiohttp = None
+    AIOHTTP_IMPORT_ERROR: Exception | None = exc
+else:
+    AIOHTTP_IMPORT_ERROR = None
 
 IMPORT_ERROR: Exception | None = None
 try:
@@ -82,6 +93,8 @@ class RealRosBridgeConfig:
     publish_head_camera: bool = True
     publish_rate_hz: float = 10.0
     imu_publish_rate_hz: float = 200.0
+    imu_ws_path: str = "/ws/imu"
+    imu_ws_reconnect_delay_s: float = 1.0
     cmd_vel_timeout_s: float = 0.5
     laser_min_range_m: float = 0.05
     laser_max_range_m: float = 6.0
@@ -125,6 +138,14 @@ def require_ros_dependencies() -> None:
             "The real XLeRobot ROS bridge requires `rclpy`, `geometry_msgs`, "
             "`sensor_msgs`, `nav_msgs`, and `tf2_ros` in the active ROS 2 Python environment."
         ) from IMPORT_ERROR
+
+
+def require_aiohttp() -> None:
+    if AIOHTTP_IMPORT_ERROR is not None:
+        raise RuntimeError(
+            "The websocket IMU bridge requires `aiohttp`. Install it with "
+            "`python -m pip install aiohttp` in the active environment."
+        ) from AIOHTTP_IMPORT_ERROR
 
 
 def yaw_to_quaternion_xyzw(yaw_rad: float) -> tuple[float, float, float, float]:
@@ -258,65 +279,6 @@ def read_imu_json(path: Path) -> dict[str, Any] | None:
     return parse_imu_json(path.read_bytes())
 
 
-def parse_imu_json(data: bytes) -> dict[str, Any] | None:
-    payload = json.loads(data.decode("utf-8"))
-    imu = payload.get("imu") if isinstance(payload, dict) else None
-    if isinstance(imu, dict):
-        payload = imu
-    if not isinstance(payload, dict):
-        raise ValueError("Expected IMU metadata to be a JSON object.")
-    angular = _extract_xyz(payload, "angular_velocity_rad_s", aliases=("gyro", "angular_velocity"))
-    linear = _extract_xyz(payload, "linear_acceleration_m_s2", aliases=("accel", "linear_acceleration"))
-    if angular is None and linear is None:
-        return None
-    sample: dict[str, Any] = {
-        "timestamp_s": _extract_timestamp_s(payload),
-        "angular_velocity_rad_s": angular or {"x": 0.0, "y": 0.0, "z": 0.0},
-        "linear_acceleration_m_s2": linear or {"x": 0.0, "y": 0.0, "z": 0.0},
-    }
-    orientation = _extract_xyzw(payload, "orientation_xyzw", aliases=("orientation",))
-    if orientation is not None:
-        sample["orientation_xyzw"] = orientation
-    return sample
-
-
-def _extract_timestamp_s(payload: dict[str, Any]) -> float:
-    for key in ("timestamp_s", "time_s"):
-        if key in payload:
-            return float(payload[key])
-    for key in ("system_timestamp_us", "device_timestamp_us", "timestamp_us"):
-        if key in payload:
-            return float(payload[key]) / 1_000_000.0
-    return time.time()
-
-
-def _extract_xyz(payload: dict[str, Any], key: str, *, aliases: tuple[str, ...] = ()) -> dict[str, float] | None:
-    for candidate in (key, *aliases):
-        value = payload.get(candidate)
-        if isinstance(value, dict) and all(axis in value for axis in ("x", "y", "z")):
-            return {axis: float(value[axis]) for axis in ("x", "y", "z")}
-    flat = {}
-    found = False
-    for axis in ("x", "y", "z"):
-        for prefix in (key, *aliases):
-            flat_key = f"{prefix}_{axis}"
-            if flat_key in payload:
-                flat[axis] = float(payload[flat_key])
-                found = True
-                break
-    if found and len(flat) == 3:
-        return flat
-    return None
-
-
-def _extract_xyzw(payload: dict[str, Any], key: str, *, aliases: tuple[str, ...] = ()) -> dict[str, float] | None:
-    for candidate in (key, *aliases):
-        value = payload.get(candidate)
-        if isinstance(value, dict) and all(axis in value for axis in ("x", "y", "z", "w")):
-            return {axis: float(value[axis]) for axis in ("x", "y", "z", "w")}
-    return None
-
-
 class OrbbecFilesystemRgbdSource:
     """Reads frames produced by the native Orbbec RGB-D sidecar.
 
@@ -384,6 +346,9 @@ class RobotBrainClient:
             return {}
         return json.loads(data.decode("utf-8"))
 
+    def websocket_url(self, path: str) -> str:
+        return build_websocket_url(self.base_url, path)
+
 
 class RobotBrainRgbdSource:
     def __init__(self, client: RobotBrainClient) -> None:
@@ -396,17 +361,12 @@ class RobotBrainRgbdSource:
         depth = None
         depth_width = None
         depth_height = None
-        imu_sample = None
         try:
             rgb, rgb_width, rgb_height = parse_rgb_ppm(self.client.get_bytes("/rgb"))
         except Exception:
             pass
         try:
             depth, depth_width, depth_height = parse_depth_pgm_mm(self.client.get_bytes("/depth"))
-        except Exception:
-            pass
-        try:
-            imu_sample = parse_imu_json(self.client.get_bytes("/imu"))
         except Exception:
             pass
         return RgbdFrame(
@@ -416,7 +376,7 @@ class RobotBrainRgbdSource:
             depth_mm=depth,
             depth_width=depth_width,
             depth_height=depth_height,
-            imu_sample=imu_sample,
+            imu_sample=None,
             timestamp_s=time.time(),
         )
 
@@ -503,6 +463,19 @@ class RealXLeRobotRosBridge(Node):
         self._last_angular = 0.0
         self._last_motion_error = ""
         self._last_imu_timestamp_s: float | None = None
+        self._max_imu_timestamp_s: float | None = None
+        self._last_accel_frame_index: int | None = None
+        self._last_gyro_frame_index: int | None = None
+        self._imu_duplicate_timestamps = 0
+        self._imu_stale_timestamps = 0
+        self._imu_inferred_drop_count = 0
+        self._imu_received_count = 0
+        self._imu_published_count = 0
+        self._imu_log_started_at = time.monotonic()
+        self._imu_log_received_at = 0
+        self._imu_log_published_at = 0
+        self._imu_stream_stop = threading.Event()
+        self._imu_stream_thread: threading.Thread | None = None
         self._cmd_vel_callback_group = MutuallyExclusiveCallbackGroup()
         self._step_callback_group = MutuallyExclusiveCallbackGroup()
         self._imu_callback_group = MutuallyExclusiveCallbackGroup()
@@ -531,11 +504,16 @@ class RealXLeRobotRosBridge(Node):
             self.step,
             callback_group=self._step_callback_group,
         )
-        self.imu_timer = self.create_timer(
-            1.0 / max(config.imu_publish_rate_hz, 1e-6),
-            self._poll_and_publish_imu,
-            callback_group=self._imu_callback_group,
-        )
+        self.imu_timer = None
+        if brain_client is not None:
+            require_aiohttp()
+            self._start_imu_stream_thread(brain_client.websocket_url(config.imu_ws_path))
+        else:
+            self.imu_timer = self.create_timer(
+                1.0 / max(config.imu_publish_rate_hz, 1e-6),
+                self._poll_and_publish_imu,
+                callback_group=self._imu_callback_group,
+            )
         self.get_logger().info(
             "Real bridge ready: "
             f"robot={config.robot_kind} port1={config.port1} port2={config.port2} "
@@ -569,12 +547,104 @@ class RealXLeRobotRosBridge(Node):
         self._publish_scan(frame=frame, stamp=stamp)
         self._publish_head_images(frame=frame, stamp=stamp)
 
+    def _start_imu_stream_thread(self, websocket_url: str) -> None:
+        self._imu_stream_thread = threading.Thread(
+            target=self._run_imu_stream_thread,
+            args=(websocket_url,),
+            name="robot-brain-imu-ws",
+            daemon=True,
+        )
+        self._imu_stream_thread.start()
+
+    def _run_imu_stream_thread(self, websocket_url: str) -> None:
+        asyncio.run(self._imu_stream_loop(websocket_url))
+
+    async def _imu_stream_loop(self, websocket_url: str) -> None:
+        timeout = aiohttp.ClientTimeout(total=None, sock_connect=5.0, sock_read=None)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            while not self._imu_stream_stop.is_set():
+                try:
+                    self.get_logger().info(f"Connecting IMU websocket: {websocket_url}")
+                    async with session.ws_connect(websocket_url, heartbeat=20.0) as ws:
+                        self.get_logger().info(f"IMU websocket connected: {websocket_url}")
+                        while not self._imu_stream_stop.is_set():
+                            try:
+                                message = await ws.receive(timeout=1.0)
+                            except asyncio.TimeoutError:
+                                continue
+                            if message.type == aiohttp.WSMsgType.TEXT:
+                                payload = message.data
+                            elif message.type == aiohttp.WSMsgType.BINARY:
+                                payload = message.data
+                            elif message.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED):
+                                raise RuntimeError("IMU websocket closed")
+                            elif message.type == aiohttp.WSMsgType.ERROR:
+                                raise ws.exception() or RuntimeError("IMU websocket error")
+                            else:
+                                continue
+                            try:
+                                sample = parse_imu_json(payload)
+                            except Exception as exc:
+                                self.get_logger().warning(f"Failed to decode IMU websocket payload: {exc}")
+                                continue
+                            if sample is None:
+                                continue
+                            self._handle_streamed_imu_sample(sample)
+                except Exception as exc:
+                    if self._imu_stream_stop.is_set():
+                        break
+                    self.get_logger().warning(
+                        "IMU websocket disconnected: "
+                        f"{_format_runtime_error(exc)}; retrying in {self.config.imu_ws_reconnect_delay_s:.1f}s"
+                    )
+                    await asyncio.sleep(max(self.config.imu_ws_reconnect_delay_s, 0.1))
+
+    def _handle_streamed_imu_sample(self, imu_sample: dict[str, Any]) -> None:
+        timestamp_s = float(imu_sample.get("timestamp_s", time.time()))
+        self._imu_received_count += 1
+        if self._last_imu_timestamp_s is not None and timestamp_s == self._last_imu_timestamp_s:
+            self._imu_duplicate_timestamps += 1
+        if self._max_imu_timestamp_s is not None and timestamp_s < self._max_imu_timestamp_s:
+            self._imu_stale_timestamps += 1
+        self._last_imu_timestamp_s = timestamp_s
+        self._max_imu_timestamp_s = timestamp_s if self._max_imu_timestamp_s is None else max(
+            self._max_imu_timestamp_s,
+            timestamp_s,
+        )
+        self._track_imu_frame_gap(imu_sample, "accel_frame_index", "_last_accel_frame_index")
+        self._track_imu_frame_gap(imu_sample, "gyro_frame_index", "_last_gyro_frame_index")
+        self._publish_imu_sample(imu_sample=imu_sample)
+        self._imu_published_count += 1
+        self._log_imu_stream_stats()
+
+    def _track_imu_frame_gap(self, imu_sample: dict[str, Any], key: str, attr_name: str) -> None:
+        current = imu_sample.get(key)
+        if current is None:
+            return
+        current_index = int(current)
+        previous = getattr(self, attr_name)
+        if previous is not None and current_index > previous + 1:
+            self._imu_inferred_drop_count += current_index - previous - 1
+        setattr(self, attr_name, current_index)
+
+    def _log_imu_stream_stats(self) -> None:
+        if self._imu_published_count <= 0 or self._imu_published_count % 200 != 0:
+            return
+        now = time.monotonic()
+        dt = max(now - self._imu_log_started_at, 1e-6)
+        received_delta = self._imu_received_count - self._imu_log_received_at
+        published_delta = self._imu_published_count - self._imu_log_published_at
+        self.get_logger().info(
+            "IMU stream "
+            f"rx~={received_delta / dt:.1f}Hz publish~={published_delta / dt:.1f}Hz "
+            f"duplicates={self._imu_duplicate_timestamps} stale={self._imu_stale_timestamps} "
+            f"inferred_drops={self._imu_inferred_drop_count}"
+        )
+        self._imu_log_started_at = now
+        self._imu_log_received_at = self._imu_received_count
+        self._imu_log_published_at = self._imu_published_count
+
     def _capture_imu_sample(self) -> dict[str, Any] | None:
-        if self.brain_client is not None:
-            try:
-                return parse_imu_json(self.brain_client.get_bytes("/imu"))
-            except Exception:
-                return None
         imu_path = self.config.orbbec.output_dir.expanduser().resolve() / self.config.orbbec.imu_filename
         if not imu_path.exists():
             return None
@@ -786,6 +856,9 @@ class RealXLeRobotRosBridge(Node):
 
     def close(self) -> None:
         try:
+            self._imu_stream_stop.set()
+            if self._imu_stream_thread is not None:
+                self._imu_stream_thread.join(timeout=max(2.0, self.config.imu_ws_reconnect_delay_s + 1.0))
             try:
                 self.runtime.stop()
             except Exception as exc:
@@ -871,7 +944,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--camera-yaw-rad", type=float, default=0.0)
     parser.add_argument("--publish-head-camera", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--publish-rate-hz", type=float, default=10.0)
-    parser.add_argument("--imu-publish-rate-hz", type=float, default=200.0)
+    parser.add_argument(
+        "--imu-publish-rate-hz",
+        type=float,
+        default=200.0,
+        help="Local filesystem IMU poll rate. Remote robot_brain IMU uses websocket push instead.",
+    )
+    parser.add_argument("--imu-ws-path", default="/ws/imu")
+    parser.add_argument("--imu-ws-reconnect-delay-s", type=float, default=1.0)
     parser.add_argument("--cmd-vel-timeout-s", type=float, default=0.5)
     parser.add_argument("--laser-min-range-m", type=float, default=0.05)
     parser.add_argument("--laser-max-range-m", type=float, default=6.0)
@@ -924,6 +1004,8 @@ def config_from_args(args: argparse.Namespace) -> RealRosBridgeConfig:
         publish_head_camera=args.publish_head_camera,
         publish_rate_hz=args.publish_rate_hz,
         imu_publish_rate_hz=args.imu_publish_rate_hz,
+        imu_ws_path=args.imu_ws_path,
+        imu_ws_reconnect_delay_s=args.imu_ws_reconnect_delay_s,
         cmd_vel_timeout_s=args.cmd_vel_timeout_s,
         laser_min_range_m=args.laser_min_range_m,
         laser_max_range_m=args.laser_max_range_m,
@@ -943,6 +1025,8 @@ def config_from_args(args: argparse.Namespace) -> RealRosBridgeConfig:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     require_ros_dependencies()
+    if args.robot_brain_url:
+        require_aiohttp()
     rclpy.init()
     bridge = RealXLeRobotRosBridge(config_from_args(args))
     executor = MultiThreadedExecutor(num_threads=3)

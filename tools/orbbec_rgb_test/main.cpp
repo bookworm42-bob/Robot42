@@ -4,14 +4,23 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
+#include <cerrno>
 #include <filesystem>
 #include <fstream>
+#include <fcntl.h>
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <sstream>
+#include <iomanip>
 #include <stdexcept>
 #include <string>
+#include <sys/socket.h>
 #include <thread>
+#include <unistd.h>
 
 namespace fs = std::filesystem;
 
@@ -27,9 +36,12 @@ struct Options {
     int depth_height = 0;
     int depth_fps = 0;
     int log_every = 1;
+    int imu_log_every = 200;
     bool latest_only = false;
     bool enable_depth = false;
     bool enable_imu = false;
+    std::string imu_udp_host = "127.0.0.1";
+    int imu_udp_port = 8766;
 };
 
 struct LatestImuSample {
@@ -43,6 +55,102 @@ struct LatestImuSample {
     float gyro_temperature = 0.0f;
     OBAccelValue accel_value{};
     OBGyroValue gyro_value{};
+};
+
+std::string imu_sample_to_json(const LatestImuSample &imu_sample) {
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(9);
+    const uint64_t latest_imu_timestamp_us = std::max(imu_sample.accel_timestamp_us, imu_sample.gyro_timestamp_us);
+    out << "{"
+        << "\"timestamp_s\":" << (static_cast<double>(latest_imu_timestamp_us) / 1'000'000.0)
+        << ",\"system_timestamp_us\":" << latest_imu_timestamp_us
+        << ",\"has_accel\":" << (imu_sample.has_accel ? "true" : "false")
+        << ",\"has_gyro\":" << (imu_sample.has_gyro ? "true" : "false");
+    if(imu_sample.has_accel) {
+        out << ",\"linear_acceleration_m_s2\":{"
+            << "\"x\":" << imu_sample.accel_value.x
+            << ",\"y\":" << imu_sample.accel_value.y
+            << ",\"z\":" << imu_sample.accel_value.z
+            << "}"
+            << ",\"accel_frame_index\":" << imu_sample.accel_frame_index
+            << ",\"accel_timestamp_us\":" << imu_sample.accel_timestamp_us
+            << ",\"accel_temperature_c\":" << imu_sample.accel_temperature;
+    }
+    if(imu_sample.has_gyro) {
+        out << ",\"angular_velocity_rad_s\":{"
+            << "\"x\":" << imu_sample.gyro_value.x
+            << ",\"y\":" << imu_sample.gyro_value.y
+            << ",\"z\":" << imu_sample.gyro_value.z
+            << "}"
+            << ",\"gyro_frame_index\":" << imu_sample.gyro_frame_index
+            << ",\"gyro_timestamp_us\":" << imu_sample.gyro_timestamp_us
+            << ",\"gyro_temperature_c\":" << imu_sample.gyro_temperature;
+    }
+    out << "}";
+    return out.str();
+}
+
+class ImuDatagramPublisher {
+public:
+    ImuDatagramPublisher(const std::string &host, int port) : socket_fd_(-1) {
+        socket_fd_ = ::socket(AF_INET, SOCK_DGRAM, 0);
+        if(socket_fd_ < 0) {
+            throw std::runtime_error("Failed to create IMU UDP socket");
+        }
+        const int flags = fcntl(socket_fd_, F_GETFL, 0);
+        if(flags < 0 || fcntl(socket_fd_, F_SETFL, flags | O_NONBLOCK) < 0) {
+            ::close(socket_fd_);
+            socket_fd_ = -1;
+            throw std::runtime_error("Failed to mark IMU UDP socket non-blocking");
+        }
+        std::memset(&destination_, 0, sizeof(destination_));
+        destination_.sin_family = AF_INET;
+        destination_.sin_port = htons(static_cast<uint16_t>(port));
+        if(::inet_pton(AF_INET, host.c_str(), &destination_.sin_addr) != 1) {
+            ::close(socket_fd_);
+            socket_fd_ = -1;
+            throw std::runtime_error("Invalid IMU UDP host: " + host);
+        }
+    }
+
+    ImuDatagramPublisher(const ImuDatagramPublisher &) = delete;
+    ImuDatagramPublisher &operator=(const ImuDatagramPublisher &) = delete;
+
+    ~ImuDatagramPublisher() {
+        if(socket_fd_ >= 0) {
+            ::close(socket_fd_);
+        }
+    }
+
+    bool publish(const LatestImuSample &imu_sample) {
+        last_error_message_.clear();
+        const std::string payload = imu_sample_to_json(imu_sample);
+        const ssize_t sent = ::sendto(
+            socket_fd_,
+            payload.data(),
+            payload.size(),
+            0,
+            reinterpret_cast<const sockaddr *>(&destination_),
+            sizeof(destination_)
+        );
+        if(sent >= 0) {
+            return true;
+        }
+        if(errno == EWOULDBLOCK || errno == EAGAIN) {
+            return false;
+        }
+        last_error_message_ = std::strerror(errno);
+        return false;
+    }
+
+    const std::string &last_error_message() const {
+        return last_error_message_;
+    }
+
+private:
+    int socket_fd_;
+    sockaddr_in destination_{};
+    std::string last_error_message_;
 };
 
 int parse_int(const std::string &value, const std::string &name) {
@@ -103,6 +211,9 @@ Options parse_args(int argc, char **argv) {
         else if(arg == "--log-every") {
             options.log_every = parse_int(require_value(arg), arg);
         }
+        else if(arg == "--imu-log-every") {
+            options.imu_log_every = parse_int(require_value(arg), arg);
+        }
         else if(arg == "--latest-only") {
             options.latest_only = true;
         }
@@ -112,12 +223,20 @@ Options parse_args(int argc, char **argv) {
         else if(arg == "--enable-imu") {
             options.enable_imu = true;
         }
+        else if(arg == "--imu-udp-host") {
+            options.imu_udp_host = require_value(arg);
+        }
+        else if(arg == "--imu-udp-port") {
+            options.imu_udp_port = parse_int(require_value(arg), arg);
+        }
         else if(arg == "--help" || arg == "-h") {
             std::cout << "Usage: orbbec_rgb_test [--output-dir DIR] [--frames N]\n"
                       << "                       [--warmup-frames N] [--timeout-ms MS]\n"
                       << "                       [--width PX] [--height PX] [--fps FPS]\n"
                       << "                       [--depth-width PX] [--depth-height PX] [--depth-fps FPS]\n"
-                      << "                       [--log-every N] [--latest-only] [--enable-depth] [--enable-imu]\n";
+                      << "                       [--log-every N] [--imu-log-every N]\n"
+                      << "                       [--imu-udp-host HOST] [--imu-udp-port PORT]\n"
+                      << "                       [--latest-only] [--enable-depth] [--enable-imu]\n";
             std::exit(EXIT_SUCCESS);
         }
         else {
@@ -136,6 +255,12 @@ Options parse_args(int argc, char **argv) {
     }
     if(options.log_every < 0) {
         throw std::runtime_error("--log-every must be 0 or positive");
+    }
+    if(options.imu_log_every < 0) {
+        throw std::runtime_error("--imu-log-every must be 0 or positive");
+    }
+    if(options.imu_udp_port < 1 || options.imu_udp_port > 65535) {
+        throw std::runtime_error("--imu-udp-port must be between 1 and 65535");
     }
     return options;
 }
@@ -294,44 +419,6 @@ void write_latest_metadata(
     fs::rename(tmp_path, path);
 }
 
-void write_latest_imu_atomic(const fs::path &path, const LatestImuSample &imu_sample) {
-    const auto tmp_path = path.string() + ".tmp";
-    std::ofstream out(tmp_path);
-    if(!out) {
-        throw std::runtime_error("Could not open IMU metadata file: " + tmp_path);
-    }
-    out << "{\n"
-        << "  \"imu\": {\n"
-        << "    \"has_accel\": " << (imu_sample.has_accel ? "true" : "false") << ",\n"
-        << "    \"has_gyro\": " << (imu_sample.has_gyro ? "true" : "false") << ",\n";
-    if(imu_sample.has_accel) {
-        out << "    \"linear_acceleration_m_s2\": {\n"
-            << "      \"x\": " << imu_sample.accel_value.x << ",\n"
-            << "      \"y\": " << imu_sample.accel_value.y << ",\n"
-            << "      \"z\": " << imu_sample.accel_value.z << "\n"
-            << "    },\n"
-            << "    \"accel_frame_index\": " << imu_sample.accel_frame_index << ",\n"
-            << "    \"accel_timestamp_us\": " << imu_sample.accel_timestamp_us << ",\n"
-            << "    \"accel_temperature_c\": " << imu_sample.accel_temperature << ",\n";
-    }
-    if(imu_sample.has_gyro) {
-        out << "    \"angular_velocity_rad_s\": {\n"
-            << "      \"x\": " << imu_sample.gyro_value.x << ",\n"
-            << "      \"y\": " << imu_sample.gyro_value.y << ",\n"
-            << "      \"z\": " << imu_sample.gyro_value.z << "\n"
-            << "    },\n"
-            << "    \"gyro_frame_index\": " << imu_sample.gyro_frame_index << ",\n"
-            << "    \"gyro_timestamp_us\": " << imu_sample.gyro_timestamp_us << ",\n"
-            << "    \"gyro_temperature_c\": " << imu_sample.gyro_temperature << ",\n";
-    }
-    const uint64_t latest_imu_timestamp_us = std::max(imu_sample.accel_timestamp_us, imu_sample.gyro_timestamp_us);
-    out << "    \"system_timestamp_us\": " << latest_imu_timestamp_us << "\n"
-        << "  }\n"
-        << "}\n";
-    out.close();
-    fs::rename(tmp_path, path);
-}
-
 int main(int argc, char **argv) try {
     const Options options = parse_args(argc, argv);
     fs::create_directories(options.output_dir);
@@ -376,11 +463,18 @@ int main(int argc, char **argv) try {
     auto converter = std::make_shared<ob::FormatConvertFilter>();
 
     std::shared_ptr<ob::Pipeline> imu_pipeline = nullptr;
+    std::unique_ptr<ImuDatagramPublisher> imu_publisher;
     std::mutex imu_mutex;
     LatestImuSample latest_imu_sample;
     bool imu_running = false;
+    uint64_t imu_callback_count = 0;
+    uint64_t imu_udp_drop_count = 0;
+    uint64_t imu_udp_error_count = 0;
+    auto imu_log_started_at = std::chrono::steady_clock::now();
     if(options.enable_imu) {
         try {
+            imu_publisher = std::make_unique<ImuDatagramPublisher>(options.imu_udp_host, options.imu_udp_port);
+            std::cout << "IMU UDP publisher: " << options.imu_udp_host << ":" << options.imu_udp_port << "\n";
             imu_pipeline = std::make_shared<ob::Pipeline>(device);
             auto imu_config = std::make_shared<ob::Config>();
             imu_config->enableGyroStream();
@@ -389,35 +483,64 @@ int main(int argc, char **argv) try {
             imu_pipeline->start(imu_config, [&](std::shared_ptr<ob::FrameSet> frame_set) {
                 auto accel_frame_raw = frame_set->getFrame(OB_FRAME_ACCEL);
                 auto gyro_frame_raw = frame_set->getFrame(OB_FRAME_GYRO);
-                std::lock_guard<std::mutex> lock(imu_mutex);
-                if(accel_frame_raw) {
-                    auto accel_frame = accel_frame_raw->as<ob::AccelFrame>();
-                    latest_imu_sample.has_accel = true;
-                    latest_imu_sample.accel_frame_index = accel_frame->getIndex();
-                    latest_imu_sample.accel_timestamp_us = accel_frame->getTimeStampUs();
-                    latest_imu_sample.accel_temperature = accel_frame->getTemperature();
-                    latest_imu_sample.accel_value = accel_frame->getValue();
-                }
-                if(gyro_frame_raw) {
-                    auto gyro_frame = gyro_frame_raw->as<ob::GyroFrame>();
-                    latest_imu_sample.has_gyro = true;
-                    latest_imu_sample.gyro_frame_index = gyro_frame->getIndex();
-                    latest_imu_sample.gyro_timestamp_us = gyro_frame->getTimeStampUs();
-                    latest_imu_sample.gyro_temperature = gyro_frame->getTemperature();
-                    latest_imu_sample.gyro_value = gyro_frame->getValue();
-                }
-                if(latest_imu_sample.has_accel || latest_imu_sample.has_gyro) {
-                    try {
-                        write_latest_imu_atomic(options.output_dir / "latest_imu.json", latest_imu_sample);
+                LatestImuSample sample_to_publish;
+                bool has_sample = false;
+                {
+                    std::lock_guard<std::mutex> lock(imu_mutex);
+                    if(accel_frame_raw) {
+                        auto accel_frame = accel_frame_raw->as<ob::AccelFrame>();
+                        latest_imu_sample.has_accel = true;
+                        latest_imu_sample.accel_frame_index = accel_frame->getIndex();
+                        latest_imu_sample.accel_timestamp_us = accel_frame->getTimeStampUs();
+                        latest_imu_sample.accel_temperature = accel_frame->getTemperature();
+                        latest_imu_sample.accel_value = accel_frame->getValue();
                     }
-                    catch(const std::exception &e) {
-                        std::cerr << "Failed to write latest_imu.json: " << e.what() << "\n";
+                    if(gyro_frame_raw) {
+                        auto gyro_frame = gyro_frame_raw->as<ob::GyroFrame>();
+                        latest_imu_sample.has_gyro = true;
+                        latest_imu_sample.gyro_frame_index = gyro_frame->getIndex();
+                        latest_imu_sample.gyro_timestamp_us = gyro_frame->getTimeStampUs();
+                        latest_imu_sample.gyro_temperature = gyro_frame->getTemperature();
+                        latest_imu_sample.gyro_value = gyro_frame->getValue();
+                    }
+                    if(latest_imu_sample.has_accel || latest_imu_sample.has_gyro) {
+                        sample_to_publish = latest_imu_sample;
+                        has_sample = true;
+                    }
+                }
+                if(!has_sample) {
+                    return;
+                }
+                ++imu_callback_count;
+                if(imu_publisher && !imu_publisher->publish(sample_to_publish)) {
+                    if(imu_publisher->last_error_message().empty()) {
+                        ++imu_udp_drop_count;
+                    }
+                    else {
+                        ++imu_udp_error_count;
+                    }
+                }
+                if(options.imu_log_every > 0 && imu_callback_count % static_cast<uint64_t>(options.imu_log_every) == 0) {
+                    const double elapsed_s =
+                        std::chrono::duration<double>(std::chrono::steady_clock::now() - imu_log_started_at).count();
+                    const double rate_hz = elapsed_s > 0.0 ? static_cast<double>(imu_callback_count) / elapsed_s : 0.0;
+                    std::cout << "IMU callback rate ~= " << rate_hz << " Hz"
+                              << " callbacks=" << imu_callback_count
+                              << " udp_drops=" << imu_udp_drop_count
+                              << " udp_errors=" << imu_udp_error_count
+                              << "\n";
+                    imu_log_started_at = std::chrono::steady_clock::now();
+                    imu_callback_count = 0;
+                    imu_udp_drop_count = 0;
+                    imu_udp_error_count = 0;
+                    if(imu_publisher && !imu_publisher->last_error_message().empty()) {
+                        std::cerr << "Latest IMU UDP error: " << imu_publisher->last_error_message() << "\n";
                     }
                 }
             });
             imu_running = true;
         }
-        catch(const ob::Error &e) {
+        catch(const std::exception &e) {
             std::cerr << "IMU stream unavailable: " << e.what() << "\n";
         }
     }

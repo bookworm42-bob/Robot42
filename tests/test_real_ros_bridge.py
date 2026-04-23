@@ -38,13 +38,14 @@ class _Twist:
 
 class _FakeBrainClient:
     def __init__(self) -> None:
+        self.requested_paths: list[str] = []
         self.payloads = {
             "/rgb": b"P6\n1 1\n255\nabc",
             "/depth": b"P5\n1 1\n65535\n" + (1234).to_bytes(2, "big"),
-            "/imu": b'{"imu":{"angular_velocity_rad_s":{"x":0.1,"y":0.2,"z":0.3},"linear_acceleration_m_s2":{"x":1.0,"y":2.0,"z":3.0},"system_timestamp_us":1234567}}',
         }
 
     def get_bytes(self, path: str) -> bytes:
+        self.requested_paths.append(path)
         return self.payloads[path]
 
 
@@ -80,11 +81,22 @@ class RealRosBridgeTests(unittest.TestCase):
         self.assertEqual(config.odom_source, "commanded")
 
     def test_robot_brain_url_selects_remote_hardware_endpoint(self) -> None:
-        args = build_parser().parse_args(["--robot-brain-url", "http://robot-brain.local:8765"])
+        args = build_parser().parse_args(
+            [
+                "--robot-brain-url",
+                "http://robot-brain.local:8765",
+                "--imu-ws-path",
+                "/ws/imu",
+                "--imu-ws-reconnect-delay-s",
+                "0.5",
+            ]
+        )
         config = config_from_args(args)
 
         self.assertEqual(config.robot_brain_url, "http://robot-brain.local:8765")
         self.assertEqual(config.imu_topic, "/imu")
+        self.assertEqual(config.imu_ws_path, "/ws/imu")
+        self.assertEqual(config.imu_ws_reconnect_delay_s, 0.5)
 
     def test_runtime_error_formatter_includes_robot_brain_http_body(self) -> None:
         exc = HTTPError(
@@ -205,7 +217,8 @@ class RealRosBridgeTests(unittest.TestCase):
         self.assertIsNone(frame.depth_mm)
 
     def test_robot_brain_rgbd_source_reads_remote_pnm_payloads(self) -> None:
-        source = RobotBrainRgbdSource(_FakeBrainClient())
+        client = _FakeBrainClient()
+        source = RobotBrainRgbdSource(client)
 
         frame = source.capture()
 
@@ -213,7 +226,8 @@ class RealRosBridgeTests(unittest.TestCase):
         self.assertEqual(frame.rgb_width, 1)
         self.assertEqual(frame.depth_mm, ((1234,),))
         self.assertEqual(frame.depth_width, 1)
-        self.assertEqual(frame.imu_sample["angular_velocity_rad_s"]["z"], 0.3)
+        self.assertIsNone(frame.imu_sample)
+        self.assertEqual(client.requested_paths, ["/rgb", "/depth"])
 
 
 if __name__ == "__main__":

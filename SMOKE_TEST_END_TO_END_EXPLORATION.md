@@ -124,12 +124,13 @@ source /opt/ros/humble/setup.bash
 python -m xlerobot_playground.real_ros_bridge \
   --robot-brain-url http://ROBOT_BRAIN_IP:8765 \
   --publish-rate-hz 10 \
-  --imu-publish-rate-hz 200 \
   --camera-x-m 0.0 \
   --camera-y-m 0.0 \
   --camera-z-m 0.35 \
   --camera-yaw-rad 0.0
 ```
+
+In robot-brain mode the IMU path now comes from `ws://ROBOT_BRAIN_IP:8765/ws/imu`, not from the old `/imu` polling timer.
 
 In another offload terminal, do not continue until these work:
 

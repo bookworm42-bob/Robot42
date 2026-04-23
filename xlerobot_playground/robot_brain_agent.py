@@ -1,18 +1,29 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 from dataclasses import dataclass
 import json
 from pathlib import Path
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import threading
+import time
 from typing import Any
 
 from multido_xlerobot.bootstrap import resolve_xlerobot_repo_root
+from xlerobot_playground.imu_transport import parse_imu_json
 from xlerobot_playground.real_exploration_runtime import (
     RealXLeRobotDirectRuntime,
     RealXLeRobotRuntimeConfig,
 )
+
+try:
+    from aiohttp import WSMsgType, web
+except Exception as exc:  # pragma: no cover - runtime dependency guard.
+    WSMsgType = None
+    web = None
+    AIOHTTP_IMPORT_ERROR: Exception | None = exc
+else:
+    AIOHTTP_IMPORT_ERROR = None
 
 
 @dataclass(frozen=True)
@@ -33,16 +44,86 @@ class RobotBrainAgentConfig:
     rgb_filename: str = "latest.ppm"
     depth_filename: str = "latest_depth.pgm"
     metadata_filename: str = "latest.json"
-    imu_filename: str = "latest_imu.json"
+    imu_udp_host: str = "127.0.0.1"
+    imu_udp_port: int = 8766
+    imu_ws_client_queue_size: int = 64
+    imu_log_every: int = 200
+
+
+class ImuStreamState:
+    def __init__(self, *, queue_size: int, log_every: int) -> None:
+        self.queue_size = max(1, int(queue_size))
+        self.log_every = max(1, int(log_every))
+        self.latest_sample: dict[str, Any] | None = None
+        self.latest_json: str | None = None
+        self._clients: set[asyncio.Queue[str]] = set()
+        self._received_count = 0
+        self._sent_count = 0
+        self._queue_drop_count = 0
+        self._last_rx_log_at = time.monotonic()
+        self._last_rx_log_count = 0
+        self._last_tx_log_at = time.monotonic()
+        self._last_tx_log_count = 0
+
+    def publish(self, sample: dict[str, Any]) -> None:
+        payload = json.dumps(sample, separators=(",", ":"))
+        self.latest_sample = sample
+        self.latest_json = payload
+        self._received_count += 1
+        for queue in tuple(self._clients):
+            if queue.full():
+                try:
+                    queue.get_nowait()
+                    self._queue_drop_count += 1
+                except asyncio.QueueEmpty:
+                    pass
+            try:
+                queue.put_nowait(payload)
+            except asyncio.QueueFull:
+                self._queue_drop_count += 1
+        if self._received_count % self.log_every == 0:
+            now = time.monotonic()
+            dt = max(now - self._last_rx_log_at, 1e-6)
+            delta = self._received_count - self._last_rx_log_count
+            rate_hz = delta / dt
+            print(
+                "[robot_brain_agent] IMU rx "
+                f"rate~={rate_hz:.1f}Hz total={self._received_count} "
+                f"clients={len(self._clients)} queue_drops={self._queue_drop_count}",
+                flush=True,
+            )
+            self._last_rx_log_at = now
+            self._last_rx_log_count = self._received_count
+
+    def note_sent(self) -> None:
+        self._sent_count += 1
+        if self._sent_count % self.log_every == 0:
+            now = time.monotonic()
+            dt = max(now - self._last_tx_log_at, 1e-6)
+            delta = self._sent_count - self._last_tx_log_count
+            rate_hz = delta / dt
+            print(
+                "[robot_brain_agent] IMU ws send "
+                f"rate~={rate_hz:.1f}Hz total={self._sent_count} "
+                f"clients={len(self._clients)} queue_drops={self._queue_drop_count}",
+                flush=True,
+            )
+            self._last_tx_log_at = now
+            self._last_tx_log_count = self._sent_count
+
+    def register_client(self) -> asyncio.Queue[str]:
+        queue: asyncio.Queue[str] = asyncio.Queue(maxsize=self.queue_size)
+        self._clients.add(queue)
+        if self.latest_json is not None:
+            queue.put_nowait(self.latest_json)
+        return queue
+
+    def unregister_client(self, queue: asyncio.Queue[str]) -> None:
+        self._clients.discard(queue)
 
 
 class RobotBrainAgent:
-    """Non-ROS hardware endpoint for the robot brain.
-
-    The robot brain owns serial ports and local Orbbec capture files. The ROS
-    offload computer can fetch RGB-D frames and forward velocity commands over
-    this small HTTP API.
-    """
+    """Non-ROS hardware endpoint for the robot brain."""
 
     def __init__(self, config: RobotBrainAgentConfig, *, runtime: RealXLeRobotDirectRuntime | None = None) -> None:
         self.config = config
@@ -60,6 +141,10 @@ class RobotBrainAgent:
         )
         self.runtime = runtime or RealXLeRobotDirectRuntime(runtime_config)
         self._motion_lock = threading.Lock()
+        self.imu_stream = ImuStreamState(
+            queue_size=config.imu_ws_client_queue_size,
+            log_every=config.imu_log_every,
+        )
 
     def velocity(self, *, linear_m_s: float, angular_rad_s: float) -> dict[str, Any]:
         if self.config.debug_motion:
@@ -91,6 +176,15 @@ class RobotBrainAgent:
             "metadata": result.metadata or {},
         }
 
+    def ingest_imu_datagram(self, data: bytes) -> None:
+        sample = parse_imu_json(data)
+        if sample is None:
+            return
+        self.imu_stream.publish(sample)
+
+    def imu_snapshot(self) -> dict[str, Any] | None:
+        return self.imu_stream.latest_sample
+
     def close(self) -> None:
         with self._motion_lock:
             try:
@@ -105,91 +199,160 @@ class RobotBrainAgent:
             return self.config.orbbec_output_dir / self.config.depth_filename
         if route == "/metadata":
             return self.config.orbbec_output_dir / self.config.metadata_filename
-        if route == "/imu":
-            return self.config.orbbec_output_dir / self.config.imu_filename
         return None
 
 
-def make_handler(agent: RobotBrainAgent) -> type[BaseHTTPRequestHandler]:
-    class Handler(BaseHTTPRequestHandler):
-        server_version = "RobotBrainAgent/0.1"
+class _ImuUdpProtocol(asyncio.DatagramProtocol):
+    def __init__(self, agent: RobotBrainAgent) -> None:
+        self.agent = agent
 
-        def do_GET(self) -> None:
-            self._serve_get_or_head(include_body=True)
+    def datagram_received(self, data: bytes, addr: tuple[str, int] | tuple[str, int, int, int]) -> None:
+        try:
+            self.agent.ingest_imu_datagram(data)
+        except Exception as exc:
+            print(f"[robot_brain_agent] Failed to decode IMU datagram from {addr}: {exc}", flush=True)
 
-        def do_HEAD(self) -> None:
-            self._serve_get_or_head(include_body=False)
+    def error_received(self, exc: Exception) -> None:
+        print(f"[robot_brain_agent] IMU UDP socket error: {exc}", flush=True)
 
-        def _serve_get_or_head(self, *, include_body: bool) -> None:
-            if self.path == "/health":
-                self._send_json(
-                    {
-                        "ok": True,
-                        "robot_kind": agent.config.robot_kind,
-                        "motion_enabled": agent.config.allow_motion_commands,
-                    },
-                    include_body=include_body,
-                )
-                return
-            path = agent.file_path(self.path)
-            if path is None:
-                self.send_error(404, "Unknown route")
-                return
-            path = path.expanduser().resolve()
-            if not path.exists():
-                self.send_error(404, f"File not ready: {path.name}")
-                return
-            content_type = {
-                "/rgb": "image/x-portable-pixmap",
-                "/depth": "image/x-portable-graymap",
-                "/metadata": "application/json",
-                "/imu": "application/json",
-            }.get(self.path, "application/octet-stream")
-            data = path.read_bytes()
-            self.send_response(200)
-            self.send_header("Content-Type", content_type)
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            if include_body:
-                self.wfile.write(data)
 
-        def do_POST(self) -> None:
-            try:
-                payload = self._read_json()
-                if self.path == "/cmd_vel":
-                    response = agent.velocity(
-                        linear_m_s=float(payload.get("linear_m_s", 0.0)),
-                        angular_rad_s=float(payload.get("angular_rad_s", 0.0)),
-                    )
-                    self._send_json(response)
-                    return
-                if self.path == "/stop":
-                    self._send_json(agent.stop())
-                    return
-                self.send_error(404, "Unknown route")
-            except Exception as exc:
-                self.send_error(500, str(exc))
+def require_aiohttp() -> None:
+    if AIOHTTP_IMPORT_ERROR is not None:
+        raise RuntimeError(
+            "robot_brain_agent requires `aiohttp` for the shared HTTP + websocket server. "
+            "Install it with `python -m pip install aiohttp`."
+        ) from AIOHTTP_IMPORT_ERROR
 
-        def log_message(self, format: str, *args: Any) -> None:
-            print(f"{self.address_string()} - {format % args}")
 
-        def _read_json(self) -> dict[str, Any]:
-            length = int(self.headers.get("Content-Length", "0"))
-            if length <= 0:
-                return {}
-            raw = self.rfile.read(length)
-            return json.loads(raw.decode("utf-8"))
+async def _read_route_bytes(agent: RobotBrainAgent, route: str) -> bytes:
+    path = agent.file_path(route)
+    if path is None:
+        raise web.HTTPNotFound(text="Unknown route")
+    resolved = path.expanduser().resolve()
+    if not resolved.exists():
+        raise web.HTTPNotFound(text=f"File not ready: {resolved.name}")
+    return await asyncio.to_thread(resolved.read_bytes)
 
-        def _send_json(self, payload: dict[str, Any], *, include_body: bool = True) -> None:
-            data = json.dumps(payload).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            if include_body:
-                self.wfile.write(data)
 
-    return Handler
+async def _handle_health(_request: web.Request) -> web.Response:
+    agent: RobotBrainAgent = _request.app["agent"]
+    return web.json_response(
+        {
+            "ok": True,
+            "robot_kind": agent.config.robot_kind,
+            "motion_enabled": agent.config.allow_motion_commands,
+            "imu_udp_port": agent.config.imu_udp_port,
+            "imu_ws_path": "/ws/imu",
+        }
+    )
+
+
+async def _handle_static_file(request: web.Request) -> web.Response:
+    agent: RobotBrainAgent = request.app["agent"]
+    data = await _read_route_bytes(agent, request.path)
+    content_type = {
+        "/rgb": "image/x-portable-pixmap",
+        "/depth": "image/x-portable-graymap",
+        "/metadata": "application/json",
+    }.get(request.path, "application/octet-stream")
+    return web.Response(body=data, content_type=content_type)
+
+
+async def _handle_imu_snapshot(request: web.Request) -> web.Response:
+    agent: RobotBrainAgent = request.app["agent"]
+    if agent.imu_stream.latest_json is None:
+        raise web.HTTPNotFound(text="IMU sample not ready")
+    return web.Response(body=agent.imu_stream.latest_json.encode("utf-8"), content_type="application/json")
+
+
+async def _handle_cmd_vel(request: web.Request) -> web.Response:
+    agent: RobotBrainAgent = request.app["agent"]
+    raw = await request.read() if request.can_read_body else b""
+    payload = json.loads(raw.decode("utf-8")) if raw else {}
+    response = await asyncio.to_thread(
+        agent.velocity,
+        linear_m_s=float(payload.get("linear_m_s", 0.0)),
+        angular_rad_s=float(payload.get("angular_rad_s", 0.0)),
+    )
+    return web.json_response(response)
+
+
+async def _handle_stop(request: web.Request) -> web.Response:
+    agent: RobotBrainAgent = request.app["agent"]
+    if request.can_read_body:
+        try:
+            await request.read()
+        except Exception:
+            pass
+    response = await asyncio.to_thread(agent.stop)
+    return web.json_response(response)
+
+
+async def _imu_sender(agent: RobotBrainAgent, ws: web.WebSocketResponse, queue: asyncio.Queue[str]) -> None:
+    while True:
+        payload = await queue.get()
+        await ws.send_str(payload)
+        agent.imu_stream.note_sent()
+
+
+async def _handle_imu_websocket(request: web.Request) -> web.WebSocketResponse:
+    agent: RobotBrainAgent = request.app["agent"]
+    ws = web.WebSocketResponse(heartbeat=20.0)
+    await ws.prepare(request)
+    queue = agent.imu_stream.register_client()
+    print(f"[robot_brain_agent] IMU websocket connected clients={len(agent.imu_stream._clients)}", flush=True)
+    sender = asyncio.create_task(_imu_sender(agent, ws, queue))
+    try:
+        async for message in ws:
+            if message.type == WSMsgType.ERROR:
+                raise ws.exception() or RuntimeError("websocket error")
+            if message.type in (WSMsgType.CLOSE, WSMsgType.CLOSED):
+                break
+    finally:
+        sender.cancel()
+        try:
+            await sender
+        except asyncio.CancelledError:
+            pass
+        agent.imu_stream.unregister_client(queue)
+        print(f"[robot_brain_agent] IMU websocket disconnected clients={len(agent.imu_stream._clients)}", flush=True)
+    return ws
+
+
+async def _runtime_context(app: web.Application) -> Any:
+    agent: RobotBrainAgent = app["agent"]
+    loop = asyncio.get_running_loop()
+    transport, _protocol = await loop.create_datagram_endpoint(
+        lambda: _ImuUdpProtocol(agent),
+        local_addr=(agent.config.imu_udp_host, agent.config.imu_udp_port),
+    )
+    app["imu_udp_transport"] = transport
+    print(
+        "[robot_brain_agent] IMU UDP listener ready: "
+        f"{agent.config.imu_udp_host}:{agent.config.imu_udp_port}",
+        flush=True,
+    )
+    try:
+        yield
+    finally:
+        transport.close()
+        await asyncio.to_thread(agent.close)
+
+
+def build_app(agent: RobotBrainAgent) -> web.Application:
+    require_aiohttp()
+    app = web.Application()
+    app["agent"] = agent
+    app.cleanup_ctx.append(_runtime_context)
+    app.router.add_get("/health", _handle_health)
+    app.router.add_get("/rgb", _handle_static_file)
+    app.router.add_get("/depth", _handle_static_file)
+    app.router.add_get("/metadata", _handle_static_file)
+    app.router.add_get("/imu", _handle_imu_snapshot)
+    app.router.add_get("/ws/imu", _handle_imu_websocket)
+    app.router.add_post("/cmd_vel", _handle_cmd_vel)
+    app.router.add_post("/stop", _handle_stop)
+    return app
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -222,11 +385,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rgb-filename", default="latest.ppm")
     parser.add_argument("--depth-filename", default="latest_depth.pgm")
     parser.add_argument("--metadata-filename", default="latest.json")
-    parser.add_argument(
-        "--imu-filename",
-        default="latest_imu.json",
-        help="JSON file that carries the latest Orbbec IMU sample. Default uses the dedicated high-rate latest_imu.json stream.",
-    )
+    parser.add_argument("--imu-udp-host", default="127.0.0.1")
+    parser.add_argument("--imu-udp-port", type=int, default=8766)
+    parser.add_argument("--imu-ws-client-queue-size", type=int, default=64)
+    parser.add_argument("--imu-log-every", type=int, default=200)
     return parser
 
 
@@ -248,27 +410,26 @@ def config_from_args(args: argparse.Namespace) -> RobotBrainAgentConfig:
         rgb_filename=args.rgb_filename,
         depth_filename=args.depth_filename,
         metadata_filename=args.metadata_filename,
-        imu_filename=args.imu_filename,
+        imu_udp_host=args.imu_udp_host,
+        imu_udp_port=args.imu_udp_port,
+        imu_ws_client_queue_size=args.imu_ws_client_queue_size,
+        imu_log_every=args.imu_log_every,
     )
 
 
 def main(argv: list[str] | None = None) -> int:
+    require_aiohttp()
     args = build_parser().parse_args(argv)
     config = config_from_args(args)
     agent = RobotBrainAgent(config)
-    server = ThreadingHTTPServer((config.host, config.port), make_handler(agent))
     print(
         "Robot brain agent ready: "
         f"http://{config.host}:{config.port} robot={config.robot_kind} "
-        f"motion_enabled={config.allow_motion_commands} orbbec={config.orbbec_output_dir}"
+        f"motion_enabled={config.allow_motion_commands} orbbec={config.orbbec_output_dir} "
+        f"imu_udp={config.imu_udp_host}:{config.imu_udp_port} imu_ws=/ws/imu",
+        flush=True,
     )
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        server.server_close()
-        agent.close()
+    web.run_app(build_app(agent), host=config.host, port=config.port, access_log=None)
     return 0
 
 

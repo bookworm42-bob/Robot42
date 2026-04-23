@@ -62,6 +62,8 @@ sudo ./build/orbbec_rgb_test/orbbec_rgb_test \
   --latest-only \
   --enable-depth \
   --enable-imu \
+  --imu-udp-host 127.0.0.1 \
+  --imu-udp-port 8766 \
   --output-dir artifacts/orbbec_rgbd
 ```
 
@@ -76,6 +78,8 @@ sudo ./build/orbbec_rgb_test/orbbec_rgb_test \
   --depth-width 640 \
   --depth-height 576 \
   --depth-fps 30 \
+  --imu-udp-host 127.0.0.1 \
+  --imu-udp-port 8766 \
   --output-dir artifacts/orbbec_rgbd
 ```
 
@@ -86,6 +90,7 @@ Use the Python environment that has LeRobot/XLeRobot installed.
 ```bash
 cd /Users/alin/Robot42
 conda activate xlerobot
+python -m pip install aiohttp
 
 python -m xlerobot_playground.robot_brain_agent \
   --allow-motion-commands \
@@ -105,9 +110,21 @@ curl http://127.0.0.1:8765/health
 curl http://127.0.0.1:8765/rgb --output /tmp/brain_rgb.ppm
 curl http://127.0.0.1:8765/depth --output /tmp/brain_depth.pgm
 curl http://127.0.0.1:8765/imu
+python - <<'PY'
+import asyncio
+from aiohttp import ClientSession
+
+async def main():
+    async with ClientSession() as session:
+        async with session.ws_connect("ws://127.0.0.1:8765/ws/imu") as ws:
+            first = await ws.receive()
+            print(first.data)
+
+asyncio.run(main())
+PY
 ```
 
-`/imu` is served directly from the Orbbec IMU JSON output. With `--enable-imu`, the sidecar writes a dedicated high-rate `latest_imu.json` that carries both gyroscope and accelerometer samples.
+`/imu` is now an in-memory debug snapshot. The high-rate IMU path is `Orbbec callback -> UDP datagram -> robot_brain_agent memory -> /ws/imu websocket`. `latest_imu.json` is no longer used in the high-rate path.
 
 ## Offload Computer
 
@@ -119,11 +136,11 @@ Run these on the ROS/Nav2 offload computer. Keep terminals OC-1, OC-2, OC-4, and
 cd /home/alin/Robot42
 source /opt/ros/humble/setup.bash
 source /home/alin/Robot42/.venv-maniskill/bin/activate
+python -m pip install aiohttp
 
 python -m xlerobot_playground.real_ros_bridge \
   --robot-brain-url http://192.168.1.133:8765 \
   --publish-rate-hz 10 \
-  --imu-publish-rate-hz 200 \
   --cmd-vel-timeout-s 0.5 \
   --max-linear-m-s 0.03 \
   --max-angular-rad-s 0.30 \
@@ -136,7 +153,7 @@ python -m xlerobot_playground.real_ros_bridge \
 
 This publishes camera images, depth-derived `/scan`, `/imu`, camera transforms, and forwards ROS `/cmd_vel` to the robot brain.
 
-`/imu` is a raw `sensor_msgs/Imu` stream carrying both angular velocity and linear acceleration. It is republished independently of RGB/depth at `--imu-publish-rate-hz`, so use `/imu` for accelerometer experiments and `/imu/filtered_yaw` only for yaw-oriented tests.
+`/imu` is a raw `sensor_msgs/Imu` stream carrying both angular velocity and linear acceleration. In robot-brain mode it is now pushed over a persistent websocket, so `/imu` is no longer capped by the old poll timer.
 
 Quick checks:
 
@@ -147,6 +164,20 @@ ros2 topic echo /imu --once
 ros2 topic hz /imu
 curl http://ROBOT_BRAIN_IP:8765/health
 ```
+
+Migration note:
+
+- Remove any process that depends on `latest_imu.json`. The sidecar no longer writes it.
+- Keep `/cmd_vel` and `/stop` on HTTP. IMU now comes from `ws://ROBOT_BRAIN_IP:8765/ws/imu`.
+- If the brain and sidecar run on different hosts, change both `--imu-udp-host` and `--imu-udp-port` together.
+
+Verification plan:
+
+- On the robot brain, watch `orbbec_rgb_test` for `IMU callback rate ~= ... Hz`.
+- On the robot brain, watch `robot_brain_agent` for `IMU rx rate~=...Hz` and `IMU ws send rate~=...Hz`.
+- On the offload computer, watch `real_ros_bridge` for `IMU websocket connected` and `IMU stream rx~=...Hz publish~=...Hz`.
+- Run `ros2 topic hz /imu` and confirm the rate is no longer limited to the old tens-of-Hz poll ceiling.
+- If the callback rate is still low, audit the current Orbbec aggregate mode `OB_FRAME_AGGREGATE_OUTPUT_ALL_TYPE_FRAME_REQUIRE` first. The transport bottleneck is removed, but that SDK aggregation setting can still quantize the upstream callback cadence.
 
 ### Terminal OC-2: IMU Yaw Filter
 
