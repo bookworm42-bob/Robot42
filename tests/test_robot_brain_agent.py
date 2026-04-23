@@ -49,6 +49,7 @@ class RobotBrainAgentTests(unittest.TestCase):
         self.assertEqual(config.port, 8765)
         self.assertFalse(config.debug_motion)
         self.assertEqual(config.calibration_prompt_response, "")
+        self.assertEqual(config.imu_filename, "latest_imu.json")
 
     def test_parser_accepts_debug_motion(self) -> None:
         args = build_parser().parse_args(["--debug-motion"])
@@ -82,7 +83,7 @@ class RobotBrainAgentTests(unittest.TestCase):
             self.assertEqual(agent.file_path("/rgb"), Path(tmpdir) / "latest.ppm")
             self.assertEqual(agent.file_path("/depth"), Path(tmpdir) / "latest_depth.pgm")
             self.assertEqual(agent.file_path("/metadata"), Path(tmpdir) / "latest.json")
-            self.assertEqual(agent.file_path("/imu"), Path(tmpdir) / "latest.json")
+            self.assertEqual(agent.file_path("/imu"), Path(tmpdir) / "latest_imu.json")
             self.assertIsNone(agent.file_path("/missing"))
 
 

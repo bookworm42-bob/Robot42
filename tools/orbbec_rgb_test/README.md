@@ -25,6 +25,6 @@ For the real exploration ROS bridge, run the sidecar with depth enabled and poin
 ./build/orbbec_rgb_test/orbbec_rgb_test --frames 0 --latest-only --enable-depth --enable-imu --output-dir artifacts/orbbec_rgbd
 ```
 
-This writes `latest.ppm`, `latest_depth.pgm`, and `latest.json`. When `--enable-imu` is set, `latest.json` also includes the latest accelerometer and gyroscope sample under the `imu` key.
+This writes `latest.ppm`, `latest_depth.pgm`, `latest.json`, and, with `--enable-imu`, a dedicated high-rate `latest_imu.json`. `latest.json` carries the latest IMU sample under the `imu` key for frame-aligned metadata, while `latest_imu.json` is updated directly from the IMU callback and is the better source for high-rate accelerometer and gyroscope reads.
 
 Depth defaults to the camera's first matching Y16 profile. If you need to force a specific depth mode, pass `--depth-width`, `--depth-height`, and `--depth-fps`.

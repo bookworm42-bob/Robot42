@@ -287,6 +287,7 @@ class RosExplorationRuntime(Node):
         self.latest_imu_msg: Imu | None = None
         self._latest_imu_orientation_yaw_rad: float | None = None
         self._latest_imu_orientation_unwrapped_yaw_rad: float | None = None
+        self._scan_sensor_yaw_offset_rad: float | None = None
         self.scan_observations: list[dict[str, Any]] = []
         self.latest_image_msg: Image | None = None
         self.latest_image_data_url: str | None = None
@@ -341,6 +342,7 @@ class RosExplorationRuntime(Node):
         reference_frame = self.config.odom_frame if self.config.publish_internal_navigation_map else self.config.map_frame
         sensor_pose = self.lookup_pose(reference_frame, message.header.frame_id)
         if sensor_pose is not None:
+            sensor_pose = self._scan_pose_with_turn_feedback(sensor_pose)
             self.scan_observations.append(
                 {
                     "frame_id": str(message.header.frame_id),
@@ -391,6 +393,20 @@ class RosExplorationRuntime(Node):
         if pose is not None:
             return self.config.odom_frame, float(pose.yaw)
         return None, None
+
+    def _scan_pose_with_turn_feedback(self, sensor_pose: Pose2D) -> Pose2D:
+        if not self.config.publish_internal_navigation_map:
+            return sensor_pose
+        _feedback_frame, feedback_yaw = self._current_turn_feedback()
+        if feedback_yaw is None:
+            return sensor_pose
+        if self._scan_sensor_yaw_offset_rad is None:
+            self._scan_sensor_yaw_offset_rad = sensor_pose.yaw - feedback_yaw
+        return Pose2D(
+            float(sensor_pose.x),
+            float(sensor_pose.y),
+            float(feedback_yaw + self._scan_sensor_yaw_offset_rad),
+        )
 
     def spin_until_ready(self, *, timeout_s: float | None = None) -> None:
         deadline = time.time() + (timeout_s if timeout_s is not None else self.config.ready_timeout_s)

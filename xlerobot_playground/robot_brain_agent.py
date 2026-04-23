@@ -224,8 +224,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--metadata-filename", default="latest.json")
     parser.add_argument(
         "--imu-filename",
-        default="latest.json",
-        help="JSON file that carries the latest Orbbec IMU sample. Default reuses latest.json metadata.",
+        default="latest_imu.json",
+        help="JSON file that carries the latest Orbbec IMU sample. Default uses the dedicated high-rate latest_imu.json stream.",
     )
     return parser
 

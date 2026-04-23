@@ -107,6 +107,8 @@ curl http://127.0.0.1:8765/depth --output /tmp/brain_depth.pgm
 curl http://127.0.0.1:8765/imu
 ```
 
+`/imu` is served directly from the Orbbec IMU JSON output. With `--enable-imu`, the sidecar writes a dedicated high-rate `latest_imu.json` that carries both gyroscope and accelerometer samples.
+
 ## Offload Computer
 
 Run these on the ROS/Nav2 offload computer. Keep terminals OC-1, OC-2, OC-4, and OC-5 running. OC-3 only needs to be run when generating/updating the Nav2 params.
@@ -134,12 +136,15 @@ python -m xlerobot_playground.real_ros_bridge \
 
 This publishes camera images, depth-derived `/scan`, `/imu`, camera transforms, and forwards ROS `/cmd_vel` to the robot brain.
 
+`/imu` is a raw `sensor_msgs/Imu` stream carrying both angular velocity and linear acceleration. It is republished independently of RGB/depth at `--imu-publish-rate-hz`, so use `/imu` for accelerometer experiments and `/imu/filtered_yaw` only for yaw-oriented tests.
+
 Quick checks:
 
 ```bash
 ros2 topic echo /camera/head/camera_info --once
 ros2 topic echo /scan --once
 ros2 topic echo /imu --once
+ros2 topic hz /imu
 curl http://ROBOT_BRAIN_IP:8765/health
 ```
 
