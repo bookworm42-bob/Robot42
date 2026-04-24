@@ -4,10 +4,12 @@ import unittest
 
 from xlerobot_playground.ros_forward_accel_diagnostic import (
     build_parser,
+    format_progress_log_line,
     forward_displacement_m,
     gravity_components_from_tilt,
     integrate_acceleration_step,
     summarize,
+    target_signed_progress_m,
     tilt_correction_alpha_for_motion,
     tilt_from_acceleration,
     update_tilt_estimate,
@@ -56,6 +58,63 @@ class RosForwardAccelDiagnosticTests(unittest.TestCase):
 
         self.assertAlmostEqual(forward_m, 0.45)
         self.assertAlmostEqual(lateral_m, 0.05)
+
+    def test_target_signed_progress_uses_selected_source(self) -> None:
+        sample = {
+            "tf_forward_distance_m": 0.42,
+            "odom_forward_distance_m": 0.41,
+        }
+
+        self.assertAlmostEqual(
+            target_signed_progress_m(
+                sample=sample,
+                target_source="tf",
+                accelerometer_distance_m=-8.0,
+                target_direction_sign=1.0,
+            ),
+            0.42,
+        )
+        self.assertAlmostEqual(
+            target_signed_progress_m(
+                sample=sample,
+                target_source="accelerometer",
+                accelerometer_distance_m=-8.0,
+                target_direction_sign=1.0,
+            ),
+            -8.0,
+        )
+        self.assertIsNone(
+            target_signed_progress_m(
+                sample={},
+                target_source="odom",
+                accelerometer_distance_m=0.2,
+                target_direction_sign=1.0,
+            )
+        )
+
+    def test_format_progress_log_line_reports_distance_sources(self) -> None:
+        line = format_progress_log_line(
+            {
+                "t_s": 2.0,
+                "target_signed_progress_m": 0.12,
+                "target_remaining_distance_m": 0.33,
+                "tf_forward_distance_m": 0.12,
+                "odom_forward_distance_m": 0.11,
+                "imu_estimated_forward_distance_m": -0.5,
+                "imu_estimated_forward_velocity_m_s": -0.2,
+                "cmd_linear_m_s": 0.03,
+                "imu_wall_age_s": 0.01,
+            },
+            target_source="tf",
+            target_distance_m=0.45,
+        )
+
+        self.assertIn("target(tf)=0.120m/0.450m", line)
+        self.assertIn("remaining=0.330m", line)
+        self.assertIn("tf=0.120m", line)
+        self.assertIn("odom=0.110m", line)
+        self.assertIn("raw_accel=-0.500m", line)
+        self.assertIn("cmd=0.030m/s", line)
 
     def test_tilt_from_acceleration_detects_level_pose(self) -> None:
         roll_rad, pitch_rad = tilt_from_acceleration(
@@ -112,6 +171,16 @@ class RosForwardAccelDiagnosticTests(unittest.TestCase):
             0.02,
         )
 
+    def test_tilt_correction_alpha_for_motion_uses_moving_alpha_while_commanded(self) -> None:
+        self.assertEqual(
+            tilt_correction_alpha_for_motion(
+                stationary_alpha=0.02,
+                commanded_linear_m_s=0.03,
+                moving_alpha=0.002,
+            ),
+            0.002,
+        )
+
     def test_summary_reports_accel_and_pose_distance(self) -> None:
         summary = summarize(
             [
@@ -150,6 +219,7 @@ class RosForwardAccelDiagnosticTests(unittest.TestCase):
                     "tf_lateral_distance_m": 0.01,
                     "odom_forward_distance_m": 0.42,
                     "odom_lateral_distance_m": 0.02,
+                    "target_source": "tf",
                     "stop_reason": "target_accel_distance_reached",
                 },
             ]
@@ -163,6 +233,7 @@ class RosForwardAccelDiagnosticTests(unittest.TestCase):
         self.assertAlmostEqual(summary["accelerometer"]["observed_imu_rate_hz"], 0.333)
         self.assertAlmostEqual(summary["tf"]["forward_distance_m"], 0.43)
         self.assertAlmostEqual(summary["odom_topic"]["forward_distance_m"], 0.42)
+        self.assertEqual(summary["target_source"], "tf")
         self.assertTrue(summary["accelerometer_bias_applied"])
         self.assertTrue(summary["tilt_compensation_applied"])
         self.assertAlmostEqual(summary["accelerometer_bias"]["gyro_roll_rad_s"], 0.001)
@@ -216,6 +287,16 @@ class RosForwardAccelDiagnosticTests(unittest.TestCase):
         args = build_parser().parse_args(["--max-imu-staleness-s", "0.25"])
 
         self.assertEqual(args.max_imu_staleness_s, 0.25)
+
+    def test_parser_defaults_target_stop_to_tf(self) -> None:
+        args = build_parser().parse_args([])
+
+        self.assertEqual(args.target_source, "tf")
+
+    def test_parser_exposes_progress_log_period(self) -> None:
+        args = build_parser().parse_args(["--progress-log-period-s", "0.25"])
+
+        self.assertEqual(args.progress_log_period_s, 0.25)
 
 
 if __name__ == "__main__":

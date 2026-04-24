@@ -14,6 +14,7 @@ from xlerobot_playground.real_ros_bridge import (
     build_parser,
     config_from_args,
     _format_runtime_error,
+    imu_ros_timestamp_s,
     parse_imu_json,
     parse_depth_pgm_mm,
     parse_rgb_ppm,
@@ -202,6 +203,25 @@ class RealRosBridgeTests(unittest.TestCase):
         self.assertEqual(sample["angular_velocity_rad_s"]["z"], 0.3)
         self.assertEqual(sample["linear_acceleration_m_s2"]["x"], 1.0)
         self.assertAlmostEqual(sample["timestamp_s"], 1.234567)
+
+    def test_imu_ros_timestamp_prefers_accel_frame_time(self) -> None:
+        sample = parse_imu_json(
+            b'{"timestamp_s":2.0,"has_accel":true,"has_gyro":true,'
+            b'"accel_timestamp_us":1500000,"gyro_timestamp_us":2000000,'
+            b'"angular_velocity_rad_s":{"x":0.1,"y":0.2,"z":0.3},'
+            b'"linear_acceleration_m_s2":{"x":1.0,"y":2.0,"z":3.0}}'
+        )
+
+        self.assertAlmostEqual(imu_ros_timestamp_s(sample), 1.5)
+
+    def test_imu_ros_timestamp_keeps_gyro_time_for_gyro_only_samples(self) -> None:
+        sample = parse_imu_json(
+            b'{"timestamp_s":2.0,"has_accel":false,"has_gyro":true,'
+            b'"gyro_timestamp_us":2000000,'
+            b'"angular_velocity_rad_s":{"x":0.1,"y":0.2,"z":0.3}}'
+        )
+
+        self.assertAlmostEqual(imu_ros_timestamp_s(sample), 2.0)
 
     def test_filesystem_source_can_return_rgb_without_depth(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

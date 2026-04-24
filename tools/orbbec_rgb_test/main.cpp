@@ -61,8 +61,10 @@ std::string imu_sample_to_json(const LatestImuSample &imu_sample) {
     std::ostringstream out;
     out << std::fixed << std::setprecision(9);
     const uint64_t latest_imu_timestamp_us = std::max(imu_sample.accel_timestamp_us, imu_sample.gyro_timestamp_us);
+    const uint64_t sample_timestamp_us =
+        imu_sample.has_accel ? imu_sample.accel_timestamp_us : imu_sample.gyro_timestamp_us;
     out << "{"
-        << "\"timestamp_s\":" << (static_cast<double>(latest_imu_timestamp_us) / 1'000'000.0)
+        << "\"timestamp_s\":" << (static_cast<double>(sample_timestamp_us) / 1'000'000.0)
         << ",\"system_timestamp_us\":" << latest_imu_timestamp_us
         << ",\"has_accel\":" << (imu_sample.has_accel ? "true" : "false")
         << ",\"has_gyro\":" << (imu_sample.has_gyro ? "true" : "false");

@@ -175,6 +175,60 @@ def forward_displacement_m(
     return forward_m, lateral_m
 
 
+def target_signed_progress_m(
+    *,
+    sample: dict[str, Any],
+    target_source: str,
+    accelerometer_distance_m: float,
+    target_direction_sign: float,
+) -> float | None:
+    normalized_source = str(target_source).strip().lower()
+    if normalized_source == "accelerometer":
+        return float(accelerometer_distance_m) * float(target_direction_sign)
+    distance_key = f"{normalized_source}_forward_distance_m"
+    if distance_key not in sample:
+        return None
+    return float(sample[distance_key]) * float(target_direction_sign)
+
+
+def _format_progress_value(value: Any, *, suffix: str = "", precision: int = 3) -> str:
+    if value is None:
+        return "n/a"
+    try:
+        return f"{float(value):.{precision}f}{suffix}"
+    except (TypeError, ValueError):
+        return "n/a"
+
+
+def format_progress_log_line(
+    sample: dict[str, Any],
+    *,
+    target_source: str,
+    target_distance_m: float | None,
+) -> str:
+    normalized_target_source = str(target_source).strip().lower()
+    target_progress = sample.get("target_signed_progress_m")
+    if target_progress is None:
+        target_progress = sample.get(f"{normalized_target_source}_forward_distance_m")
+    target_label = f"target({normalized_target_source})={_format_progress_value(target_progress, suffix='m')}"
+    if target_distance_m is not None:
+        target_label += f"/{abs(float(target_distance_m)):.3f}m"
+    if "target_remaining_distance_m" in sample:
+        target_label += f" remaining={_format_progress_value(sample.get('target_remaining_distance_m'), suffix='m')}"
+    elif "target_unavailable_reason" in sample:
+        target_label += f" unavailable={sample['target_unavailable_reason']}"
+    return (
+        f"[forward_accel_diag] progress t={_format_progress_value(sample.get('t_s'), suffix='s', precision=2)} "
+        f"{target_label} "
+        f"tf={_format_progress_value(sample.get('tf_forward_distance_m'), suffix='m')} "
+        f"odom={_format_progress_value(sample.get('odom_forward_distance_m'), suffix='m')} "
+        f"raw_accel={_format_progress_value(sample.get('imu_estimated_forward_distance_m'), suffix='m')} "
+        f"accel_vel={_format_progress_value(sample.get('imu_estimated_forward_velocity_m_s'), suffix='m/s')} "
+        f"cmd={_format_progress_value(sample.get('cmd_linear_m_s'), suffix='m/s')} "
+        f"imu_age={_format_progress_value(sample.get('imu_wall_age_s'), suffix='s')}"
+    )
+
+
 class ForwardAccelDiagnosticNode(Node):
     def __init__(
         self,
@@ -302,7 +356,13 @@ class ForwardAccelDiagnosticNode(Node):
             gyro_norm_tolerance_rad_s=self.gyro_stationary_tolerance_rad_s,
         )
         tilt_alpha = (
-            self.tilt_accel_correction_alpha if is_stationary else self.tilt_accel_correction_alpha_when_moving
+            tilt_correction_alpha_for_motion(
+                stationary_alpha=self.tilt_accel_correction_alpha,
+                commanded_linear_m_s=self._commanded_linear_m_s,
+                moving_alpha=self.tilt_accel_correction_alpha_when_moving,
+            )
+            if is_stationary
+            else self.tilt_accel_correction_alpha_when_moving
         )
         self._estimated_roll_rad, self._estimated_pitch_rad = update_tilt_estimate(
             previous_roll_rad=self._estimated_roll_rad,
@@ -586,6 +646,8 @@ class ForwardAccelDiagnosticNode(Node):
         linear_m_s: float,
         send_motion: bool,
         target_distance_m: float | None = None,
+        target_source: str = "tf",
+        progress_log_period_s: float = 1.0,
     ) -> list[dict[str, Any]]:
         samples: list[dict[str, Any]] = []
         accel_bias = self.calibrate_accel_bias()
@@ -595,16 +657,27 @@ class ForwardAccelDiagnosticNode(Node):
             print("[forward_accel_diag] Running with accel bias correction enabled.", flush=True)
         self._reset_run_state(accel_bias=accel_bias)
         self._commanded_linear_m_s = float(linear_m_s) if send_motion else 0.0
+        target_abs_distance_m = abs(float(target_distance_m)) if target_distance_m is not None else None
+        normalized_target_source = str(target_source).strip().lower()
+        if normalized_target_source not in {"tf", "odom", "accelerometer"}:
+            raise ValueError(f"Unsupported target source: {target_source}")
         if not self.enable_zupt:
             print("[forward_accel_diag] Pure integration mode: ZUPT disabled.", flush=True)
         elif self.allow_zupt_while_commanded_motion:
             print("[forward_accel_diag] ZUPT enabled for all stationary samples.", flush=True)
         else:
             print("[forward_accel_diag] ZUPT enabled only when commanded motion is zero.", flush=True)
+        if target_abs_distance_m is not None:
+            print(
+                f"[forward_accel_diag] Target stop source: {normalized_target_source} "
+                f"target={target_abs_distance_m:.3f} m.",
+                flush=True,
+            )
         start = time.time()
         start_monotonic = time.monotonic()
         deadline = start + max(float(duration_s), 0.0)
-        target_abs_distance_m = abs(float(target_distance_m)) if target_distance_m is not None else None
+        progress_log_period_s = max(float(progress_log_period_s), 0.0)
+        next_progress_log_s = start if progress_log_period_s > 1e-9 else math.inf
         tf_start_pose: dict[str, float] | None = None
         odom_start_pose: dict[str, float] | None = None
         stop_reason = "duration_timeout"
@@ -713,18 +786,38 @@ class ForwardAccelDiagnosticNode(Node):
                 else:
                     command_linear_m_s = float(linear_m_s)
                     if target_abs_distance_m is not None:
-                        signed_progress_m = float(self._estimated_distance_m) * target_direction_sign
-                        remaining_m = max(target_abs_distance_m - max(signed_progress_m, 0.0), 0.0)
-                        sample["target_signed_progress_m"] = signed_progress_m
-                        sample["target_remaining_distance_m"] = remaining_m
-                        if signed_progress_m >= target_abs_distance_m:
-                            command_linear_m_s = 0.0
-                            target_reached = True
+                        sample["target_source"] = normalized_target_source
+                        signed_progress_m = target_signed_progress_m(
+                            sample=sample,
+                            target_source=normalized_target_source,
+                            accelerometer_distance_m=self._estimated_distance_m,
+                            target_direction_sign=target_direction_sign,
+                        )
+                        if signed_progress_m is None:
+                            sample["target_unavailable_reason"] = f"{normalized_target_source}_distance_unavailable"
+                        if signed_progress_m is not None:
+                            remaining_m = max(target_abs_distance_m - max(signed_progress_m, 0.0), 0.0)
+                            sample["target_signed_progress_m"] = signed_progress_m
+                            sample["target_remaining_distance_m"] = remaining_m
+                            if signed_progress_m >= target_abs_distance_m:
+                                command_linear_m_s = 0.0
+                                target_reached = True
                 self.publish_forward(command_linear_m_s)
             sample["cmd_linear_m_s"] = command_linear_m_s
+            if now >= next_progress_log_s:
+                print(
+                    format_progress_log_line(
+                        sample,
+                        target_source=normalized_target_source,
+                        target_distance_m=target_abs_distance_m,
+                    ),
+                    flush=True,
+                )
+                while next_progress_log_s <= now:
+                    next_progress_log_s += progress_log_period_s
             samples.append(sample)
             if target_abs_distance_m is not None and target_reached:
-                stop_reason = "target_accel_distance_reached"
+                stop_reason = f"target_{normalized_target_source}_distance_reached"
                 break
         self._run_active = False
         self.stop()
@@ -825,6 +918,9 @@ def summarize(samples: list[dict[str, Any]]) -> dict[str, Any]:
         "accelerometer_bias_applied": bool(samples and "accel_bias_forward_m_s2" in samples[0]),
         "tilt_compensation_applied": any("imu_gravity_forward_m_s2" in sample for sample in samples),
     }
+    target_sources = [str(sample["target_source"]) for sample in samples if "target_source" in sample]
+    if target_sources:
+        summary["target_source"] = target_sources[-1]
     if samples and "accel_bias_forward_m_s2" in samples[0]:
         summary["accelerometer_bias"] = {
             "forward_m_s2": round(float(samples[0]["accel_bias_forward_m_s2"]), 6),
@@ -863,7 +959,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--velocity-damping-per-s", type=float, default=0.0)
     parser.add_argument("--max-estimated-velocity-m-s", type=float, default=0.75)
     parser.add_argument("--tilt-accel-correction-alpha", type=float, default=0.02)
-    parser.add_argument("--tilt-accel-correction-alpha-when-moving", type=float, default=0.002)
+    parser.add_argument("--tilt-accel-correction-alpha-when-moving", type=float, default=0.0)
     parser.add_argument("--gravity-m-s2", type=float, default=9.80665)
     parser.add_argument("--accel-stationary-tolerance-m-s2", type=float, default=0.10)
     parser.add_argument("--gyro-stationary-tolerance-rad-s", type=float, default=0.05)
@@ -899,7 +995,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--target-distance-m",
         type=float,
         default=0.45,
-        help="Stop early when the accelerometer-only integrated forward distance reaches this absolute distance.",
+        help="Stop early when the selected target source reaches this absolute distance.",
+    )
+    parser.add_argument(
+        "--target-source",
+        choices=("tf", "odom", "accelerometer"),
+        default="tf",
+        help="Distance source used for target stopping. The accelerometer source is raw double integration and is diagnostic-only.",
+    )
+    parser.add_argument(
+        "--progress-log-period-s",
+        type=float,
+        default=1.0,
+        help="Print live distance progress at this interval. Use 0 to disable progress logging.",
     )
     parser.add_argument(
         "--send-motion",
@@ -943,6 +1051,8 @@ def main(argv: list[str] | None = None) -> int:
             linear_m_s=args.linear_m_s,
             send_motion=args.send_motion,
             target_distance_m=args.target_distance_m,
+            target_source=args.target_source,
+            progress_log_period_s=args.progress_log_period_s,
         )
         summary = summarize(samples)
         write_csv(Path(args.csv_out).expanduser(), samples)
@@ -952,7 +1062,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(summary, indent=2, sort_keys=True))
         accel_distance_m = summary.get("accelerometer", {}).get("reported_distance_m")
         if accel_distance_m is not None:
-            print(f"Reported accelerometer-only distance: {accel_distance_m} m")
+            print(f"Raw accelerometer-only distance: {accel_distance_m} m")
         print(f"Wrote samples: {Path(args.csv_out).expanduser()}")
         print(f"Wrote summary: {json_path}")
         return 0 if (

@@ -153,6 +153,22 @@ def yaw_to_quaternion_xyzw(yaw_rad: float) -> tuple[float, float, float, float]:
     return 0.0, 0.0, math.sin(half), math.cos(half)
 
 
+def imu_ros_timestamp_s(imu_sample: dict[str, Any]) -> float | None:
+    if imu_sample.get("has_accel", True) and "accel_timestamp_us" in imu_sample:
+        return float(imu_sample["accel_timestamp_us"]) / 1_000_000.0
+    if "timestamp_s" in imu_sample:
+        return float(imu_sample["timestamp_s"])
+    if "timestamp_us" in imu_sample:
+        return float(imu_sample["timestamp_us"]) / 1_000_000.0
+    if "system_timestamp_us" in imu_sample:
+        return float(imu_sample["system_timestamp_us"]) / 1_000_000.0
+    if "device_timestamp_us" in imu_sample:
+        return float(imu_sample["device_timestamp_us"]) / 1_000_000.0
+    if "gyro_timestamp_us" in imu_sample:
+        return float(imu_sample["gyro_timestamp_us"]) / 1_000_000.0
+    return None
+
+
 def twist_to_base_velocity(message: Any) -> tuple[float, float]:
     return float(message.linear.x), float(message.angular.z)
 
@@ -600,12 +616,16 @@ class RealXLeRobotRosBridge(Node):
                     await asyncio.sleep(max(self.config.imu_ws_reconnect_delay_s, 0.1))
 
     def _handle_streamed_imu_sample(self, imu_sample: dict[str, Any]) -> None:
-        timestamp_s = float(imu_sample.get("timestamp_s", time.time()))
+        timestamp_s = imu_ros_timestamp_s(imu_sample)
+        if timestamp_s is None:
+            timestamp_s = time.time()
         self._imu_received_count += 1
         if self._last_imu_timestamp_s is not None and timestamp_s == self._last_imu_timestamp_s:
             self._imu_duplicate_timestamps += 1
+            return
         if self._max_imu_timestamp_s is not None and timestamp_s < self._max_imu_timestamp_s:
             self._imu_stale_timestamps += 1
+            return
         self._last_imu_timestamp_s = timestamp_s
         self._max_imu_timestamp_s = timestamp_s if self._max_imu_timestamp_s is None else max(
             self._max_imu_timestamp_s,
@@ -657,7 +677,9 @@ class RealXLeRobotRosBridge(Node):
         imu_sample = self._capture_imu_sample()
         if imu_sample is None:
             return
-        timestamp_s = float(imu_sample.get("timestamp_s", time.time()))
+        timestamp_s = imu_ros_timestamp_s(imu_sample)
+        if timestamp_s is None:
+            timestamp_s = time.time()
         if self._last_imu_timestamp_s is not None and timestamp_s <= self._last_imu_timestamp_s:
             return
         self._last_imu_timestamp_s = timestamp_s
@@ -746,7 +768,7 @@ class RealXLeRobotRosBridge(Node):
 
     def _publish_imu_sample(self, *, imu_sample: dict[str, Any]) -> None:
         msg = Imu()
-        imu_timestamp_s = imu_sample.get("timestamp_s")
+        imu_timestamp_s = imu_ros_timestamp_s(imu_sample)
         if imu_timestamp_s is None:
             stamp = self.get_clock().now().to_msg()
             msg.header.stamp = stamp
