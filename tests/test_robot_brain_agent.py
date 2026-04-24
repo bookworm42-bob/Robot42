@@ -98,6 +98,11 @@ class RobotBrainAgentTests(unittest.TestCase):
         self.assertIsNotNone(snapshot)
         self.assertEqual(snapshot["angular_velocity_rad_s"]["z"], 0.3)
         self.assertEqual(snapshot["gyro_frame_index"], 7)
+        stats = agent.imu_stream.stats()
+        self.assertTrue(stats["ready"])
+        self.assertEqual(stats["received_count"], 1)
+        self.assertEqual(stats["latest_timestamp_s"], 1.25)
+        self.assertIsNotNone(stats["age_s"])
 
 
 if __name__ == "__main__":

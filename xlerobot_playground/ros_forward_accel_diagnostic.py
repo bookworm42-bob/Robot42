@@ -198,6 +198,7 @@ class ForwardAccelDiagnosticNode(Node):
         gyro_stationary_tolerance_rad_s: float,
         enable_zupt: bool,
         allow_zupt_while_commanded_motion: bool,
+        max_imu_staleness_s: float,
     ) -> None:
         super().__init__("xlerobot_forward_accel_diagnostic")
         self.odom_frame = odom_frame
@@ -218,6 +219,7 @@ class ForwardAccelDiagnosticNode(Node):
         self.gyro_stationary_tolerance_rad_s = max(float(gyro_stationary_tolerance_rad_s), 0.0)
         self.enable_zupt = bool(enable_zupt)
         self.allow_zupt_while_commanded_motion = bool(allow_zupt_while_commanded_motion)
+        self.max_imu_staleness_s = max(float(max_imu_staleness_s), 0.0)
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self, spin_thread=False)
         self.cmd_vel_pub = self.create_publisher(Twist, cmd_vel_topic, 10)
@@ -231,7 +233,12 @@ class ForwardAccelDiagnosticNode(Node):
         self.gyro_bias_yaw_rad_s = 0.0
         self._run_bias_applied = False
         self._run_active = False
+        self._run_started_wall_s: float | None = None
         self._integration_last_stamp_s: float | None = None
+        self._integration_first_stamp_s: float | None = None
+        self._integration_last_wall_s: float | None = None
+        self._integration_sample_count = 0
+        self._integration_rejected_nonmonotonic_count = 0
         self._estimated_distance_m = 0.0
         self._estimated_velocity_m_s = 0.0
         self._estimated_roll_rad: float | None = None
@@ -244,7 +251,12 @@ class ForwardAccelDiagnosticNode(Node):
     def _reset_run_state(self, *, accel_bias: dict[str, float] | None) -> None:
         self._run_bias_applied = accel_bias is not None
         self._run_active = True
+        self._run_started_wall_s = time.monotonic()
         self._integration_last_stamp_s = None
+        self._integration_first_stamp_s = None
+        self._integration_last_wall_s = None
+        self._integration_sample_count = 0
+        self._integration_rejected_nonmonotonic_count = 0
         self._estimated_distance_m = 0.0
         self._estimated_velocity_m_s = 0.0
         self._estimated_roll_rad = None if accel_bias is None else float(accel_bias["tilt_roll_rad"])
@@ -257,6 +269,7 @@ class ForwardAccelDiagnosticNode(Node):
             return
         imu_stamp_s = float(imu_sample["timestamp_s"])
         if self._integration_last_stamp_s is not None and imu_stamp_s <= self._integration_last_stamp_s:
+            self._integration_rejected_nonmonotonic_count += 1
             return
         dt_s = (
             self.sample_dt_s
@@ -264,6 +277,10 @@ class ForwardAccelDiagnosticNode(Node):
             else max(0.0, imu_stamp_s - self._integration_last_stamp_s)
         )
         self._integration_last_stamp_s = imu_stamp_s
+        if self._integration_first_stamp_s is None:
+            self._integration_first_stamp_s = imu_stamp_s
+        self._integration_last_wall_s = float(imu_sample.get("received_monotonic_s", time.monotonic()))
+        self._integration_sample_count += 1
         raw_forward_m_s2 = float(imu_sample["base_linear_acceleration_x_m_s2"])
         raw_lateral_m_s2 = float(imu_sample["base_linear_acceleration_y_m_s2"])
         raw_vertical_m_s2 = float(imu_sample["base_linear_acceleration_z_m_s2"])
@@ -331,6 +348,9 @@ class ForwardAccelDiagnosticNode(Node):
             "imu_available": True,
             "imu_timestamp_s": imu_stamp_s,
             "imu_dt_s": dt_s,
+            "imu_integration_sample_count": self._integration_sample_count,
+            "imu_integration_first_timestamp_s": self._integration_first_stamp_s,
+            "imu_integration_rejected_nonmonotonic_count": self._integration_rejected_nonmonotonic_count,
             "imu_raw_linear_acceleration_x_m_s2": float(imu_sample["linear_acceleration_x_m_s2"]),
             "imu_raw_linear_acceleration_y_m_s2": float(imu_sample["linear_acceleration_y_m_s2"]),
             "imu_raw_linear_acceleration_z_m_s2": float(imu_sample["linear_acceleration_z_m_s2"]),
@@ -397,6 +417,7 @@ class ForwardAccelDiagnosticNode(Node):
         )
         self.latest_imu_sample = {
             "timestamp_s": stamp_s,
+            "received_monotonic_s": time.monotonic(),
             "linear_acceleration_x_m_s2": linear_x,
             "linear_acceleration_y_m_s2": linear_y,
             "linear_acceleration_z_m_s2": linear_z,
@@ -411,6 +432,19 @@ class ForwardAccelDiagnosticNode(Node):
             "base_angular_velocity_z_rad_s": float(base_gyro_z),
         }
         self._integrate_imu_sample(self.latest_imu_sample)
+
+    def imu_staleness_s(self, *, now_s: float | None = None) -> float | None:
+        if self._integration_last_wall_s is None:
+            return None
+        if now_s is None:
+            now_s = time.monotonic()
+        return max(float(now_s) - self._integration_last_wall_s, 0.0)
+
+    def imu_is_fresh(self, *, now_s: float | None = None) -> bool:
+        if self.max_imu_staleness_s <= 1e-9:
+            return self._integration_sample_count > 0
+        age_s = self.imu_staleness_s(now_s=now_s)
+        return age_s is not None and age_s <= self.max_imu_staleness_s
 
     def lookup_pose(self) -> dict[str, float] | None:
         try:
@@ -568,6 +602,7 @@ class ForwardAccelDiagnosticNode(Node):
         else:
             print("[forward_accel_diag] ZUPT enabled only when commanded motion is zero.", flush=True)
         start = time.time()
+        start_monotonic = time.monotonic()
         deadline = start + max(float(duration_s), 0.0)
         target_abs_distance_m = abs(float(target_distance_m)) if target_distance_m is not None else None
         tf_start_pose: dict[str, float] | None = None
@@ -578,6 +613,7 @@ class ForwardAccelDiagnosticNode(Node):
         while time.time() < deadline:
             rclpy.spin_once(self, timeout_sec=0.001)
             now = time.time()
+            now_monotonic = time.monotonic()
             if now < next_sample_s:
                 continue
             next_sample_s += self.sample_dt_s
@@ -647,18 +683,43 @@ class ForwardAccelDiagnosticNode(Node):
                 sample["imu_available"] = False
             else:
                 sample.update(self._latest_integration_sample)
+                imu_age_s = self.imu_staleness_s(now_s=now_monotonic)
+                if imu_age_s is not None:
+                    sample["imu_wall_age_s"] = imu_age_s
+                    sample["imu_stale"] = (
+                        self.max_imu_staleness_s > 1e-9 and imu_age_s > self.max_imu_staleness_s
+                    )
             command_linear_m_s = 0.0
             target_reached = False
             if send_motion:
-                command_linear_m_s = float(linear_m_s)
-                if target_abs_distance_m is not None:
-                    signed_progress_m = float(self._estimated_distance_m) * target_direction_sign
-                    remaining_m = max(target_abs_distance_m - max(signed_progress_m, 0.0), 0.0)
-                    sample["target_signed_progress_m"] = signed_progress_m
-                    sample["target_remaining_distance_m"] = remaining_m
-                    if signed_progress_m >= target_abs_distance_m:
-                        command_linear_m_s = 0.0
-                        target_reached = True
+                imu_fresh = self.imu_is_fresh(now_s=now_monotonic)
+                if not imu_fresh and self.max_imu_staleness_s > 1e-9:
+                    if self._integration_sample_count <= 0:
+                        elapsed_without_imu_s = now_monotonic - start_monotonic
+                        sample["motion_blocked_reason"] = "imu_unavailable"
+                        if elapsed_without_imu_s >= self.max_imu_staleness_s:
+                            sample["cmd_linear_m_s"] = 0.0
+                            stop_reason = "imu_unavailable"
+                            self.stop()
+                            samples.append(sample)
+                            break
+                    else:
+                        sample["motion_blocked_reason"] = "imu_stale"
+                        sample["cmd_linear_m_s"] = 0.0
+                        stop_reason = "imu_stale_timeout"
+                        self.stop()
+                        samples.append(sample)
+                        break
+                else:
+                    command_linear_m_s = float(linear_m_s)
+                    if target_abs_distance_m is not None:
+                        signed_progress_m = float(self._estimated_distance_m) * target_direction_sign
+                        remaining_m = max(target_abs_distance_m - max(signed_progress_m, 0.0), 0.0)
+                        sample["target_signed_progress_m"] = signed_progress_m
+                        sample["target_remaining_distance_m"] = remaining_m
+                        if signed_progress_m >= target_abs_distance_m:
+                            command_linear_m_s = 0.0
+                            target_reached = True
                 self.publish_forward(command_linear_m_s)
             sample["cmd_linear_m_s"] = command_linear_m_s
             samples.append(sample)
@@ -706,15 +767,31 @@ def _summarize_accel(samples: list[dict[str, Any]]) -> dict[str, Any]:
     peak_velocity = max(abs(float(sample.get("imu_estimated_forward_velocity_m_s", 0.0))) for sample in valid)
     stationary_sample_count = sum(1 for sample in valid if sample.get("imu_stationary"))
     zupt_sample_count = sum(1 for sample in valid if sample.get("imu_zupt_applied"))
+    stale_sample_count = sum(1 for sample in valid if sample.get("imu_stale"))
     observed_rate_hz: float | None = None
+    integrated_sample_count: int | None = None
+    integration_rejected_count: int | None = None
+    max_wall_age_s: float | None = None
+    wall_ages = [float(sample["imu_wall_age_s"]) for sample in valid if "imu_wall_age_s" in sample]
+    if wall_ages:
+        max_wall_age_s = max(wall_ages)
+    if "imu_integration_sample_count" in end:
+        integrated_sample_count = int(end.get("imu_integration_sample_count", 0))
+        integration_rejected_count = int(end.get("imu_integration_rejected_nonmonotonic_count", 0))
+        first_stamp_s = float(end.get("imu_integration_first_timestamp_s", end.get("imu_timestamp_s", 0.0)))
+        last_stamp_s = float(end.get("imu_timestamp_s", 0.0))
+        elapsed_stamp_s = last_stamp_s - first_stamp_s
+        if integrated_sample_count >= 2 and elapsed_stamp_s > 1e-6:
+            observed_rate_hz = (integrated_sample_count - 1) / elapsed_stamp_s
     if len(valid) >= 2:
         first_stamp_s = float(valid[0].get("imu_timestamp_s", 0.0))
         last_stamp_s = float(valid[-1].get("imu_timestamp_s", 0.0))
         elapsed_stamp_s = last_stamp_s - first_stamp_s
-        if elapsed_stamp_s > 1e-6:
+        if observed_rate_hz is None and elapsed_stamp_s > 1e-6:
             observed_rate_hz = (len(valid) - 1) / elapsed_stamp_s
-    return {
+    result = {
         "valid_sample_count": len(valid),
+        "logged_sample_count": len(valid),
         "elapsed_s": round(max(float(end["t_s"]) - float(valid[0]["t_s"]), 1e-6), 3),
         "reported_distance_m": round(float(end.get("imu_estimated_forward_distance_m", 0.0)), 4),
         "reported_velocity_m_s": round(float(end.get("imu_estimated_forward_velocity_m_s", 0.0)), 4),
@@ -725,8 +802,17 @@ def _summarize_accel(samples: list[dict[str, Any]]) -> dict[str, Any]:
         "stationary_fraction": round(stationary_sample_count / len(valid), 4),
         "zupt_applied_sample_count": zupt_sample_count,
         "zupt_applied_fraction": round(zupt_sample_count / len(valid), 4),
+        "stale_sample_count": stale_sample_count,
+        "stale_fraction": round(stale_sample_count / len(valid), 4),
         "observed_imu_rate_hz": None if observed_rate_hz is None else round(observed_rate_hz, 3),
     }
+    if integrated_sample_count is not None:
+        result["integrated_sample_count"] = integrated_sample_count
+    if integration_rejected_count is not None:
+        result["integration_rejected_nonmonotonic_count"] = integration_rejected_count
+    if max_wall_age_s is not None:
+        result["max_imu_wall_age_s"] = round(max_wall_age_s, 3)
+    return result
 
 
 def summarize(samples: list[dict[str, Any]]) -> dict[str, Any]:
@@ -791,6 +877,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Keep zero-velocity resets enabled even while a non-zero forward command is active.",
     )
+    parser.add_argument(
+        "--max-imu-staleness-s",
+        type=float,
+        default=0.5,
+        help="When sending motion, stop immediately if no integrated IMU callback has arrived within this wall-clock age. Use 0 to disable.",
+    )
     parser.add_argument("--odom-frame", default="odom")
     parser.add_argument("--base-frame", default="base_link")
     parser.add_argument("--cmd-vel-topic", default="/cmd_vel")
@@ -843,6 +935,7 @@ def main(argv: list[str] | None = None) -> int:
         gyro_stationary_tolerance_rad_s=args.gyro_stationary_tolerance_rad_s,
         enable_zupt=args.enable_zupt,
         allow_zupt_while_commanded_motion=args.zupt_while_commanded_motion,
+        max_imu_staleness_s=args.max_imu_staleness_s,
     )
     try:
         samples = node.collect(

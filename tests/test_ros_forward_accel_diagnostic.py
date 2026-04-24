@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 from xlerobot_playground.ros_forward_accel_diagnostic import (
+    build_parser,
     forward_displacement_m,
     gravity_components_from_tilt,
     integrate_acceleration_step,
@@ -165,6 +166,56 @@ class RosForwardAccelDiagnosticTests(unittest.TestCase):
         self.assertTrue(summary["accelerometer_bias_applied"])
         self.assertTrue(summary["tilt_compensation_applied"])
         self.assertAlmostEqual(summary["accelerometer_bias"]["gyro_roll_rad_s"], 0.001)
+
+    def test_summary_uses_integrated_imu_count_for_rate_when_available(self) -> None:
+        summary = summarize(
+            [
+                {
+                    "t_s": 0.0,
+                    "imu_available": True,
+                    "imu_timestamp_s": 10.0,
+                    "imu_integration_first_timestamp_s": 10.0,
+                    "imu_integration_sample_count": 1,
+                    "imu_integration_rejected_nonmonotonic_count": 0,
+                    "imu_estimated_forward_distance_m": 0.0,
+                    "imu_estimated_forward_velocity_m_s": 0.0,
+                    "imu_used_forward_acceleration_m_s2": 0.0,
+                    "imu_stationary": True,
+                    "imu_zupt_applied": False,
+                    "imu_wall_age_s": 0.01,
+                    "imu_stale": False,
+                },
+                {
+                    "t_s": 1.0,
+                    "imu_available": True,
+                    "imu_timestamp_s": 11.0,
+                    "imu_integration_first_timestamp_s": 10.0,
+                    "imu_integration_sample_count": 201,
+                    "imu_integration_rejected_nonmonotonic_count": 3,
+                    "imu_estimated_forward_distance_m": 0.1,
+                    "imu_estimated_forward_velocity_m_s": 0.2,
+                    "imu_used_forward_acceleration_m_s2": 0.3,
+                    "imu_stationary": False,
+                    "imu_zupt_applied": False,
+                    "imu_wall_age_s": 0.6,
+                    "imu_stale": True,
+                },
+            ]
+        )
+
+        accel = summary["accelerometer"]
+        self.assertEqual(accel["valid_sample_count"], 2)
+        self.assertEqual(accel["logged_sample_count"], 2)
+        self.assertEqual(accel["integrated_sample_count"], 201)
+        self.assertEqual(accel["integration_rejected_nonmonotonic_count"], 3)
+        self.assertAlmostEqual(accel["observed_imu_rate_hz"], 200.0)
+        self.assertEqual(accel["stale_sample_count"], 1)
+        self.assertAlmostEqual(accel["max_imu_wall_age_s"], 0.6)
+
+    def test_parser_exposes_imu_staleness_guard(self) -> None:
+        args = build_parser().parse_args(["--max-imu-staleness-s", "0.25"])
+
+        self.assertEqual(args.max_imu_staleness_s, 0.25)
 
 
 if __name__ == "__main__":

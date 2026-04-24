@@ -64,12 +64,14 @@ class ImuStreamState:
         self._last_rx_log_count = 0
         self._last_tx_log_at = time.monotonic()
         self._last_tx_log_count = 0
+        self._last_received_monotonic_s: float | None = None
 
     def publish(self, sample: dict[str, Any]) -> None:
         payload = json.dumps(sample, separators=(",", ":"))
         self.latest_sample = sample
         self.latest_json = payload
         self._received_count += 1
+        self._last_received_monotonic_s = time.monotonic()
         for queue in tuple(self._clients):
             if queue.full():
                 try:
@@ -120,6 +122,22 @@ class ImuStreamState:
 
     def unregister_client(self, queue: asyncio.Queue[str]) -> None:
         self._clients.discard(queue)
+
+    def stats(self) -> dict[str, Any]:
+        imu_age_s = None
+        if self._last_received_monotonic_s is not None:
+            imu_age_s = max(time.monotonic() - self._last_received_monotonic_s, 0.0)
+        return {
+            "ready": self.latest_sample is not None,
+            "age_s": None if imu_age_s is None else round(imu_age_s, 3),
+            "received_count": self._received_count,
+            "sent_count": self._sent_count,
+            "client_count": len(self._clients),
+            "queue_drop_count": self._queue_drop_count,
+            "latest_timestamp_s": None
+            if self.latest_sample is None
+            else self.latest_sample.get("timestamp_s"),
+        }
 
 
 class RobotBrainAgent:
@@ -243,6 +261,7 @@ async def _handle_health(_request: web.Request) -> web.Response:
             "motion_enabled": agent.config.allow_motion_commands,
             "imu_udp_port": agent.config.imu_udp_port,
             "imu_ws_path": "/ws/imu",
+            "imu": agent.imu_stream.stats(),
         }
     )
 

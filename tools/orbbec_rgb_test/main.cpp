@@ -475,6 +475,11 @@ int main(int argc, char **argv) try {
         try {
             imu_publisher = std::make_unique<ImuDatagramPublisher>(options.imu_udp_host, options.imu_udp_port);
             std::cout << "IMU UDP publisher: " << options.imu_udp_host << ":" << options.imu_udp_port << "\n";
+            if(options.frames != 0) {
+                std::cerr << "WARNING: --enable-imu with finite --frames=" << options.frames
+                          << " will stop the IMU UDP stream when RGB capture exits. "
+                          << "Use --frames 0 for continuous robot runs.\n";
+            }
             imu_pipeline = std::make_shared<ob::Pipeline>(device);
             auto imu_config = std::make_shared<ob::Config>();
             imu_config->enableGyroStream();
