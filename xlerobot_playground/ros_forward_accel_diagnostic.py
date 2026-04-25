@@ -541,6 +541,11 @@ class ForwardAccelDiagnosticNode(Node):
                 "bias_forward_m_s2": self.accel_bias_forward_m_s2,
                 "bias_lateral_m_s2": self.accel_bias_lateral_m_s2,
                 "bias_vertical_m_s2": self.accel_bias_vertical_m_s2,
+                "gyro_bias_roll_rad_s": self.gyro_bias_roll_rad_s,
+                "gyro_bias_pitch_rad_s": self.gyro_bias_pitch_rad_s,
+                "gyro_bias_yaw_rad_s": self.gyro_bias_yaw_rad_s,
+                "tilt_roll_rad": 0.0,
+                "tilt_pitch_rad": 0.0,
                 "sample_count": 0,
                 "elapsed_s": 0.0,
             }

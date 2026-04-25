@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 from xlerobot_playground.ros_forward_accel_diagnostic import (
+    ForwardAccelDiagnosticNode,
     build_parser,
     format_progress_log_line,
     forward_displacement_m,
@@ -297,6 +298,23 @@ class RosForwardAccelDiagnosticTests(unittest.TestCase):
         args = build_parser().parse_args(["--progress-log-period-s", "0.25"])
 
         self.assertEqual(args.progress_log_period_s, 0.25)
+
+    def test_zero_accel_bias_contains_tilt_and_gyro_fields(self) -> None:
+        node = object.__new__(ForwardAccelDiagnosticNode)
+        node.accel_bias_calibration_s = 0.0
+        node.accel_bias_min_samples = 50
+        node.accel_bias_forward_m_s2 = 0.0
+        node.accel_bias_lateral_m_s2 = 0.0
+        node.accel_bias_vertical_m_s2 = 0.0
+        node.gyro_bias_roll_rad_s = 0.0
+        node.gyro_bias_pitch_rad_s = 0.0
+        node.gyro_bias_yaw_rad_s = 0.0
+
+        bias = node.calibrate_accel_bias()
+
+        self.assertEqual(bias["tilt_roll_rad"], 0.0)
+        self.assertEqual(bias["tilt_pitch_rad"], 0.0)
+        self.assertEqual(bias["gyro_bias_roll_rad_s"], 0.0)
 
 
 if __name__ == "__main__":
