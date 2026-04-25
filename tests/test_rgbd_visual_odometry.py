@@ -5,6 +5,7 @@ import unittest
 
 from xlerobot_playground.rgbd_visual_odometry import (
     PlanarPose,
+    RgbdVisualOdometryNode,
     angle_wrap,
     build_parser,
     compose_planar,
@@ -47,6 +48,26 @@ class RgbdVisualOdometryHelperTests(unittest.TestCase):
 
     def test_angle_wrap(self) -> None:
         self.assertAlmostEqual(angle_wrap(math.radians(181.0)), math.radians(-179.0))
+
+    def test_imu_arrival_age_is_independent_of_header_stamp(self) -> None:
+        class _ClockTime:
+            nanoseconds = 10_000_000_000
+
+        class _Clock:
+            def now(self) -> _ClockTime:
+                return _ClockTime()
+
+        node = object.__new__(RgbdVisualOdometryNode)
+        node.config = type("Config", (), {"imu_stale_after_s": 0.5})()
+        node.get_clock = lambda: _Clock()
+        node._latest_imu_received_s = 9.8
+        node._latest_imu_orientation_unwrapped_yaw_rad = math.radians(45.0)
+        node._imu_orientation_origin_yaw_rad = math.radians(5.0)
+
+        self.assertAlmostEqual(node._relative_imu_yaw_rad(), math.radians(40.0))
+
+        node._latest_imu_received_s = 9.0
+        self.assertIsNone(node._relative_imu_yaw_rad())
 
 
 if __name__ == "__main__":

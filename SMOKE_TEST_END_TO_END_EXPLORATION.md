@@ -55,10 +55,13 @@ cd /home/alin/Robot42
 cmake -S tools/orbbec_rgb_test -B build/orbbec_rgb_test -DORBBEC_SDK_ROOT="$HOME/orbbec/sdk"
 cmake --build build/orbbec_rgb_test
 
-./build/orbbec_rgb_test/orbbec_rgb_test \
+sudo ./build/orbbec_rgb_test/orbbec_rgb_test --list-profiles
+
+sudo ./build/orbbec_rgb_test/orbbec_rgb_test \
   --frames 0 \
   --no-file-output \
   --enable-depth \
+  --enable-depth-registration \
   --enable-imu \
   --imu-udp-host 127.0.0.1 \
   --imu-udp-port 8766 \

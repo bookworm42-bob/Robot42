@@ -46,6 +46,8 @@ struct Options {
     bool enable_depth = false;
     bool enable_imu = false;
     bool no_file_output = false;
+    bool list_profiles = false;
+    bool enable_depth_registration = false;
     std::string imu_udp_host = "127.0.0.1";
     int imu_udp_port = 8766;
     bool camera_http_enable = false;
@@ -477,6 +479,13 @@ Options parse_args(int argc, char **argv) {
         else if(arg == "--no-file-output") {
             options.no_file_output = true;
         }
+        else if(arg == "--list-profiles") {
+            options.list_profiles = true;
+        }
+        else if(arg == "--enable-depth-registration") {
+            options.enable_depth_registration = true;
+            options.enable_depth = true;
+        }
         else if(arg == "--imu-udp-host") {
             options.imu_udp_host = require_value(arg);
         }
@@ -508,7 +517,8 @@ Options parse_args(int argc, char **argv) {
                       << "                       [--camera-http-enable] [--camera-http-host HOST]\n"
                       << "                       [--camera-http-port PORT] [--camera-http-path PATH]\n"
                       << "                       [--camera-http-timeout-ms MS]\n"
-                      << "                       [--latest-only] [--no-file-output] [--enable-depth] [--enable-imu]\n";
+                      << "                       [--latest-only] [--no-file-output] [--enable-depth] [--enable-imu]\n"
+                      << "                       [--enable-depth-registration] [--list-profiles]\n";
             std::exit(EXIT_SUCCESS);
         }
         else {
@@ -540,11 +550,127 @@ Options parse_args(int argc, char **argv) {
     if(options.camera_http_timeout_ms < 1) {
         throw std::runtime_error("--camera-http-timeout-ms must be positive");
     }
+    if(options.enable_depth_registration && !options.enable_depth) {
+        throw std::runtime_error("--enable-depth-registration requires --enable-depth");
+    }
     return options;
 }
 
 std::string format_name(OBFormat format) {
     return ob::TypeHelper::convertOBFormatTypeToString(format);
+}
+
+std::string stream_name(OBStreamType type) {
+    return ob::TypeHelper::convertOBStreamTypeToString(type);
+}
+
+std::string sensor_name(OBSensorType type) {
+    return ob::TypeHelper::convertOBSensorTypeToString(type);
+}
+
+void print_device_profiles(const std::shared_ptr<ob::Device> &device) {
+    auto sensors = device->getSensorList();
+    const auto sensor_count = sensors->getCount();
+    std::cout << "Available stream profiles:\n";
+    for(uint32_t sensor_index = 0; sensor_index < sensor_count; ++sensor_index) {
+        const auto sensor_type = sensors->getSensorType(sensor_index);
+        std::cout << "  Sensor " << sensor_index << ": " << sensor_name(sensor_type) << "\n";
+        auto sensor = sensors->getSensor(sensor_index);
+        auto profiles = sensor->getStreamProfileList();
+        const auto profile_count = profiles->getCount();
+        if(profile_count == 0) {
+            std::cout << "    (no profiles)\n";
+            continue;
+        }
+        for(uint32_t profile_index = 0; profile_index < profile_count; ++profile_index) {
+            auto profile = profiles->getProfile(profile_index);
+            std::cout << "    [" << profile_index << "] " << stream_name(profile->getType())
+                      << " format=" << format_name(profile->getFormat());
+            if(profile->is<ob::VideoStreamProfile>()) {
+                auto video = profile->as<ob::VideoStreamProfile>();
+                std::cout << " " << video->getWidth() << "x" << video->getHeight()
+                          << "@" << video->getFps();
+            }
+            else if(profile->is<ob::AccelStreamProfile>()) {
+                auto accel = profile->as<ob::AccelStreamProfile>();
+                std::cout << " sample_rate="
+                          << ob::TypeHelper::convertOBIMUSampleRateTypeToString(accel->getSampleRate())
+                          << " full_scale="
+                          << ob::TypeHelper::convertOBAccelFullScaleRangeTypeToString(accel->getFullScaleRange());
+            }
+            else if(profile->is<ob::GyroStreamProfile>()) {
+                auto gyro = profile->as<ob::GyroStreamProfile>();
+                std::cout << " sample_rate="
+                          << ob::TypeHelper::convertOBIMUSampleRateTypeToString(gyro->getSampleRate())
+                          << " full_scale="
+                          << ob::TypeHelper::convertOBGyroFullScaleRangeTypeToString(gyro->getFullScaleRange());
+            }
+            std::cout << "\n";
+        }
+    }
+}
+
+std::shared_ptr<ob::Config> build_pipeline_config(ob::Pipeline &pipeline, const Options &options) {
+    auto config = std::make_shared<ob::Config>();
+    if(options.enable_depth_registration) {
+        auto color_profiles = pipeline.getStreamProfileList(OB_SENSOR_COLOR);
+        auto color_profile = color_profiles->getVideoStreamProfile(
+            options.width,
+            options.height,
+            OB_FORMAT_RGB,
+            options.fps
+        );
+        auto depth_profiles = pipeline.getD2CDepthProfileList(color_profile, ALIGN_D2C_HW_MODE);
+        if(depth_profiles->getCount() == 0) {
+            throw std::runtime_error("Hardware depth-to-color alignment is not supported for the selected color profile.");
+        }
+        const int depth_width = options.depth_width > 0 ? options.depth_width : OB_WIDTH_ANY;
+        const int depth_height = options.depth_height > 0 ? options.depth_height : OB_HEIGHT_ANY;
+        const int depth_fps = options.depth_fps > 0 ? options.depth_fps : options.fps;
+        auto depth_profile = depth_profiles->getVideoStreamProfile(
+            depth_width,
+            depth_height,
+            OB_FORMAT_Y16,
+            depth_fps
+        );
+        config->enableStream(color_profile);
+        config->enableStream(depth_profile);
+        config->setAlignMode(ALIGN_D2C_HW_MODE);
+        config->setDepthScaleRequire(true);
+        config->setFrameAggregateOutputMode(OB_FRAME_AGGREGATE_OUTPUT_ALL_TYPE_FRAME_REQUIRE);
+        pipeline.enableFrameSync();
+
+        std::cout << "Hardware depth-to-color registration enabled: "
+                  << "color=" << color_profile->getWidth() << "x" << color_profile->getHeight()
+                  << "@" << color_profile->getFps()
+                  << " depth_source=" << depth_profile->getWidth() << "x" << depth_profile->getHeight()
+                  << "@" << depth_profile->getFps()
+                  << " format=" << format_name(depth_profile->getFormat()) << "\n";
+        return config;
+    }
+
+    config->enableVideoStream(
+        OB_STREAM_COLOR,
+        static_cast<uint32_t>(options.width),
+        static_cast<uint32_t>(options.height),
+        static_cast<uint32_t>(options.fps),
+        OB_FORMAT_ANY
+    );
+    if(options.enable_depth) {
+        const uint32_t depth_width = options.depth_width > 0 ? static_cast<uint32_t>(options.depth_width) : OB_WIDTH_ANY;
+        const uint32_t depth_height = options.depth_height > 0 ? static_cast<uint32_t>(options.depth_height) : OB_HEIGHT_ANY;
+        const uint32_t depth_fps = options.depth_fps > 0
+            ? static_cast<uint32_t>(options.depth_fps)
+            : static_cast<uint32_t>(options.fps);
+        config->enableVideoStream(
+            OB_STREAM_DEPTH,
+            depth_width,
+            depth_height,
+            depth_fps,
+            OB_FORMAT_Y16
+        );
+    }
+    return config;
 }
 
 std::shared_ptr<ob::ColorFrame> to_rgb_frame(
@@ -704,34 +830,17 @@ int main(int argc, char **argv) try {
     }
 
     ob::Pipeline pipeline;
-    auto config = std::make_shared<ob::Config>();
-    config->enableVideoStream(
-        OB_STREAM_COLOR,
-        static_cast<uint32_t>(options.width),
-        static_cast<uint32_t>(options.height),
-        static_cast<uint32_t>(options.fps),
-        OB_FORMAT_ANY
-    );
-    if(options.enable_depth) {
-        const uint32_t depth_width = options.depth_width > 0 ? static_cast<uint32_t>(options.depth_width) : OB_WIDTH_ANY;
-        const uint32_t depth_height = options.depth_height > 0 ? static_cast<uint32_t>(options.depth_height) : OB_HEIGHT_ANY;
-        const uint32_t depth_fps = options.depth_fps > 0
-            ? static_cast<uint32_t>(options.depth_fps)
-            : static_cast<uint32_t>(options.fps);
-        config->enableVideoStream(
-            OB_STREAM_DEPTH,
-            depth_width,
-            depth_height,
-            depth_fps,
-            OB_FORMAT_Y16
-        );
-    }
 
     auto device = pipeline.getDevice();
     auto info = device->getDeviceInfo();
     std::cout << "Orbbec device: " << info->getName()
               << " pid=0x" << std::hex << info->getPid() << std::dec
               << " sn=" << info->getSerialNumber() << "\n";
+    if(options.list_profiles) {
+        print_device_profiles(device);
+        return EXIT_SUCCESS;
+    }
+    auto config = build_pipeline_config(pipeline, options);
     if(options.enable_depth) {
         std::cout << "Depth stream requested: "
                   << (options.depth_width > 0 ? std::to_string(options.depth_width) : "any")

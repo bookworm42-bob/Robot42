@@ -76,10 +76,13 @@ cd /Users/alin/Robot42
 cmake -S tools/orbbec_rgb_test -B build/orbbec_rgb_test
 cmake --build build/orbbec_rgb_test
 
+sudo ./build/orbbec_rgb_test/orbbec_rgb_test --list-profiles
+
 sudo ./build/orbbec_rgb_test/orbbec_rgb_test \
   --frames 0 \
   --no-file-output \
   --enable-depth \
+  --enable-depth-registration \
   --enable-imu \
   --imu-udp-host 127.0.0.1 \
   --imu-udp-port 8766 \
@@ -89,16 +92,17 @@ sudo ./build/orbbec_rgb_test/orbbec_rgb_test \
   --camera-http-path /camera/rgbd
 ```
 
-If the Orbbec rejects the default depth profile, use the explicit profile that worked for Gemini 2:
+If the Orbbec default aligned depth profile is too heavy, use the listed Gemini 2 `Y16 640x400@30` depth source profile:
 
 ```bash
 sudo ./build/orbbec_rgb_test/orbbec_rgb_test \
   --frames 0 \
   --no-file-output \
   --enable-depth \
+  --enable-depth-registration \
   --enable-imu \
   --depth-width 640 \
-  --depth-height 576 \
+  --depth-height 400 \
   --depth-fps 30 \
   --imu-udp-host 127.0.0.1 \
   --imu-udp-port 8766 \

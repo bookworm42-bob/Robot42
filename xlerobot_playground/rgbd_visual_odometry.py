@@ -312,6 +312,7 @@ class RgbdVisualOdometryNode(Node):
         self._latest_imu_orientation_yaw_rad: float | None = None
         self._latest_imu_orientation_unwrapped_yaw_rad: float | None = None
         self._imu_orientation_origin_yaw_rad: float | None = None
+        self._latest_imu_received_s: float | None = None
         self.accepted_updates = 0
         self.rejected_updates = 0
         self.create_subscription(Image, config.rgb_topic, self._on_rgb, 10)
@@ -336,6 +337,7 @@ class RgbdVisualOdometryNode(Node):
 
     def _on_imu(self, message: Any) -> None:
         self.latest_imu = message
+        self._latest_imu_received_s = self.get_clock().now().nanoseconds / 1_000_000_000.0
         if message.header.stamp is None:
             return
         stamp_s = stamp_to_seconds(message.header.stamp)
@@ -385,10 +387,15 @@ class RgbdVisualOdometryNode(Node):
                 f"from {self._imu_bias_sample_count} samples over {elapsed_s:.2f}s"
             )
 
-    def _relative_imu_yaw_rad(self, *, stamp_s: float) -> float | None:
-        if self._latest_imu_stamp_s is None:
+    def _latest_imu_age_s(self) -> float | None:
+        if self._latest_imu_received_s is None:
             return None
-        if abs(float(stamp_s) - self._latest_imu_stamp_s) > self.config.imu_stale_after_s:
+        now_s = self.get_clock().now().nanoseconds / 1_000_000_000.0
+        return max(now_s - self._latest_imu_received_s, 0.0)
+
+    def _relative_imu_yaw_rad(self) -> float | None:
+        age_s = self._latest_imu_age_s()
+        if age_s is None or age_s > self.config.imu_stale_after_s:
             return None
         if self._latest_imu_orientation_unwrapped_yaw_rad is None or self._imu_orientation_origin_yaw_rad is None:
             return None
@@ -401,8 +408,8 @@ class RgbdVisualOdometryNode(Node):
         if self.latest_imu is None or self.latest_imu.header.stamp is None:
             self._last_prediction_stamp_s = stamp_s
             return 0.0
-        imu_stamp_s = stamp_to_seconds(self.latest_imu.header.stamp)
-        if abs(stamp_s - imu_stamp_s) > self.config.imu_stale_after_s:
+        age_s = self._latest_imu_age_s()
+        if age_s is None or age_s > self.config.imu_stale_after_s:
             self._last_prediction_stamp_s = stamp_s
             return 0.0
         previous_stamp_s = self._last_prediction_stamp_s
@@ -424,7 +431,7 @@ class RgbdVisualOdometryNode(Node):
         stamp = self.get_clock().now().to_msg()
         stamp_s = stamp_to_seconds(stamp)
         predicted_yaw_rad = self._predict_yaw_from_imu(stamp_s=stamp_s)
-        absolute_imu_yaw_rad = self._relative_imu_yaw_rad(stamp_s=stamp_s)
+        absolute_imu_yaw_rad = self._relative_imu_yaw_rad()
         if self.latest_rgb is not None and self.latest_depth is not None and self.intrinsics is not None:
             try:
                 frame = VisualOdomFrame(
@@ -435,7 +442,7 @@ class RgbdVisualOdometryNode(Node):
                 )
                 stamp_s = stamp_to_seconds(frame.stamp)
                 predicted_yaw_rad = self._predict_yaw_from_imu(stamp_s=stamp_s)
-                absolute_imu_yaw_rad = self._relative_imu_yaw_rad(stamp_s=stamp_s)
+                absolute_imu_yaw_rad = self._relative_imu_yaw_rad()
                 if self.previous_frame is not None:
                     estimate = self.estimator.estimate(self.previous_frame, frame)
                     if estimate is not None:
