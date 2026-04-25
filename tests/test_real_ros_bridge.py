@@ -23,6 +23,7 @@ from xlerobot_playground.real_ros_bridge import (
     twist_to_base_velocity,
     yaw_to_quaternion_xyzw,
 )
+from xlerobot_playground.rgbd_transport import pack_rgbd_frame
 
 
 class _Vector:
@@ -38,12 +39,23 @@ class _Twist:
 
 
 class _FakeBrainClient:
-    def __init__(self) -> None:
+    def __init__(self, *, paired: bool = False) -> None:
         self.requested_paths: list[str] = []
         self.payloads = {
             "/rgb": b"P6\n1 1\n255\nabc",
             "/depth": b"P5\n1 1\n65535\n" + (1234).to_bytes(2, "big"),
         }
+        if paired:
+            self.payloads["/rgbd"] = pack_rgbd_frame(
+                frame_index=7,
+                timestamp_us=1_250_000,
+                rgb=b"abc",
+                rgb_width=1,
+                rgb_height=1,
+                depth_be=(1234).to_bytes(2, "big"),
+                depth_width=1,
+                depth_height=1,
+            )
 
     def get_bytes(self, path: str) -> bytes:
         self.requested_paths.append(path)
@@ -247,7 +259,21 @@ class RealRosBridgeTests(unittest.TestCase):
         self.assertEqual(frame.depth_mm, ((1234,),))
         self.assertEqual(frame.depth_width, 1)
         self.assertIsNone(frame.imu_sample)
-        self.assertEqual(client.requested_paths, ["/rgb", "/depth"])
+        self.assertEqual(client.requested_paths, ["/rgbd", "/rgb", "/depth"])
+
+    def test_robot_brain_rgbd_source_prefers_paired_payload(self) -> None:
+        client = _FakeBrainClient(paired=True)
+        source = RobotBrainRgbdSource(client)
+
+        frame = source.capture()
+
+        self.assertEqual(frame.rgb, b"abc")
+        self.assertEqual(frame.rgb_width, 1)
+        self.assertEqual(frame.depth_mm, ((1234,),))
+        self.assertEqual(frame.depth_width, 1)
+        self.assertEqual(frame.frame_index, 7)
+        self.assertAlmostEqual(frame.timestamp_s, 1.25)
+        self.assertEqual(client.requested_paths, ["/rgbd"])
 
 
 if __name__ == "__main__":

@@ -15,6 +15,12 @@ from xlerobot_playground.real_exploration_runtime import (
     RealXLeRobotDirectRuntime,
     RealXLeRobotRuntimeConfig,
 )
+from xlerobot_playground.rgbd_transport import (
+    PackedRgbdFrame,
+    depth_payload_to_pgm,
+    rgb_payload_to_ppm,
+    unpack_rgbd_frame,
+)
 
 try:
     from aiohttp import WSMsgType, web
@@ -48,6 +54,8 @@ class RobotBrainAgentConfig:
     imu_udp_port: int = 8766
     imu_ws_client_queue_size: int = 64
     imu_log_every: int = 200
+    camera_max_frame_bytes: int = 16 * 1024 * 1024
+    camera_log_every: int = 30
 
 
 class ImuStreamState:
@@ -140,6 +148,73 @@ class ImuStreamState:
         }
 
 
+class RgbdStreamState:
+    def __init__(self, *, log_every: int) -> None:
+        self.log_every = max(1, int(log_every))
+        self.latest_frame: PackedRgbdFrame | None = None
+        self.latest_payload: bytes | None = None
+        self._received_count = 0
+        self._last_rx_log_at = time.monotonic()
+        self._last_rx_log_count = 0
+        self._last_received_monotonic_s: float | None = None
+
+    def publish_payload(self, payload: bytes) -> PackedRgbdFrame:
+        frame = unpack_rgbd_frame(payload)
+        self.latest_frame = frame
+        self.latest_payload = payload
+        self._received_count += 1
+        self._last_received_monotonic_s = time.monotonic()
+        if self._received_count % self.log_every == 0:
+            now = time.monotonic()
+            dt = max(now - self._last_rx_log_at, 1e-6)
+            delta = self._received_count - self._last_rx_log_count
+            print(
+                "[robot_brain_agent] RGB-D rx "
+                f"rate~={delta / dt:.1f}Hz total={self._received_count} "
+                f"rgb={frame.rgb_width}x{frame.rgb_height} "
+                f"depth={frame.depth_width or 0}x{frame.depth_height or 0}",
+                flush=True,
+            )
+            self._last_rx_log_at = now
+            self._last_rx_log_count = self._received_count
+        return frame
+
+    def rgb_ppm(self) -> bytes | None:
+        frame = self.latest_frame
+        if frame is None:
+            return None
+        return rgb_payload_to_ppm(frame.rgb, width=frame.rgb_width, height=frame.rgb_height)
+
+    def depth_pgm(self) -> bytes | None:
+        frame = self.latest_frame
+        if frame is None or frame.depth_be is None or frame.depth_width is None or frame.depth_height is None:
+            return None
+        return depth_payload_to_pgm(frame.depth_be, width=frame.depth_width, height=frame.depth_height)
+
+    def metadata_json(self) -> bytes | None:
+        frame = self.latest_frame
+        if frame is None:
+            return None
+        return json.dumps(self.stats(), sort_keys=True).encode("utf-8")
+
+    def stats(self) -> dict[str, Any]:
+        age_s = None
+        if self._last_received_monotonic_s is not None:
+            age_s = max(time.monotonic() - self._last_received_monotonic_s, 0.0)
+        frame = self.latest_frame
+        return {
+            "ready": frame is not None,
+            "age_s": None if age_s is None else round(age_s, 3),
+            "received_count": self._received_count,
+            "frame_index": None if frame is None else frame.frame_index,
+            "timestamp_s": None if frame is None else frame.timestamp_s,
+            "rgb": None if frame is None else {"width": frame.rgb_width, "height": frame.rgb_height},
+            "depth": None
+            if frame is None or frame.depth_width is None or frame.depth_height is None
+            else {"width": frame.depth_width, "height": frame.depth_height},
+        }
+
+
 class RobotBrainAgent:
     """Non-ROS hardware endpoint for the robot brain."""
 
@@ -163,6 +238,7 @@ class RobotBrainAgent:
             queue_size=config.imu_ws_client_queue_size,
             log_every=config.imu_log_every,
         )
+        self.rgbd_stream = RgbdStreamState(log_every=config.camera_log_every)
 
     def velocity(self, *, linear_m_s: float, angular_rad_s: float) -> dict[str, Any]:
         if self.config.debug_motion:
@@ -199,6 +275,9 @@ class RobotBrainAgent:
         if sample is None:
             return
         self.imu_stream.publish(sample)
+
+    def ingest_rgbd_payload(self, data: bytes) -> PackedRgbdFrame:
+        return self.rgbd_stream.publish_payload(data)
 
     def imu_snapshot(self) -> dict[str, Any] | None:
         return self.imu_stream.latest_sample
@@ -243,6 +322,21 @@ def require_aiohttp() -> None:
 
 
 async def _read_route_bytes(agent: RobotBrainAgent, route: str) -> bytes:
+    if route == "/rgbd":
+        if agent.rgbd_stream.latest_payload is not None:
+            return agent.rgbd_stream.latest_payload
+    elif route == "/rgb":
+        rgb = agent.rgbd_stream.rgb_ppm()
+        if rgb is not None:
+            return rgb
+    elif route == "/depth":
+        depth = agent.rgbd_stream.depth_pgm()
+        if depth is not None:
+            return depth
+    elif route == "/metadata":
+        metadata = agent.rgbd_stream.metadata_json()
+        if metadata is not None:
+            return metadata
     path = agent.file_path(route)
     if path is None:
         raise web.HTTPNotFound(text="Unknown route")
@@ -262,6 +356,7 @@ async def _handle_health(_request: web.Request) -> web.Response:
             "imu_udp_port": agent.config.imu_udp_port,
             "imu_ws_path": "/ws/imu",
             "imu": agent.imu_stream.stats(),
+            "rgbd": agent.rgbd_stream.stats(),
         }
     )
 
@@ -272,9 +367,27 @@ async def _handle_static_file(request: web.Request) -> web.Response:
     content_type = {
         "/rgb": "image/x-portable-pixmap",
         "/depth": "image/x-portable-graymap",
+        "/rgbd": "application/octet-stream",
         "/metadata": "application/json",
     }.get(request.path, "application/octet-stream")
     return web.Response(body=data, content_type=content_type)
+
+
+async def _handle_rgbd_ingest(request: web.Request) -> web.Response:
+    agent: RobotBrainAgent = request.app["agent"]
+    data = await request.read()
+    frame = agent.ingest_rgbd_payload(data)
+    return web.json_response(
+        {
+            "ok": True,
+            "frame_index": frame.frame_index,
+            "timestamp_s": frame.timestamp_s,
+            "rgb": {"width": frame.rgb_width, "height": frame.rgb_height},
+            "depth": None
+            if frame.depth_width is None or frame.depth_height is None
+            else {"width": frame.depth_width, "height": frame.depth_height},
+        }
+    )
 
 
 async def _handle_imu_snapshot(request: web.Request) -> web.Response:
@@ -360,13 +473,15 @@ async def _runtime_context(app: web.Application) -> Any:
 
 def build_app(agent: RobotBrainAgent) -> web.Application:
     require_aiohttp()
-    app = web.Application()
+    app = web.Application(client_max_size=agent.config.camera_max_frame_bytes)
     app["agent"] = agent
     app.cleanup_ctx.append(_runtime_context)
     app.router.add_get("/health", _handle_health)
+    app.router.add_get("/rgbd", _handle_static_file)
     app.router.add_get("/rgb", _handle_static_file)
     app.router.add_get("/depth", _handle_static_file)
     app.router.add_get("/metadata", _handle_static_file)
+    app.router.add_post("/camera/rgbd", _handle_rgbd_ingest)
     app.router.add_get("/imu", _handle_imu_snapshot)
     app.router.add_get("/ws/imu", _handle_imu_websocket)
     app.router.add_post("/cmd_vel", _handle_cmd_vel)
@@ -408,6 +523,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--imu-udp-port", type=int, default=8766)
     parser.add_argument("--imu-ws-client-queue-size", type=int, default=64)
     parser.add_argument("--imu-log-every", type=int, default=200)
+    parser.add_argument("--camera-max-frame-bytes", type=int, default=16 * 1024 * 1024)
+    parser.add_argument("--camera-log-every", type=int, default=30)
     return parser
 
 
@@ -433,6 +550,8 @@ def config_from_args(args: argparse.Namespace) -> RobotBrainAgentConfig:
         imu_udp_port=args.imu_udp_port,
         imu_ws_client_queue_size=args.imu_ws_client_queue_size,
         imu_log_every=args.imu_log_every,
+        camera_max_frame_bytes=args.camera_max_frame_bytes,
+        camera_log_every=args.camera_log_every,
     )
 
 

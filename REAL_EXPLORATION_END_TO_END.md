@@ -49,41 +49,7 @@ save the final map JSON
 
 Run these on the robot brain Mac. Keep both terminals running.
 
-### Terminal RB-1: Orbbec Sidecar
-
-```bash
-cd /Users/alin/Robot42
-
-cmake -S tools/orbbec_rgb_test -B build/orbbec_rgb_test
-cmake --build build/orbbec_rgb_test
-
-sudo ./build/orbbec_rgb_test/orbbec_rgb_test \
-  --frames 0 \
-  --latest-only \
-  --enable-depth \
-  --enable-imu \
-  --imu-udp-host 127.0.0.1 \
-  --imu-udp-port 8766 \
-  --output-dir artifacts/orbbec_rgbd
-```
-
-If the Orbbec rejects the default depth profile, use the explicit profile that worked for Gemini 2:
-
-```bash
-sudo ./build/orbbec_rgb_test/orbbec_rgb_test \
-  --frames 0 \
-  --latest-only \
-  --enable-depth \
-  --enable-imu \
-  --depth-width 640 \
-  --depth-height 576 \
-  --depth-fps 30 \
-  --imu-udp-host 127.0.0.1 \
-  --imu-udp-port 8766 \
-  --output-dir artifacts/orbbec_rgbd
-```
-
-### Terminal RB-2: Robot Brain Agent
+### Terminal RB-1: Robot Brain Agent
 
 Use the Python environment that has LeRobot/XLeRobot installed.
 
@@ -99,8 +65,47 @@ python -m xlerobot_playground.robot_brain_agent \
   --port1 /dev/tty.usbmodem5B140330101 \
   --port2 /dev/tty.usbmodem5B140332271 \
   --max-linear-m-s 0.03 \
-  --max-angular-rad-s 0.30 \
-  --orbbec-output-dir artifacts/orbbec_rgbd
+  --max-angular-rad-s 0.30
+```
+
+### Terminal RB-2: Orbbec Sidecar
+
+```bash
+cd /Users/alin/Robot42
+
+cmake -S tools/orbbec_rgb_test -B build/orbbec_rgb_test
+cmake --build build/orbbec_rgb_test
+
+sudo ./build/orbbec_rgb_test/orbbec_rgb_test \
+  --frames 0 \
+  --no-file-output \
+  --enable-depth \
+  --enable-imu \
+  --imu-udp-host 127.0.0.1 \
+  --imu-udp-port 8766 \
+  --camera-http-enable \
+  --camera-http-host 127.0.0.1 \
+  --camera-http-port 8765 \
+  --camera-http-path /camera/rgbd
+```
+
+If the Orbbec rejects the default depth profile, use the explicit profile that worked for Gemini 2:
+
+```bash
+sudo ./build/orbbec_rgb_test/orbbec_rgb_test \
+  --frames 0 \
+  --no-file-output \
+  --enable-depth \
+  --enable-imu \
+  --depth-width 640 \
+  --depth-height 576 \
+  --depth-fps 30 \
+  --imu-udp-host 127.0.0.1 \
+  --imu-udp-port 8766 \
+  --camera-http-enable \
+  --camera-http-host 127.0.0.1 \
+  --camera-http-port 8765 \
+  --camera-http-path /camera/rgbd
 ```
 
 Quick health checks from the robot brain:
@@ -140,7 +145,7 @@ python -m pip install aiohttp
 
 python -m xlerobot_playground.real_ros_bridge \
   --robot-brain-url http://192.168.1.133:8765 \
-  --publish-rate-hz 10 \
+  --publish-rate-hz 30 \
   --cmd-vel-timeout-s 0.5 \
   --max-linear-m-s 0.03 \
   --max-angular-rad-s 0.30 \
@@ -219,7 +224,7 @@ python -m xlerobot_playground.rgbd_visual_odometry \
   --odom-topic /odom \
   --imu-frame-convention base_link \
   --imu-bias-calibration-s 0.0 \
-  --publish-rate-hz 15
+  --publish-rate-hz 30
 ```
 
 This consumes the filtered yaw IMU topic, which is already bias-corrected and expressed in `base_link`.

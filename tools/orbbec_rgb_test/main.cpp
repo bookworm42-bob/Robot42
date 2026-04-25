@@ -12,15 +12,20 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sstream>
 #include <iomanip>
 #include <stdexcept>
 #include <string>
+#include <sys/select.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <thread>
 #include <unistd.h>
+#include <utility>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -40,8 +45,14 @@ struct Options {
     bool latest_only = false;
     bool enable_depth = false;
     bool enable_imu = false;
+    bool no_file_output = false;
     std::string imu_udp_host = "127.0.0.1";
     int imu_udp_port = 8766;
+    bool camera_http_enable = false;
+    std::string camera_http_host = "127.0.0.1";
+    int camera_http_port = 8765;
+    std::string camera_http_path = "/camera/rgbd";
+    int camera_http_timeout_ms = 100;
 };
 
 struct LatestImuSample {
@@ -155,6 +166,244 @@ private:
     std::string last_error_message_;
 };
 
+void append_u32_be(std::vector<uint8_t> &buffer, uint32_t value) {
+    buffer.push_back(static_cast<uint8_t>((value >> 24) & 0xff));
+    buffer.push_back(static_cast<uint8_t>((value >> 16) & 0xff));
+    buffer.push_back(static_cast<uint8_t>((value >> 8) & 0xff));
+    buffer.push_back(static_cast<uint8_t>(value & 0xff));
+}
+
+void append_u64_be(std::vector<uint8_t> &buffer, uint64_t value) {
+    for(int shift = 56; shift >= 0; shift -= 8) {
+        buffer.push_back(static_cast<uint8_t>((value >> shift) & 0xff));
+    }
+}
+
+uint64_t unix_time_us() {
+    const auto now = std::chrono::system_clock::now().time_since_epoch();
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(now).count());
+}
+
+std::vector<uint8_t> depth_frame_to_big_endian_mm(const std::shared_ptr<ob::DepthFrame> &depth_frame) {
+    const auto width = depth_frame->getWidth();
+    const auto height = depth_frame->getHeight();
+    const auto pixel_count = static_cast<uint64_t>(width) * static_cast<uint64_t>(height);
+    const auto expected_size = pixel_count * sizeof(uint16_t);
+    if(depth_frame->getDataSize() < expected_size) {
+        throw std::runtime_error("Depth frame data is smaller than width * height * uint16");
+    }
+    const auto *raw = reinterpret_cast<const uint16_t *>(depth_frame->getData());
+    const float scale_to_mm = depth_frame->getValueScale();
+    std::vector<uint8_t> out;
+    out.reserve(static_cast<size_t>(pixel_count * 2));
+    for(uint64_t index = 0; index < pixel_count; ++index) {
+        const float scaled = static_cast<float>(raw[index]) * scale_to_mm;
+        const auto clamped = static_cast<uint16_t>(std::max(0.0f, std::min(65535.0f, scaled)));
+        out.push_back(static_cast<uint8_t>((clamped >> 8) & 0xff));
+        out.push_back(static_cast<uint8_t>(clamped & 0xff));
+    }
+    return out;
+}
+
+std::vector<uint8_t> build_rgbd_payload(
+    const std::shared_ptr<ob::ColorFrame> &rgb_frame,
+    const std::shared_ptr<ob::DepthFrame> &depth_frame,
+    uint64_t fallback_frame_index
+) {
+    const auto rgb_width = rgb_frame->getWidth();
+    const auto rgb_height = rgb_frame->getHeight();
+    const auto rgb_size = static_cast<uint64_t>(rgb_width) * static_cast<uint64_t>(rgb_height) * 3;
+    if(rgb_frame->getFormat() != OB_FORMAT_RGB) {
+        throw std::runtime_error("build_rgbd_payload received a non-RGB frame");
+    }
+    if(rgb_frame->getDataSize() < rgb_size) {
+        throw std::runtime_error("RGB frame data is smaller than width * height * 3");
+    }
+
+    std::vector<uint8_t> depth_payload;
+    uint32_t depth_width = 0;
+    uint32_t depth_height = 0;
+    if(depth_frame) {
+        depth_width = depth_frame->getWidth();
+        depth_height = depth_frame->getHeight();
+        depth_payload = depth_frame_to_big_endian_mm(depth_frame);
+    }
+
+    std::vector<uint8_t> payload;
+    payload.reserve(static_cast<size_t>(60 + rgb_size + depth_payload.size()));
+    const char magic[8] = {'X', 'L', 'R', 'G', 'B', 'D', '1', '\0'};
+    const uint64_t frame_index = rgb_frame->getIndex() > 0 ? rgb_frame->getIndex() : fallback_frame_index;
+    const uint64_t timestamp_us = rgb_frame->getSystemTimeStampUs() > 0
+        ? rgb_frame->getSystemTimeStampUs()
+        : unix_time_us();
+    payload.insert(payload.end(), magic, magic + 8);
+    append_u32_be(payload, 1);
+    append_u64_be(payload, frame_index);
+    append_u64_be(payload, timestamp_us);
+    append_u32_be(payload, rgb_width);
+    append_u32_be(payload, rgb_height);
+    append_u32_be(payload, depth_width);
+    append_u32_be(payload, depth_height);
+    append_u64_be(payload, rgb_size);
+    append_u64_be(payload, static_cast<uint64_t>(depth_payload.size()));
+    const auto *rgb_data = reinterpret_cast<const uint8_t *>(rgb_frame->getData());
+    payload.insert(payload.end(), rgb_data, rgb_data + rgb_size);
+    payload.insert(payload.end(), depth_payload.begin(), depth_payload.end());
+    return payload;
+}
+
+class CameraHttpPublisher {
+public:
+    CameraHttpPublisher(std::string host, int port, std::string path, int timeout_ms)
+        : host_(std::move(host)), port_(port), path_(std::move(path)), timeout_ms_(std::max(1, timeout_ms)) {
+        if(path_.empty() || path_[0] != '/') {
+            path_ = "/" + path_;
+        }
+    }
+
+    bool publish(const std::vector<uint8_t> &payload) {
+        last_error_message_.clear();
+        int socket_fd = connect_socket();
+        if(socket_fd < 0) {
+            return false;
+        }
+
+        std::ostringstream request;
+        request << "POST " << path_ << " HTTP/1.1\r\n"
+                << "Host: " << host_ << ":" << port_ << "\r\n"
+                << "Content-Type: application/octet-stream\r\n"
+                << "Content-Length: " << payload.size() << "\r\n"
+                << "Connection: close\r\n\r\n";
+        const std::string header = request.str();
+        bool ok = send_all(socket_fd, reinterpret_cast<const uint8_t *>(header.data()), header.size())
+            && send_all(socket_fd, payload.data(), payload.size());
+        if(ok) {
+            char response[128] = {};
+            const ssize_t received = ::recv(socket_fd, response, sizeof(response) - 1, 0);
+            if(received <= 0 || !is_success_response(response, static_cast<size_t>(received))) {
+                last_error_message_ = "camera HTTP POST did not receive a 2xx response";
+                ok = false;
+            }
+        }
+        ::close(socket_fd);
+        return ok;
+    }
+
+    const std::string &last_error_message() const {
+        return last_error_message_;
+    }
+
+private:
+    bool is_success_response(const char *response, size_t size) const {
+        const std::string response_text(response, size);
+        const size_t line_end = response_text.find("\r\n");
+        const std::string status_line = response_text.substr(0, line_end);
+        std::istringstream stream(status_line);
+        std::string version;
+        int status = 0;
+        stream >> version >> status;
+        return version.rfind("HTTP/", 0) == 0 && status >= 200 && status < 300;
+    }
+
+    int connect_socket() {
+        addrinfo hints{};
+        hints.ai_socktype = SOCK_STREAM;
+        hints.ai_family = AF_UNSPEC;
+        addrinfo *results = nullptr;
+        const std::string port_string = std::to_string(port_);
+        const int rc = ::getaddrinfo(host_.c_str(), port_string.c_str(), &hints, &results);
+        if(rc != 0) {
+            last_error_message_ = std::string("getaddrinfo failed: ") + gai_strerror(rc);
+            return -1;
+        }
+        int socket_fd = -1;
+        for(addrinfo *item = results; item != nullptr; item = item->ai_next) {
+            socket_fd = ::socket(item->ai_family, item->ai_socktype, item->ai_protocol);
+            if(socket_fd < 0) {
+                continue;
+            }
+            if(connect_with_timeout(socket_fd, item->ai_addr, item->ai_addrlen)) {
+                break;
+            }
+            ::close(socket_fd);
+            socket_fd = -1;
+        }
+        ::freeaddrinfo(results);
+        if(socket_fd < 0) {
+            last_error_message_ = "could not connect to camera HTTP endpoint";
+        }
+        return socket_fd;
+    }
+
+    bool connect_with_timeout(int socket_fd, const sockaddr *addr, socklen_t addr_len) {
+        const int flags = fcntl(socket_fd, F_GETFL, 0);
+        if(flags < 0 || fcntl(socket_fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+            last_error_message_ = "could not set camera HTTP socket non-blocking";
+            return false;
+        }
+        int rc = ::connect(socket_fd, addr, addr_len);
+        if(rc == 0) {
+            fcntl(socket_fd, F_SETFL, flags);
+            set_socket_timeout(socket_fd);
+            return true;
+        }
+        if(errno != EINPROGRESS) {
+            last_error_message_ = std::strerror(errno);
+            return false;
+        }
+        fd_set write_fds;
+        FD_ZERO(&write_fds);
+        FD_SET(socket_fd, &write_fds);
+        timeval timeout = timeout_value();
+        rc = ::select(socket_fd + 1, nullptr, &write_fds, nullptr, &timeout);
+        if(rc <= 0) {
+            last_error_message_ = rc == 0 ? "camera HTTP connect timed out" : std::strerror(errno);
+            return false;
+        }
+        int socket_error = 0;
+        socklen_t error_len = sizeof(socket_error);
+        if(::getsockopt(socket_fd, SOL_SOCKET, SO_ERROR, &socket_error, &error_len) < 0 || socket_error != 0) {
+            last_error_message_ = socket_error == 0 ? std::strerror(errno) : std::strerror(socket_error);
+            return false;
+        }
+        fcntl(socket_fd, F_SETFL, flags);
+        set_socket_timeout(socket_fd);
+        return true;
+    }
+
+    timeval timeout_value() const {
+        timeval timeout{};
+        timeout.tv_sec = timeout_ms_ / 1000;
+        timeout.tv_usec = (timeout_ms_ % 1000) * 1000;
+        return timeout;
+    }
+
+    void set_socket_timeout(int socket_fd) const {
+        timeval timeout = timeout_value();
+        ::setsockopt(socket_fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+        ::setsockopt(socket_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    }
+
+    bool send_all(int socket_fd, const uint8_t *data, size_t size) {
+        size_t sent_total = 0;
+        while(sent_total < size) {
+            const ssize_t sent = ::send(socket_fd, data + sent_total, size - sent_total, 0);
+            if(sent <= 0) {
+                last_error_message_ = std::strerror(errno);
+                return false;
+            }
+            sent_total += static_cast<size_t>(sent);
+        }
+        return true;
+    }
+
+    std::string host_;
+    int port_;
+    std::string path_;
+    int timeout_ms_;
+    std::string last_error_message_;
+};
+
 int parse_int(const std::string &value, const std::string &name) {
     try {
         size_t consumed = 0;
@@ -225,11 +474,29 @@ Options parse_args(int argc, char **argv) {
         else if(arg == "--enable-imu") {
             options.enable_imu = true;
         }
+        else if(arg == "--no-file-output") {
+            options.no_file_output = true;
+        }
         else if(arg == "--imu-udp-host") {
             options.imu_udp_host = require_value(arg);
         }
         else if(arg == "--imu-udp-port") {
             options.imu_udp_port = parse_int(require_value(arg), arg);
+        }
+        else if(arg == "--camera-http-enable") {
+            options.camera_http_enable = true;
+        }
+        else if(arg == "--camera-http-host") {
+            options.camera_http_host = require_value(arg);
+        }
+        else if(arg == "--camera-http-port") {
+            options.camera_http_port = parse_int(require_value(arg), arg);
+        }
+        else if(arg == "--camera-http-path") {
+            options.camera_http_path = require_value(arg);
+        }
+        else if(arg == "--camera-http-timeout-ms") {
+            options.camera_http_timeout_ms = parse_int(require_value(arg), arg);
         }
         else if(arg == "--help" || arg == "-h") {
             std::cout << "Usage: orbbec_rgb_test [--output-dir DIR] [--frames N]\n"
@@ -238,7 +505,10 @@ Options parse_args(int argc, char **argv) {
                       << "                       [--depth-width PX] [--depth-height PX] [--depth-fps FPS]\n"
                       << "                       [--log-every N] [--imu-log-every N]\n"
                       << "                       [--imu-udp-host HOST] [--imu-udp-port PORT]\n"
-                      << "                       [--latest-only] [--enable-depth] [--enable-imu]\n";
+                      << "                       [--camera-http-enable] [--camera-http-host HOST]\n"
+                      << "                       [--camera-http-port PORT] [--camera-http-path PATH]\n"
+                      << "                       [--camera-http-timeout-ms MS]\n"
+                      << "                       [--latest-only] [--no-file-output] [--enable-depth] [--enable-imu]\n";
             std::exit(EXIT_SUCCESS);
         }
         else {
@@ -263,6 +533,12 @@ Options parse_args(int argc, char **argv) {
     }
     if(options.imu_udp_port < 1 || options.imu_udp_port > 65535) {
         throw std::runtime_error("--imu-udp-port must be between 1 and 65535");
+    }
+    if(options.camera_http_port < 1 || options.camera_http_port > 65535) {
+        throw std::runtime_error("--camera-http-port must be between 1 and 65535");
+    }
+    if(options.camera_http_timeout_ms < 1) {
+        throw std::runtime_error("--camera-http-timeout-ms must be positive");
     }
     return options;
 }
@@ -423,7 +699,9 @@ void write_latest_metadata(
 
 int main(int argc, char **argv) try {
     const Options options = parse_args(argc, argv);
-    fs::create_directories(options.output_dir);
+    if(!options.no_file_output) {
+        fs::create_directories(options.output_dir);
+    }
 
     ob::Pipeline pipeline;
     auto config = std::make_shared<ob::Config>();
@@ -437,7 +715,9 @@ int main(int argc, char **argv) try {
     if(options.enable_depth) {
         const uint32_t depth_width = options.depth_width > 0 ? static_cast<uint32_t>(options.depth_width) : OB_WIDTH_ANY;
         const uint32_t depth_height = options.depth_height > 0 ? static_cast<uint32_t>(options.depth_height) : OB_HEIGHT_ANY;
-        const uint32_t depth_fps = options.depth_fps > 0 ? static_cast<uint32_t>(options.depth_fps) : OB_FPS_ANY;
+        const uint32_t depth_fps = options.depth_fps > 0
+            ? static_cast<uint32_t>(options.depth_fps)
+            : static_cast<uint32_t>(options.fps);
         config->enableVideoStream(
             OB_STREAM_DEPTH,
             depth_width,
@@ -458,7 +738,7 @@ int main(int argc, char **argv) try {
                   << "x"
                   << (options.depth_height > 0 ? std::to_string(options.depth_height) : "any")
                   << "@"
-                  << (options.depth_fps > 0 ? std::to_string(options.depth_fps) : "any")
+                  << (options.depth_fps > 0 ? std::to_string(options.depth_fps) : std::to_string(options.fps))
                   << " Y16\n";
     }
 
@@ -466,6 +746,7 @@ int main(int argc, char **argv) try {
 
     std::shared_ptr<ob::Pipeline> imu_pipeline = nullptr;
     std::unique_ptr<ImuDatagramPublisher> imu_publisher;
+    std::unique_ptr<CameraHttpPublisher> camera_publisher;
     std::mutex imu_mutex;
     LatestImuSample latest_imu_sample;
     bool imu_running = false;
@@ -551,6 +832,17 @@ int main(int argc, char **argv) try {
             std::cerr << "IMU stream unavailable: " << e.what() << "\n";
         }
     }
+    if(options.camera_http_enable) {
+        camera_publisher = std::make_unique<CameraHttpPublisher>(
+            options.camera_http_host,
+            options.camera_http_port,
+            options.camera_http_path,
+            options.camera_http_timeout_ms
+        );
+        std::cout << "Camera RGB-D HTTP publisher enabled: "
+                  << options.camera_http_host << ":" << options.camera_http_port
+                  << options.camera_http_path << "\n";
+    }
     pipeline.start(config);
 
     for(int i = 0; i < options.warmup_frames; ++i) {
@@ -585,19 +877,28 @@ int main(int argc, char **argv) try {
 
         ++captured;
         const auto latest_path = options.output_dir / "latest.ppm";
-        if(!options.latest_only) {
-            const auto numbered_path = options.output_dir / ("frame_" + std::to_string(captured) + ".ppm");
-            write_ppm_atomic(numbered_path, rgb_frame);
-        }
-        write_ppm_atomic(latest_path, rgb_frame);
-        if(depth_frame) {
-            const auto latest_depth_path = options.output_dir / "latest_depth.pgm";
+        if(!options.no_file_output) {
             if(!options.latest_only) {
-                const auto numbered_depth_path =
-                    options.output_dir / ("frame_" + std::to_string(captured) + "_depth.pgm");
-                write_depth_pgm_atomic(numbered_depth_path, depth_frame);
+                const auto numbered_path = options.output_dir / ("frame_" + std::to_string(captured) + ".ppm");
+                write_ppm_atomic(numbered_path, rgb_frame);
             }
-            write_depth_pgm_atomic(latest_depth_path, depth_frame);
+            write_ppm_atomic(latest_path, rgb_frame);
+            if(depth_frame) {
+                const auto latest_depth_path = options.output_dir / "latest_depth.pgm";
+                if(!options.latest_only) {
+                    const auto numbered_depth_path =
+                        options.output_dir / ("frame_" + std::to_string(captured) + "_depth.pgm");
+                    write_depth_pgm_atomic(numbered_depth_path, depth_frame);
+                }
+                write_depth_pgm_atomic(latest_depth_path, depth_frame);
+            }
+        }
+        if(camera_publisher) {
+            const auto payload = build_rgbd_payload(rgb_frame, depth_frame, static_cast<uint64_t>(captured));
+            if(!camera_publisher->publish(payload) && options.log_every > 0) {
+                std::cout << "WARNING: camera RGB-D HTTP publish failed: "
+                          << camera_publisher->last_error_message() << "\n";
+            }
         }
         LatestImuSample imu_snapshot;
         const LatestImuSample *imu_ptr = nullptr;
@@ -608,16 +909,20 @@ int main(int argc, char **argv) try {
                 imu_ptr = &imu_snapshot;
             }
         }
-        write_latest_metadata(options.output_dir / "latest.json", rgb_frame, depth_frame, imu_ptr, captured, source_format);
+        if(!options.no_file_output) {
+            write_latest_metadata(options.output_dir / "latest.json", rgb_frame, depth_frame, imu_ptr, captured, source_format);
+        }
 
         if(options.log_every > 0 && captured % options.log_every == 0) {
             std::cout << "Captured RGB frame " << captured
                       << " " << rgb_frame->getWidth() << "x" << rgb_frame->getHeight()
                       << " source=" << source_format
-                      << " saved=" << latest_path;
+                      << (options.no_file_output ? "" : (" saved=" + latest_path.string()));
             if(depth_frame) {
-                std::cout << " depth=" << depth_frame->getWidth() << "x" << depth_frame->getHeight()
-                          << " saved=" << (options.output_dir / "latest_depth.pgm");
+                std::cout << " depth=" << depth_frame->getWidth() << "x" << depth_frame->getHeight();
+                if(!options.no_file_output) {
+                    std::cout << " saved=" << (options.output_dir / "latest_depth.pgm");
+                }
             }
             std::cout << "\n";
         }

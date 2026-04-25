@@ -18,6 +18,7 @@ from xlerobot_playground.real_exploration_runtime import (
     RealXLeRobotDirectRuntime,
     RealXLeRobotRuntimeConfig,
 )
+from xlerobot_playground.rgbd_transport import depth_big_endian_bytes_to_rows, unpack_rgbd_frame
 
 try:
     import aiohttp
@@ -91,7 +92,7 @@ class RealRosBridgeConfig:
     camera_z_m: float = 0.35
     camera_yaw_rad: float = 0.0
     publish_head_camera: bool = True
-    publish_rate_hz: float = 10.0
+    publish_rate_hz: float = 30.0
     imu_publish_rate_hz: float = 200.0
     imu_ws_path: str = "/ws/imu"
     imu_ws_reconnect_delay_s: float = 1.0
@@ -114,6 +115,7 @@ class RgbdFrame:
     depth_height: int | None
     imu_sample: dict[str, Any] | None
     timestamp_s: float
+    frame_index: int | None = None
 
 
 class RgbdSource(Protocol):
@@ -371,6 +373,28 @@ class RobotBrainRgbdSource:
         self.client = client
 
     def capture(self) -> RgbdFrame:
+        try:
+            frame = unpack_rgbd_frame(self.client.get_bytes("/rgbd"))
+            depth = None
+            if frame.depth_be is not None and frame.depth_width is not None and frame.depth_height is not None:
+                depth = depth_big_endian_bytes_to_rows(
+                    frame.depth_be,
+                    width=frame.depth_width,
+                    height=frame.depth_height,
+                )
+            return RgbdFrame(
+                rgb=frame.rgb,
+                rgb_width=frame.rgb_width,
+                rgb_height=frame.rgb_height,
+                depth_mm=depth,
+                depth_width=frame.depth_width,
+                depth_height=frame.depth_height,
+                imu_sample=None,
+                timestamp_s=frame.timestamp_s,
+                frame_index=frame.frame_index,
+            )
+        except Exception:
+            pass
         rgb = None
         rgb_width = None
         rgb_height = None
@@ -965,7 +989,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--camera-z-m", type=float, default=0.35)
     parser.add_argument("--camera-yaw-rad", type=float, default=0.0)
     parser.add_argument("--publish-head-camera", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--publish-rate-hz", type=float, default=10.0)
+    parser.add_argument("--publish-rate-hz", type=float, default=30.0)
     parser.add_argument(
         "--imu-publish-rate-hz",
         type=float,

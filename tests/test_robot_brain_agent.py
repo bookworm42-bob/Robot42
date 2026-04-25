@@ -10,6 +10,7 @@ from xlerobot_playground.robot_brain_agent import (
     build_parser,
     config_from_args,
 )
+from xlerobot_playground.rgbd_transport import pack_rgbd_frame
 
 
 class FakeResult:
@@ -51,6 +52,8 @@ class RobotBrainAgentTests(unittest.TestCase):
         self.assertEqual(config.calibration_prompt_response, "")
         self.assertEqual(config.imu_udp_host, "127.0.0.1")
         self.assertEqual(config.imu_udp_port, 8766)
+        self.assertEqual(config.camera_max_frame_bytes, 16 * 1024 * 1024)
+        self.assertEqual(config.camera_log_every, 30)
 
     def test_parser_accepts_debug_motion(self) -> None:
         args = build_parser().parse_args(["--debug-motion"])
@@ -103,6 +106,33 @@ class RobotBrainAgentTests(unittest.TestCase):
         self.assertEqual(stats["received_count"], 1)
         self.assertEqual(stats["latest_timestamp_s"], 1.25)
         self.assertIsNotNone(stats["age_s"])
+
+    def test_agent_keeps_latest_rgbd_in_memory(self) -> None:
+        agent = RobotBrainAgent(RobotBrainAgentConfig(), runtime=FakeRuntime())
+
+        frame = agent.ingest_rgbd_payload(
+            pack_rgbd_frame(
+                frame_index=3,
+                timestamp_us=2_500_000,
+                rgb=b"abc",
+                rgb_width=1,
+                rgb_height=1,
+                depth_be=(1234).to_bytes(2, "big"),
+                depth_width=1,
+                depth_height=1,
+            )
+        )
+
+        self.assertEqual(frame.frame_index, 3)
+        self.assertEqual(agent.rgbd_stream.rgb_ppm(), b"P6\n1 1\n255\nabc")
+        self.assertEqual(agent.rgbd_stream.depth_pgm(), b"P5\n1 1\n65535\n" + (1234).to_bytes(2, "big"))
+        self.assertIn(b'"frame_index": 3', agent.rgbd_stream.metadata_json())
+        stats = agent.rgbd_stream.stats()
+        self.assertTrue(stats["ready"])
+        self.assertEqual(stats["received_count"], 1)
+        self.assertEqual(stats["frame_index"], 3)
+        self.assertEqual(stats["rgb"], {"width": 1, "height": 1})
+        self.assertEqual(stats["depth"], {"width": 1, "height": 1})
 
 
 if __name__ == "__main__":

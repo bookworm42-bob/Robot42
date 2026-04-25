@@ -34,23 +34,7 @@ Do not start the moving smoke test until `/camera/head/camera_info`, `/odom`, an
 
 ## Robot Brain
 
-### Terminal RB-1: Orbbec RGB-D Sidecar
-
-```bash
-cd /home/alin/Robot42
-
-cmake -S tools/orbbec_rgb_test -B build/orbbec_rgb_test -DORBBEC_SDK_ROOT="$HOME/orbbec/sdk"
-cmake --build build/orbbec_rgb_test
-
-./build/orbbec_rgb_test/orbbec_rgb_test \
-  --frames 0 \
-  --latest-only \
-  --enable-depth \
-  --enable-imu \
-  --output-dir artifacts/orbbec_rgbd
-```
-
-### Terminal RB-2: Robot Brain Agent
+### Terminal RB-1: Robot Brain Agent
 
 Keep the robot wheels raised for the first run.
 
@@ -60,8 +44,28 @@ cd /home/alin/Robot42
 python -m xlerobot_playground.robot_brain_agent \
   --allow-motion-commands \
   --max-linear-m-s 0.03 \
-  --max-angular-rad-s 0.10 \
-  --orbbec-output-dir artifacts/orbbec_rgbd
+  --max-angular-rad-s 0.10
+```
+
+### Terminal RB-2: Orbbec RGB-D Sidecar
+
+```bash
+cd /home/alin/Robot42
+
+cmake -S tools/orbbec_rgb_test -B build/orbbec_rgb_test -DORBBEC_SDK_ROOT="$HOME/orbbec/sdk"
+cmake --build build/orbbec_rgb_test
+
+./build/orbbec_rgb_test/orbbec_rgb_test \
+  --frames 0 \
+  --no-file-output \
+  --enable-depth \
+  --enable-imu \
+  --imu-udp-host 127.0.0.1 \
+  --imu-udp-port 8766 \
+  --camera-http-enable \
+  --camera-http-host 127.0.0.1 \
+  --camera-http-port 8765 \
+  --camera-http-path /camera/rgbd
 ```
 
 Check the robot brain locally:
@@ -109,10 +113,11 @@ First verify the offload computer can fetch camera data from the robot brain:
 
 ```bash
 curl --max-time 3 http://ROBOT_BRAIN_IP:8765/health
+curl --max-time 3 http://ROBOT_BRAIN_IP:8765/rgbd --output /tmp/xlerobot_rgbd.bin
 curl --max-time 3 http://ROBOT_BRAIN_IP:8765/rgb --output /tmp/xlerobot_rgb.ppm
 curl --max-time 3 http://ROBOT_BRAIN_IP:8765/depth --output /tmp/xlerobot_depth.pgm
 curl --max-time 3 http://ROBOT_BRAIN_IP:8765/imu
-ls -lh /tmp/xlerobot_rgb.ppm /tmp/xlerobot_depth.pgm
+ls -lh /tmp/xlerobot_rgbd.bin /tmp/xlerobot_rgb.ppm /tmp/xlerobot_depth.pgm
 ```
 
 Then start the bridge:
@@ -123,7 +128,7 @@ source /opt/ros/humble/setup.bash
 
 python -m xlerobot_playground.real_ros_bridge \
   --robot-brain-url http://ROBOT_BRAIN_IP:8765 \
-  --publish-rate-hz 10 \
+  --publish-rate-hz 30 \
   --camera-x-m 0.0 \
   --camera-y-m 0.0 \
   --camera-z-m 0.35 \
@@ -182,7 +187,7 @@ python -m xlerobot_playground.rgbd_visual_odometry \
   --odom-topic /odom \
   --imu-frame-convention base_link \
   --imu-bias-calibration-s 0.0 \
-  --publish-rate-hz 15
+  --publish-rate-hz 30
 ```
 
 This consumes the filtered yaw IMU topic, which is already bias-corrected and expressed in `base_link`.
