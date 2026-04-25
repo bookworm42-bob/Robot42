@@ -72,7 +72,7 @@ cd /Users/alin/Robot42
 cmake -S tools/orbbec_rgb_test -B build/orbbec_rgb_test -DORBBEC_SDK_ROOT="$HOME/orbbec/sdk"
 cmake --build build/orbbec_rgb_test
 
-./build/orbbec_rgb_test/orbbec_rgb_test \
+sudo ./build/orbbec_rgb_test/orbbec_rgb_test \
   --frames 0 \
   --no-file-output \
   --enable-depth \

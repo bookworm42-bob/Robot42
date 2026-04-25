@@ -19,6 +19,7 @@ from xlerobot_playground.real_ros_bridge import (
     parse_depth_pgm_mm,
     parse_rgb_ppm,
     read_depth_pgm_mm,
+    synthesize_scan_from_depth_be,
     synthesize_scan_from_depth_rows,
     twist_to_base_velocity,
     yaw_to_quaternion_xyzw,
@@ -269,11 +270,39 @@ class RealRosBridgeTests(unittest.TestCase):
 
         self.assertEqual(frame.rgb, b"abc")
         self.assertEqual(frame.rgb_width, 1)
-        self.assertEqual(frame.depth_mm, ((1234,),))
+        self.assertIsNone(frame.depth_mm)
+        self.assertEqual(frame.depth_be, (1234).to_bytes(2, "big"))
         self.assertEqual(frame.depth_width, 1)
         self.assertEqual(frame.frame_index, 7)
         self.assertAlmostEqual(frame.timestamp_s, 1.25)
         self.assertEqual(client.requested_paths, ["/rgbd"])
+
+    def test_synthesize_scan_from_depth_be_matches_row_path(self) -> None:
+        rows = (
+            (1000, 0, 2000),
+            (1500, 1200, 0),
+            (0, 1800, 2500),
+        )
+        depth_be = b"".join(value.to_bytes(2, "big") for row in rows for value in row)
+
+        from_rows = synthesize_scan_from_depth_rows(
+            rows,
+            horizontal_fov_rad=1.0,
+            band_height_px=2,
+            range_min_m=0.05,
+            range_max_m=6.0,
+        )
+        from_bytes = synthesize_scan_from_depth_be(
+            depth_be,
+            width=3,
+            height=3,
+            horizontal_fov_rad=1.0,
+            band_height_px=2,
+            range_min_m=0.05,
+            range_max_m=6.0,
+        )
+
+        self.assertEqual(from_bytes, from_rows)
 
 
 if __name__ == "__main__":

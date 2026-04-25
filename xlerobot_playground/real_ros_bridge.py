@@ -18,7 +18,7 @@ from xlerobot_playground.real_exploration_runtime import (
     RealXLeRobotDirectRuntime,
     RealXLeRobotRuntimeConfig,
 )
-from xlerobot_playground.rgbd_transport import depth_big_endian_bytes_to_rows, unpack_rgbd_frame
+from xlerobot_playground.rgbd_transport import unpack_rgbd_frame
 
 try:
     import aiohttp
@@ -116,6 +116,7 @@ class RgbdFrame:
     imu_sample: dict[str, Any] | None
     timestamp_s: float
     frame_index: int | None = None
+    depth_be: bytes | None = None
 
 
 class RgbdSource(Protocol):
@@ -208,6 +209,57 @@ def synthesize_scan_from_depth_rows(
             if not math.isfinite(raw_depth) or raw_depth <= 0.0:
                 continue
             planar_range_m = (raw_depth / 1000.0) / max(math.cos(image_angle), 1e-3)
+            if range_min_m <= planar_range_m <= range_max_m:
+                best = min(best, planar_range_m)
+        scan_index = width - 1 - column
+        ranges[scan_index] = best
+    if fill_no_return:
+        ranges = [range_max_m if math.isinf(value) else value for value in ranges]
+    if width == 1:
+        angles = [0.0]
+    else:
+        angles = [
+            -horizontal_fov_rad / 2.0 + (horizontal_fov_rad * index / (width - 1))
+            for index in range(width)
+        ]
+    return tuple(float(value) for value in ranges), tuple(float(value) for value in angles)
+
+
+def synthesize_scan_from_depth_be(
+    depth_be: bytes,
+    *,
+    width: int,
+    height: int,
+    horizontal_fov_rad: float,
+    band_height_px: int,
+    range_min_m: float,
+    range_max_m: float,
+    fill_no_return: bool = True,
+) -> tuple[tuple[float, ...], tuple[float, ...]]:
+    if width <= 0 or height <= 0:
+        raise ValueError("Expected a non-empty depth image.")
+    expected_size = width * height * 2
+    if len(depth_be) < expected_size:
+        raise ValueError(f"Depth payload is truncated: expected {expected_size} bytes, got {len(depth_be)}.")
+
+    band_half = max(1, int(band_height_px) // 2)
+    center = height // 2
+    row_start = max(0, center - band_half)
+    row_stop = min(height, center + band_half)
+    fx = width / (2.0 * math.tan(horizontal_fov_rad / 2.0))
+    cx = width / 2.0
+    payload = memoryview(depth_be)
+    ranges = [math.inf for _ in range(width)]
+    for column in range(width):
+        image_angle = -math.atan2((column - cx) / max(fx, 1e-6), 1.0)
+        cos_angle = max(math.cos(image_angle), 1e-3)
+        best = math.inf
+        for row in range(row_start, row_stop):
+            offset = (row * width + column) * 2
+            raw_depth = int.from_bytes(payload[offset : offset + 2], "big")
+            if raw_depth <= 0:
+                continue
+            planar_range_m = (float(raw_depth) / 1000.0) / cos_angle
             if range_min_m <= planar_range_m <= range_max_m:
                 best = min(best, planar_range_m)
         scan_index = width - 1 - column
@@ -375,23 +427,17 @@ class RobotBrainRgbdSource:
     def capture(self) -> RgbdFrame:
         try:
             frame = unpack_rgbd_frame(self.client.get_bytes("/rgbd"))
-            depth = None
-            if frame.depth_be is not None and frame.depth_width is not None and frame.depth_height is not None:
-                depth = depth_big_endian_bytes_to_rows(
-                    frame.depth_be,
-                    width=frame.depth_width,
-                    height=frame.depth_height,
-                )
             return RgbdFrame(
                 rgb=frame.rgb,
                 rgb_width=frame.rgb_width,
                 rgb_height=frame.rgb_height,
-                depth_mm=depth,
+                depth_mm=None,
                 depth_width=frame.depth_width,
                 depth_height=frame.depth_height,
                 imu_sample=None,
                 timestamp_s=frame.timestamp_s,
                 frame_index=frame.frame_index,
+                depth_be=frame.depth_be,
             )
         except Exception:
             pass
@@ -835,16 +881,28 @@ class RealXLeRobotRosBridge(Node):
         self.imu_publisher.publish(msg)
 
     def _publish_scan(self, *, frame: RgbdFrame, stamp: Any) -> None:
-        if frame.depth_mm is None:
+        if frame.depth_be is not None and frame.depth_width is not None and frame.depth_height is not None:
+            ranges, angles = synthesize_scan_from_depth_be(
+                frame.depth_be,
+                width=int(frame.depth_width),
+                height=int(frame.depth_height),
+                horizontal_fov_rad=self.config.orbbec.horizontal_fov_rad,
+                band_height_px=self.config.scan_band_height_px,
+                range_min_m=self.config.laser_min_range_m,
+                range_max_m=self.config.laser_max_range_m,
+                fill_no_return=self.config.laser_fill_no_return,
+            )
+        elif frame.depth_mm is not None:
+            ranges, angles = synthesize_scan_from_depth_rows(
+                frame.depth_mm,
+                horizontal_fov_rad=self.config.orbbec.horizontal_fov_rad,
+                band_height_px=self.config.scan_band_height_px,
+                range_min_m=self.config.laser_min_range_m,
+                range_max_m=self.config.laser_max_range_m,
+                fill_no_return=self.config.laser_fill_no_return,
+            )
+        else:
             return
-        ranges, angles = synthesize_scan_from_depth_rows(
-            frame.depth_mm,
-            horizontal_fov_rad=self.config.orbbec.horizontal_fov_rad,
-            band_height_px=self.config.scan_band_height_px,
-            range_min_m=self.config.laser_min_range_m,
-            range_max_m=self.config.laser_max_range_m,
-            fill_no_return=self.config.laser_fill_no_return,
-        )
         msg = LaserScan()
         msg.header.stamp = stamp
         msg.header.frame_id = self.config.head_laser_frame
@@ -872,7 +930,18 @@ class RealXLeRobotRosBridge(Node):
             rgb_msg.step = int(frame.rgb_width) * 3
             rgb_msg.data = frame.rgb
             self.head_rgb_publisher.publish(rgb_msg)
-        if frame.depth_mm is not None and frame.depth_width is not None and frame.depth_height is not None:
+        if frame.depth_be is not None and frame.depth_width is not None and frame.depth_height is not None:
+            depth_msg = Image()
+            depth_msg.header.stamp = stamp
+            depth_msg.header.frame_id = self.config.head_camera_frame
+            depth_msg.height = int(frame.depth_height)
+            depth_msg.width = int(frame.depth_width)
+            depth_msg.encoding = "mono16"
+            depth_msg.is_bigendian = True
+            depth_msg.step = int(frame.depth_width) * 2
+            depth_msg.data = frame.depth_be
+            self.head_depth_publisher.publish(depth_msg)
+        elif frame.depth_mm is not None and frame.depth_width is not None and frame.depth_height is not None:
             depth_msg = Image()
             depth_msg.header.stamp = stamp
             depth_msg.header.frame_id = self.config.head_camera_frame
