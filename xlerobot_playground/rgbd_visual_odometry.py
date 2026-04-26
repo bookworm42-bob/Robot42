@@ -25,6 +25,7 @@ try:
     from nav_msgs.msg import Odometry
     from rclpy.node import Node
     from sensor_msgs.msg import CameraInfo, Image, Imu
+    from std_msgs.msg import Float32
     from tf2_ros import TransformBroadcaster
 except Exception as exc:  # pragma: no cover - runtime guard.
     IMPORT_ERROR = exc
@@ -36,6 +37,7 @@ except Exception as exc:  # pragma: no cover - runtime guard.
     CameraInfo = None
     Image = None
     Imu = None
+    Float32 = None
     TransformBroadcaster = None
 
 
@@ -57,6 +59,7 @@ class RgbdVoConfig:
     odom_frame: str = "odom"
     base_frame: str = "base_link"
     camera_frame: str = "head_camera_link"
+    camera_pitch_topic: str = "/camera/head/pitch_rad"
     publish_rate_hz: float = 30.0
     min_depth_m: float = 0.15
     max_depth_m: float = 4.0
@@ -72,6 +75,7 @@ class RgbdVoConfig:
     camera_x_m: float = 0.0
     camera_y_m: float = 0.0
     camera_yaw_rad: float = 0.0
+    camera_pitch_rad: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -113,6 +117,9 @@ class VisualOdomFrame:
 @dataclass(frozen=True)
 class VisualOdomEstimate:
     translation_m: float
+    camera_translation_x_m: float
+    camera_translation_y_m: float
+    camera_translation_z_m: float
     yaw_rad: float
     matches: int
     inliers: int
@@ -171,6 +178,18 @@ def compose_planar_local(pose: PlanarPose, *, delta_x_m: float, delta_y_m: float
         y=pose.y + world_dy,
         yaw=angle_wrap(pose.yaw + delta_yaw_rad),
     )
+
+
+def camera_optical_translation_to_base_planar(
+    *,
+    camera_x_m: float,
+    camera_y_m: float,
+    camera_z_m: float,
+    pitch_rad: float,
+) -> tuple[float, float]:
+    base_forward_m = camera_z_m * math.cos(pitch_rad) - camera_y_m * math.sin(pitch_rad)
+    base_left_m = -camera_x_m
+    return base_forward_m, base_left_m
 
 
 def stamp_to_seconds(stamp: Any) -> float:
@@ -331,6 +350,9 @@ class FeatureRgbdOdometry:
             )
         return VisualOdomEstimate(
             translation_m=camera_forward_m,
+            camera_translation_x_m=float(prev_t_curr[0]),
+            camera_translation_y_m=float(prev_t_curr[1]),
+            camera_translation_z_m=float(prev_t_curr[2]),
             yaw_rad=camera_yaw_rad,
             matches=len(matches),
             inliers=inlier_count,
@@ -349,6 +371,7 @@ class RgbdVisualOdometryNode(Node):
         self.latest_depth: Any | None = None
         self.latest_imu: Any | None = None
         self.intrinsics: CameraIntrinsics | None = None
+        self.camera_pitch_rad = float(config.camera_pitch_rad)
         self.previous_frame: VisualOdomFrame | None = None
         self.pose = PlanarPose(0.0, 0.0, 0.0)
         self.planar_velocity_x_m_s = 0.0
@@ -376,12 +399,13 @@ class RgbdVisualOdometryNode(Node):
         self.create_subscription(Image, config.rgb_topic, self._on_rgb, 10)
         self.create_subscription(Image, config.depth_topic, self._on_depth, 10)
         self.create_subscription(CameraInfo, config.camera_info_topic, self._on_camera_info, 10)
+        self.create_subscription(Float32, config.camera_pitch_topic, self._on_camera_pitch, 10)
         self.create_subscription(Imu, config.imu_topic, self._on_imu, 50)
         self.create_timer(1.0 / max(config.publish_rate_hz, 1e-6), self.step)
         self.get_logger().info(
             "RGB-D visual odometry ready: "
             f"rgb={config.rgb_topic} depth={config.depth_topic} camera_info={config.camera_info_topic} "
-            f"imu={config.imu_topic} odom={config.odom_topic}"
+            f"camera_pitch={config.camera_pitch_topic} imu={config.imu_topic} odom={config.odom_topic}"
         )
 
     def _record_estimate(self, estimate: VisualOdomEstimate) -> None:
@@ -497,6 +521,9 @@ class RgbdVisualOdometryNode(Node):
 
     def _on_camera_info(self, message: Any) -> None:
         self.intrinsics = intrinsics_from_camera_info(message)
+
+    def _on_camera_pitch(self, message: Any) -> None:
+        self.camera_pitch_rad = float(message.data)
 
     def _on_imu(self, message: Any) -> None:
         self.latest_imu = message
@@ -615,15 +642,21 @@ class RgbdVisualOdometryNode(Node):
                             imu_yaw_rad = predicted_yaw_rad
                         else:
                             imu_yaw_rad = 0.0
+                        base_forward_m, base_left_m = camera_optical_translation_to_base_planar(
+                            camera_x_m=estimate.camera_translation_x_m,
+                            camera_y_m=estimate.camera_translation_y_m,
+                            camera_z_m=estimate.camera_translation_z_m,
+                            pitch_rad=self.camera_pitch_rad,
+                        )
                         self.pose = compose_planar_local(
                             self.pose,
-                            delta_x_m=estimate.translation_m,
-                            delta_y_m=0.0,
+                            delta_x_m=base_forward_m,
+                            delta_y_m=base_left_m,
                             delta_yaw_rad=imu_yaw_rad,
                         )
                         dt = max(stamp_s - stamp_to_seconds(self.previous_frame.stamp), 1e-6)
-                        self.planar_velocity_x_m_s = estimate.translation_m / dt
-                        self.planar_velocity_y_m_s = 0.0
+                        self.planar_velocity_x_m_s = base_forward_m / dt
+                        self.planar_velocity_y_m_s = base_left_m / dt
                         self.accepted_updates += 1
                         self._record_estimate(estimate)
                         self.previous_frame = frame
@@ -714,6 +747,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--odom-frame", default="odom")
     parser.add_argument("--base-frame", default="base_link")
     parser.add_argument("--camera-frame", default="head_camera_link")
+    parser.add_argument("--camera-pitch-topic", default="/camera/head/pitch_rad")
     parser.add_argument("--publish-rate-hz", type=float, default=30.0)
     parser.add_argument("--min-depth-m", type=float, default=0.15)
     parser.add_argument("--max-depth-m", type=float, default=4.0)
@@ -739,6 +773,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--camera-x-m", type=float, default=0.0)
     parser.add_argument("--camera-y-m", type=float, default=0.0)
     parser.add_argument("--camera-yaw-rad", type=float, default=0.0)
+    parser.add_argument("--camera-pitch-rad", type=float, default=0.0)
+    parser.add_argument("--camera-pitch-deg", type=float, default=None)
     return parser
 
 
@@ -752,6 +788,7 @@ def config_from_args(args: argparse.Namespace) -> RgbdVoConfig:
         odom_frame=args.odom_frame,
         base_frame=args.base_frame,
         camera_frame=args.camera_frame,
+        camera_pitch_topic=args.camera_pitch_topic,
         publish_rate_hz=args.publish_rate_hz,
         min_depth_m=args.min_depth_m,
         max_depth_m=args.max_depth_m,
@@ -767,6 +804,9 @@ def config_from_args(args: argparse.Namespace) -> RgbdVoConfig:
         camera_x_m=args.camera_x_m,
         camera_y_m=args.camera_y_m,
         camera_yaw_rad=args.camera_yaw_rad,
+        camera_pitch_rad=(
+            args.camera_pitch_rad if args.camera_pitch_deg is None else math.radians(args.camera_pitch_deg)
+        ),
     )
 
 

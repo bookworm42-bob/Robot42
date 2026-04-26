@@ -4,6 +4,7 @@ import argparse
 import asyncio
 from dataclasses import dataclass
 import json
+import math
 from pathlib import Path
 import threading
 import time
@@ -56,6 +57,10 @@ class RobotBrainAgentConfig:
     imu_log_every: int = 200
     camera_max_frame_bytes: int = 16 * 1024 * 1024
     camera_log_every: int = 30
+    initial_camera_pitch_rad: float = 0.0
+    camera_pitch_action_key: str | None = None
+    camera_pitch_action_units: str = "deg"
+    camera_pitch_settle_s: float = 2.0
 
 
 class ImuStreamState:
@@ -239,6 +244,9 @@ class RobotBrainAgent:
             log_every=config.imu_log_every,
         )
         self.rgbd_stream = RgbdStreamState(log_every=config.camera_log_every)
+        self._camera_state_lock = threading.Lock()
+        self._camera_pitch_rad = float(config.initial_camera_pitch_rad)
+        self._camera_pitch_updated_s = time.time()
 
     def velocity(self, *, linear_m_s: float, angular_rad_s: float) -> dict[str, Any]:
         if self.config.debug_motion:
@@ -281,6 +289,63 @@ class RobotBrainAgent:
 
     def imu_snapshot(self) -> dict[str, Any] | None:
         return self.imu_stream.latest_sample
+
+    def camera_state(self) -> dict[str, Any]:
+        with self._camera_state_lock:
+            return {
+                "pitch_rad": self._camera_pitch_rad,
+                "pitch_deg": self._camera_pitch_rad * 180.0 / math.pi,
+                "updated_s": self._camera_pitch_updated_s,
+            }
+
+    def update_camera_state(self, *, pitch_rad: float) -> dict[str, Any]:
+        with self._camera_state_lock:
+            self._camera_pitch_rad = float(pitch_rad)
+            self._camera_pitch_updated_s = time.time()
+            return {
+                "pitch_rad": self._camera_pitch_rad,
+                "pitch_deg": self._camera_pitch_rad * 180.0 / math.pi,
+                "updated_s": self._camera_pitch_updated_s,
+            }
+
+    def pitch_camera(
+        self,
+        *,
+        pitch_rad: float,
+        action_key: str | None = None,
+        settle_s: float | None = None,
+    ) -> dict[str, Any]:
+        if not self.config.allow_motion_commands:
+            return {
+                "succeeded": False,
+                "message": "Real camera pitch commands are disabled. Set --allow-motion-commands after hardware checks.",
+                "metadata": {"requested_pitch_rad": float(pitch_rad)},
+            }
+        resolved_action_key = action_key or self.config.camera_pitch_action_key
+        if not resolved_action_key:
+            return {
+                "succeeded": False,
+                "message": "No camera pitch action key configured. Set --camera-pitch-action-key or pass action_key.",
+                "metadata": {"requested_pitch_rad": float(pitch_rad)},
+            }
+        pitch_deg = float(pitch_rad) * 180.0 / math.pi
+        units = str(self.config.camera_pitch_action_units).strip().lower()
+        action_value = pitch_deg if units == "deg" else float(pitch_rad)
+        action = {resolved_action_key: action_value}
+        with self._motion_lock:
+            self.runtime.connect()
+            sent = self.runtime.robot.send_action(action)
+            time.sleep(max(0.0, self.config.camera_pitch_settle_s if settle_s is None else float(settle_s)))
+        state = self.update_camera_state(pitch_rad=pitch_rad)
+        return {
+            "succeeded": True,
+            "message": "Camera pitch command sent and state updated.",
+            "metadata": {
+                "requested_action": action,
+                "sent_action": sent,
+                "camera": state,
+            },
+        }
 
     def close(self) -> None:
         with self._motion_lock:
@@ -357,6 +422,7 @@ async def _handle_health(_request: web.Request) -> web.Response:
             "imu_ws_path": "/ws/imu",
             "imu": agent.imu_stream.stats(),
             "rgbd": agent.rgbd_stream.stats(),
+            "camera": agent.camera_state(),
         }
     )
 
@@ -395,6 +461,44 @@ async def _handle_imu_snapshot(request: web.Request) -> web.Response:
     if agent.imu_stream.latest_json is None:
         raise web.HTTPNotFound(text="IMU sample not ready")
     return web.Response(body=agent.imu_stream.latest_json.encode("utf-8"), content_type="application/json")
+
+
+async def _handle_camera_head_pose_get(request: web.Request) -> web.Response:
+    agent: RobotBrainAgent = request.app["agent"]
+    return web.json_response(agent.camera_state())
+
+
+async def _handle_camera_head_pose_post(request: web.Request) -> web.Response:
+    agent: RobotBrainAgent = request.app["agent"]
+    raw = await request.read() if request.can_read_body else b""
+    payload = json.loads(raw.decode("utf-8")) if raw else {}
+    if "pitch_rad" in payload:
+        pitch_rad = float(payload["pitch_rad"])
+    elif "pitch_deg" in payload:
+        pitch_rad = float(payload["pitch_deg"]) * math.pi / 180.0
+    else:
+        raise web.HTTPBadRequest(text="Expected pitch_rad or pitch_deg.")
+    return web.json_response(agent.update_camera_state(pitch_rad=pitch_rad))
+
+
+async def _handle_camera_head_pitch(request: web.Request) -> web.Response:
+    agent: RobotBrainAgent = request.app["agent"]
+    raw = await request.read() if request.can_read_body else b""
+    payload = json.loads(raw.decode("utf-8")) if raw else {}
+    if "pitch_rad" in payload:
+        pitch_rad = float(payload["pitch_rad"])
+    elif "pitch_deg" in payload:
+        pitch_rad = float(payload["pitch_deg"]) * math.pi / 180.0
+    else:
+        raise web.HTTPBadRequest(text="Expected pitch_rad or pitch_deg.")
+    response = await asyncio.to_thread(
+        agent.pitch_camera,
+        pitch_rad=pitch_rad,
+        action_key=payload.get("action_key"),
+        settle_s=payload.get("settle_s"),
+    )
+    status = 200 if response.get("succeeded") else 400
+    return web.json_response(response, status=status)
 
 
 async def _handle_cmd_vel(request: web.Request) -> web.Response:
@@ -483,6 +587,9 @@ def build_app(agent: RobotBrainAgent) -> web.Application:
     app.router.add_get("/metadata", _handle_static_file)
     app.router.add_post("/camera/rgbd", _handle_rgbd_ingest)
     app.router.add_get("/imu", _handle_imu_snapshot)
+    app.router.add_get("/camera/head/pose", _handle_camera_head_pose_get)
+    app.router.add_post("/camera/head/pose", _handle_camera_head_pose_post)
+    app.router.add_post("/camera/head/pitch", _handle_camera_head_pitch)
     app.router.add_get("/ws/imu", _handle_imu_websocket)
     app.router.add_post("/cmd_vel", _handle_cmd_vel)
     app.router.add_post("/stop", _handle_stop)
@@ -525,6 +632,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--imu-log-every", type=int, default=200)
     parser.add_argument("--camera-max-frame-bytes", type=int, default=16 * 1024 * 1024)
     parser.add_argument("--camera-log-every", type=int, default=30)
+    parser.add_argument("--initial-camera-pitch-rad", type=float, default=0.0)
+    parser.add_argument("--initial-camera-pitch-deg", type=float, default=None)
+    parser.add_argument(
+        "--camera-pitch-action-key",
+        default=None,
+        help="Robot send_action key used for absolute head/camera pitch, for example a head tilt joint position key.",
+    )
+    parser.add_argument("--camera-pitch-action-units", choices=("deg", "rad"), default="deg")
+    parser.add_argument("--camera-pitch-settle-s", type=float, default=2.0)
     return parser
 
 
@@ -552,6 +668,14 @@ def config_from_args(args: argparse.Namespace) -> RobotBrainAgentConfig:
         imu_log_every=args.imu_log_every,
         camera_max_frame_bytes=args.camera_max_frame_bytes,
         camera_log_every=args.camera_log_every,
+        initial_camera_pitch_rad=(
+            args.initial_camera_pitch_rad
+            if args.initial_camera_pitch_deg is None
+            else args.initial_camera_pitch_deg * math.pi / 180.0
+        ),
+        camera_pitch_action_key=args.camera_pitch_action_key,
+        camera_pitch_action_units=args.camera_pitch_action_units,
+        camera_pitch_settle_s=args.camera_pitch_settle_s,
     )
 
 

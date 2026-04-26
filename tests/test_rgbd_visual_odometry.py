@@ -8,6 +8,7 @@ from xlerobot_playground.rgbd_visual_odometry import (
     RgbdVisualOdometryNode,
     angle_wrap,
     build_parser,
+    camera_optical_translation_to_base_planar,
     compose_planar,
     config_from_args,
     yaw_from_quaternion_xyzw,
@@ -48,6 +49,27 @@ class RgbdVisualOdometryHelperTests(unittest.TestCase):
 
     def test_angle_wrap(self) -> None:
         self.assertAlmostEqual(angle_wrap(math.radians(181.0)), math.radians(-179.0))
+
+    def test_camera_pitch_projects_optical_translation_to_base(self) -> None:
+        forward, left = camera_optical_translation_to_base_planar(
+            camera_x_m=0.0,
+            camera_y_m=0.0,
+            camera_z_m=1.0,
+            pitch_rad=math.radians(30.0),
+        )
+
+        self.assertAlmostEqual(forward, math.cos(math.radians(30.0)))
+        self.assertAlmostEqual(left, 0.0)
+
+        forward, left = camera_optical_translation_to_base_planar(
+            camera_x_m=0.1,
+            camera_y_m=0.2,
+            camera_z_m=1.0,
+            pitch_rad=0.0,
+        )
+
+        self.assertAlmostEqual(forward, 1.0)
+        self.assertAlmostEqual(left, -0.1)
 
     def test_imu_arrival_age_is_independent_of_header_stamp(self) -> None:
         class _ClockTime:

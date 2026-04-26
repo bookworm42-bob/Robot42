@@ -57,6 +57,14 @@ python -m xlerobot_playground.robot_brain_agent \
   --max-angular-rad-s 0.10
 ```
 
+If you want the robot brain to physically command the head/camera pitch for the pitched-camera test, also pass the real action key used by the robot runtime:
+
+```bash
+  --camera-pitch-action-key <REAL_CAMERA_PITCH_ACTION_KEY> \
+  --camera-pitch-action-units deg \
+  --camera-pitch-settle-s 2.0
+```
+
 Expected:
 
 - Logs show the HTTP agent is ready on port `8765`.
@@ -255,6 +263,8 @@ python -m xlerobot_playground.rgbd_visual_odometry \
   --publish-rate-hz 30 \
   --min-translation-update-m 0.01
 ```
+
+The VO node subscribes to `/camera/head/pitch_rad` by default. Keep that default for the pitched-camera test unless you intentionally changed the bridge topic.
 
 In another terminal:
 
@@ -463,7 +473,91 @@ Pass criteria:
 
 If the robot physically travels much less or much more than `/odom`, the odometry scale or RGB-D alignment is wrong.
 
-## Test 5: Square Path Consistency
+## Test 5: Pitched Camera Forward 1.0 m
+
+Purpose: validate that RGB-D odometry still reports forward distance correctly when the camera is pitched down for collision detection.
+
+This test should physically pitch the camera down to 35 degrees, wait until ROS publishes the updated pitch on `/camera/head/pitch_rad`, then drive forward until TF reports 1 m.
+
+First confirm the pitch state is visible from the robot brain and ROS bridge:
+
+```bash
+cd "$ROBOT42"
+source /opt/ros/humble/setup.bash
+source /home/alin/Robot42/.venv-maniskill/bin/activate
+
+curl --max-time 3 "${ROBOT_BRAIN_URL}/camera/head/pose" | python -m json.tool
+ros2 topic echo /camera/head/pitch_rad --once
+```
+
+Expected:
+
+- Robot brain pose JSON has `pitch_rad` and `pitch_deg`.
+- `/camera/head/pitch_rad` publishes a `std_msgs/msg/Float32`.
+
+Then run the pitched forward diagnostic:
+
+```bash
+cd "$ROBOT42"
+source /opt/ros/humble/setup.bash
+source /home/alin/Robot42/.venv-maniskill/bin/activate
+
+python -m xlerobot_playground.ros_pitched_forward_diagnostic \
+  --robot-brain-url "${ROBOT_BRAIN_URL}" \
+  --camera-pitch-deg 35 \
+  --camera-pitch-action-key <REAL_CAMERA_PITCH_ACTION_KEY> \
+  --camera-pitch-settle-s 2.0 \
+  --duration-s 60 \
+  --sample-hz 30 \
+  --linear-m-s 0.03 \
+  --target-distance-m 1.0 \
+  --target-source tf \
+  --imu-topic /imu/filtered_yaw \
+  --imu-frame-convention base_link \
+  --accel-bias-calibration-s 0.0 \
+  --max-imu-staleness-s 0.5 \
+  --csv-out artifacts/diagnostics/forward_pitch35_1m.csv \
+  --json-out artifacts/diagnostics/forward_pitch35_1m_summary.json
+
+python -m json.tool artifacts/diagnostics/forward_pitch35_1m_summary.json
+```
+
+If robot brain was launched with `--camera-pitch-action-key`, you can omit `--camera-pitch-action-key` from the diagnostic command.
+
+Expected:
+
+- Camera pitches down before wheel motion starts.
+- Diagnostic prints that the ROS camera pitch was confirmed.
+- Robot moves forward and stops around 1 m according to TF.
+- `stop_reason` is `target_tf_distance_reached`.
+
+Pass criteria:
+
+- Physical travel is close to 1 m.
+- `tf.forward_distance_m` and `odom_topic.forward_distance_m` are within `0.10 m` of 1.0 m.
+- Lateral drift is below `0.10 m`.
+- The `accelerometer.reported_distance_m` value is ignored; accelerometer double integration is diagnostic-only and is not used by odometry.
+
+If the camera moves in the wrong direction, stop before driving and check pitch sign, action key, and action units. Positive pitch means camera down in this odometry stack.
+
+If pitch confirmation times out:
+
+```bash
+curl --max-time 3 "${ROBOT_BRAIN_URL}/camera/head/pose" | python -m json.tool
+ros2 topic hz /camera/head/pitch_rad
+ros2 node info /xlerobot_real_ros_bridge
+```
+
+Check that `real_ros_bridge` is running latest code and polling the same `ROBOT_BRAIN_URL`.
+
+If level 1 m passes but pitched 1 m under-reports or over-reports, check:
+
+- The published `/camera/head/pitch_rad` value matches the physical camera angle.
+- The camera pitch sign is correct.
+- RGB/depth registration is still aligned at the pitched angle.
+- `rgbd_visual_odometry` was restarted after the pitch-support update.
+
+## Test 6: Square Path Consistency
 
 Purpose: detect accumulated rotation or translation bias.
 

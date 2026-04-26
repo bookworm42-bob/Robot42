@@ -25,6 +25,16 @@ class FakeRuntime:
         self.velocity_calls = []
         self.stop_calls = 0
         self.close_calls = 0
+        self.connected = False
+        self.robot = self
+        self.actions = []
+
+    def connect(self) -> None:
+        self.connected = True
+
+    def send_action(self, action):
+        self.actions.append(dict(action))
+        return dict(action)
 
     def drive_velocity(self, *, linear_m_s: float, angular_rad_s: float):
         self.velocity_calls.append((linear_m_s, angular_rad_s))
@@ -76,6 +86,23 @@ class RobotBrainAgentTests(unittest.TestCase):
         self.assertTrue(response["succeeded"])
         self.assertEqual(runtime.velocity_calls, [(0.02, 0.08)])
         self.assertEqual(response["metadata"], {"sent": True})
+
+    def test_agent_commands_camera_pitch_and_updates_state(self) -> None:
+        runtime = FakeRuntime()
+        agent = RobotBrainAgent(
+            RobotBrainAgentConfig(
+                allow_motion_commands=True,
+                camera_pitch_action_key="head_tilt.pos",
+                camera_pitch_settle_s=0.0,
+            ),
+            runtime=runtime,
+        )
+
+        response = agent.pitch_camera(pitch_rad=0.5)
+
+        self.assertTrue(response["succeeded"])
+        self.assertEqual(runtime.actions, [{"head_tilt.pos": 0.5 * 180.0 / 3.141592653589793}])
+        self.assertAlmostEqual(agent.camera_state()["pitch_rad"], 0.5)
 
     def test_agent_serves_expected_orbbec_file_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
