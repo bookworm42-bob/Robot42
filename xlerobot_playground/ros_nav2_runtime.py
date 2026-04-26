@@ -6,7 +6,7 @@ from io import BytesIO
 import math
 import subprocess
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 import numpy as np
 
@@ -37,7 +37,7 @@ try:
         qos_profile_sensor_data,
     )
     from rclpy.time import Time as RosTime
-    from sensor_msgs.msg import Image, LaserScan
+    from sensor_msgs.msg import Image, Imu, LaserScan
     from tf2_ros import Buffer, TransformBroadcaster, TransformListener
     from tf2_ros import ConnectivityException, ExtrapolationException, LookupException
 except Exception as exc:  # pragma: no cover - runtime guard.
@@ -61,6 +61,7 @@ except Exception as exc:  # pragma: no cover - runtime guard.
     qos_profile_sensor_data = None
     RosTime = None
     Image = None
+    Imu = None
     LaserScan = None
     Buffer = None
     TransformBroadcaster = None
@@ -106,11 +107,106 @@ def ros_goal_status_label(status: int | None) -> str:
     return mapping.get(status, f"status_{status}")
 
 
+def remaining_turn_delta_rad(*, desired_total_yaw_rad: float, achieved_total_yaw_rad: float) -> float:
+    remaining = max(abs(float(desired_total_yaw_rad)) - abs(float(achieved_total_yaw_rad)), 0.0)
+    return math.copysign(remaining, float(desired_total_yaw_rad) if abs(float(desired_total_yaw_rad)) > 1e-9 else 1.0)
+
+
+def compute_turn_command(
+    *,
+    requested_angular_rad_s: float,
+    target_yaw_rad: float | None,
+    feedback_yaw_rad: float | None,
+    minimum_command_rad_s: float = 0.12,
+    slowdown_zone_rad: float = math.radians(50.0),
+    stop_tolerance_rad: float = math.radians(2.0),
+) -> tuple[float, bool]:
+    command_direction = 1.0 if requested_angular_rad_s >= 0.0 else -1.0
+    max_command_speed = abs(float(requested_angular_rad_s))
+    if max_command_speed <= 1e-6:
+        return 0.0, True
+    if target_yaw_rad is None or feedback_yaw_rad is None:
+        return command_direction * max_command_speed, False
+    remaining_yaw_rad = max(abs(float(target_yaw_rad)) - abs(float(feedback_yaw_rad)), 0.0)
+    if remaining_yaw_rad <= max(float(stop_tolerance_rad), 0.0):
+        return 0.0, True
+    if remaining_yaw_rad < max(float(slowdown_zone_rad), 1e-6):
+        scaled_speed = max_command_speed * (remaining_yaw_rad / max(float(slowdown_zone_rad), 1e-6))
+        commanded_speed = max(minimum_command_rad_s, scaled_speed)
+    else:
+        commanded_speed = max_command_speed
+    commanded_speed = min(commanded_speed, max_command_speed)
+    return command_direction * commanded_speed, False
+
+
+def _unwrap_yaw_sequence(yaws: Iterable[float]) -> list[float]:
+    sequence = list(yaws)
+    if not sequence:
+        return []
+    unwrapped = [float(sequence[0])]
+    previous = float(sequence[0])
+    for value in sequence[1:]:
+        current = float(value)
+        delta = math.atan2(math.sin(current - previous), math.cos(current - previous))
+        unwrapped.append(unwrapped[-1] + delta)
+        previous = current
+    return unwrapped
+
+
+def _select_turnaround_scan_observations(
+    observations: list[dict[str, Any]],
+    *,
+    sample_count: int,
+) -> list[dict[str, Any]]:
+    if len(observations) <= sample_count:
+        return list(observations)
+    poses = [item.get("pose") for item in observations]
+    if not all(isinstance(pose, Pose2D) for pose in poses):
+        stride = max(len(observations) // max(sample_count, 1), 1)
+        return observations[::stride][:sample_count]
+    yaws = _unwrap_yaw_sequence([float(pose.yaw) for pose in poses if isinstance(pose, Pose2D)])
+    if len(yaws) != len(observations):
+        stride = max(len(observations) // max(sample_count, 1), 1)
+        return observations[::stride][:sample_count]
+    span = yaws[-1] - yaws[0]
+    if abs(span) < math.radians(45.0):
+        stride = max(len(observations) // max(sample_count, 1), 1)
+        return observations[::stride][:sample_count]
+    direction = 1.0 if span >= 0.0 else -1.0
+    usable_span = min(abs(span), math.tau)
+    start_yaw = yaws[0]
+    if sample_count <= 1:
+        targets = [start_yaw]
+    else:
+        targets = [
+            start_yaw + direction * (usable_span * index / (sample_count - 1))
+            for index in range(sample_count)
+        ]
+    chosen_indices: set[int] = set()
+    for target in targets:
+        best_index = min(
+            range(len(yaws)),
+            key=lambda index: (abs(yaws[index] - target), abs(index - len(yaws) // 2)),
+        )
+        chosen_indices.add(best_index)
+    if 0 not in chosen_indices:
+        chosen_indices.add(0)
+    if len(observations) - 1 not in chosen_indices:
+        chosen_indices.add(len(observations) - 1)
+    ordered = sorted(chosen_indices)
+    if len(ordered) > sample_count:
+        stride = max(len(ordered) / float(sample_count), 1.0)
+        compacted = [ordered[min(int(round(index * stride)), len(ordered) - 1)] for index in range(sample_count)]
+        ordered = sorted(set(compacted))
+    return [observations[index] for index in ordered]
+
+
 @dataclass(frozen=True)
 class RosRuntimeConfig:
     map_topic: str = "/map"
     scan_topic: str = "/scan"
     rgb_topic: str = "/camera/head/image_raw"
+    imu_topic: str = "/imu/filtered_yaw"
     cmd_vel_topic: str = "/cmd_vel"
     map_frame: str = "map"
     odom_frame: str = "odom"
@@ -122,6 +218,7 @@ class RosRuntimeConfig:
     turn_scan_settle_s: float = 1.0
     manual_spin_angular_speed_rad_s: float = 0.25
     manual_spin_publish_hz: float = 20.0
+    manual_spin_direction_sign: float = -1.0
     allow_multiple_action_servers: bool = False
     publish_internal_navigation_map: bool = True
 
@@ -187,6 +284,10 @@ class RosExplorationRuntime(Node):
         self.latest_map_stamp_s: float = 0.0
         self.latest_scan: LaserScan | None = None
         self.latest_scan_stats: dict[str, Any] | None = None
+        self.latest_imu_msg: Imu | None = None
+        self._latest_imu_orientation_yaw_rad: float | None = None
+        self._latest_imu_orientation_unwrapped_yaw_rad: float | None = None
+        self._scan_sensor_yaw_offset_rad: float | None = None
         self.scan_observations: list[dict[str, Any]] = []
         self.latest_image_msg: Image | None = None
         self.latest_image_data_url: str | None = None
@@ -204,6 +305,7 @@ class RosExplorationRuntime(Node):
         self.create_subscription(OccupancyGrid, config.map_topic, self._on_map, map_qos)
         self.create_subscription(LaserScan, config.scan_topic, self._on_scan, qos_profile_sensor_data)
         self.create_subscription(Image, config.rgb_topic, self._on_rgb, qos_profile_sensor_data)
+        self.create_subscription(Imu, config.imu_topic, self._on_imu, qos_profile_sensor_data)
         self._published_navigation_map: RosOccupancyMap | None = None
         self._map_to_odom = Pose2D(0.0, 0.0, 0.0)
         self._publish_timer = self.create_timer(0.2, self._publish_internal_navigation_state)
@@ -240,6 +342,7 @@ class RosExplorationRuntime(Node):
         reference_frame = self.config.odom_frame if self.config.publish_internal_navigation_map else self.config.map_frame
         sensor_pose = self.lookup_pose(reference_frame, message.header.frame_id)
         if sensor_pose is not None:
+            sensor_pose = self._scan_pose_with_turn_feedback(sensor_pose)
             self.scan_observations.append(
                 {
                     "frame_id": str(message.header.frame_id),
@@ -260,6 +363,50 @@ class RosExplorationRuntime(Node):
         encoded = image_message_to_data_url(message)
         if encoded:
             self.latest_image_data_url = encoded
+
+    def _on_imu(self, message: Imu) -> None:
+        self.latest_imu_msg = message
+        covariance = getattr(message, "orientation_covariance", None)
+        if covariance is None or len(covariance) < 1 or float(covariance[0]) < 0.0:
+            return
+        orientation = message.orientation
+        yaw_rad = yaw_from_quaternion_xyzw(
+            float(orientation.x),
+            float(orientation.y),
+            float(orientation.z),
+            float(orientation.w),
+        )
+        if self._latest_imu_orientation_yaw_rad is None:
+            self._latest_imu_orientation_unwrapped_yaw_rad = yaw_rad
+        else:
+            assert self._latest_imu_orientation_unwrapped_yaw_rad is not None
+            self._latest_imu_orientation_unwrapped_yaw_rad += math.atan2(
+                math.sin(yaw_rad - self._latest_imu_orientation_yaw_rad),
+                math.cos(yaw_rad - self._latest_imu_orientation_yaw_rad),
+            )
+        self._latest_imu_orientation_yaw_rad = yaw_rad
+
+    def _current_turn_feedback(self) -> tuple[str, float] | tuple[None, None]:
+        if self._latest_imu_orientation_unwrapped_yaw_rad is not None:
+            return "imu", float(self._latest_imu_orientation_unwrapped_yaw_rad)
+        pose = self.current_pose_in_frame(self.config.odom_frame)
+        if pose is not None:
+            return self.config.odom_frame, float(pose.yaw)
+        return None, None
+
+    def _scan_pose_with_turn_feedback(self, sensor_pose: Pose2D) -> Pose2D:
+        if not self.config.publish_internal_navigation_map:
+            return sensor_pose
+        _feedback_frame, feedback_yaw = self._current_turn_feedback()
+        if feedback_yaw is None:
+            return sensor_pose
+        if self._scan_sensor_yaw_offset_rad is None:
+            self._scan_sensor_yaw_offset_rad = sensor_pose.yaw - feedback_yaw
+        return Pose2D(
+            float(sensor_pose.x),
+            float(sensor_pose.y),
+            float(feedback_yaw + self._scan_sensor_yaw_offset_rad),
+        )
 
     def spin_until_ready(self, *, timeout_s: float | None = None) -> None:
         deadline = time.time() + (timeout_s if timeout_s is not None else self.config.ready_timeout_s)
@@ -306,6 +453,43 @@ class RosExplorationRuntime(Node):
         deadline = time.time() + duration_s
         while time.time() < deadline:
             rclpy.spin_once(self, timeout_sec=0.05)
+
+    def hold_stop_until_stable(
+        self,
+        *,
+        duration_s: float,
+        yaw_stable_tolerance_rad: float = math.radians(0.6),
+        min_stable_cycles: int = 3,
+    ) -> dict[str, Any]:
+        deadline = time.time() + max(float(duration_s), 0.0)
+        _feedback_frame, previous_yaw = self._current_turn_feedback()
+        stable_cycles = 0
+        observed_yaw_delta = 0.0
+        while time.time() < deadline:
+            self._cmd_vel_pub.publish(Twist())
+            rclpy.spin_once(self, timeout_sec=0.05)
+            feedback_frame, current_yaw = self._current_turn_feedback()
+            if current_yaw is None or previous_yaw is None:
+                time.sleep(0.05)
+                continue
+            delta = math.atan2(
+                math.sin(current_yaw - previous_yaw),
+                math.cos(current_yaw - previous_yaw),
+            )
+            observed_yaw_delta += delta
+            previous_yaw = current_yaw
+            if abs(delta) <= yaw_stable_tolerance_rad:
+                stable_cycles += 1
+                if stable_cycles >= max(int(min_stable_cycles), 1):
+                    break
+            else:
+                stable_cycles = 0
+            time.sleep(0.05)
+        return {
+            "stable": stable_cycles >= max(int(min_stable_cycles), 1),
+            "stable_cycles": stable_cycles,
+            "observed_yaw_delta_rad": observed_yaw_delta,
+        }
 
     def scan_observation_count(self) -> int:
         return len(self.scan_observations)
@@ -415,50 +599,36 @@ class RosExplorationRuntime(Node):
     ) -> dict[str, Any]:
         start_time = time.time()
         start_pose = self.current_pose()
+        observation_start_index = len(self.scan_observations)
         sample_count = 12
-        step_radians = float(self.config.turn_scan_radians) / float(sample_count)
         event = {
             "reason": reason,
-            "mode": "discrete_stop_and_scan",
+            "mode": "continuous_spin",
             "target_yaw_rad": round(self.config.turn_scan_radians, 3),
             "sample_count": sample_count,
-            "sample_step_rad": round(step_radians, 3),
         }
-        observations: list[dict[str, Any]] = []
-        total_yaw_delta = 0.0
-        stop_reason = "target_yaw_reached"
-        completed = True
-        for index in range(sample_count):
-            if should_cancel is not None and should_cancel():
-                stop_reason = "canceled"
-                completed = False
-                break
-            if index > 0:
-                segment = self._spin_by_delta(step_radians, should_cancel=should_cancel)
-                total_yaw_delta += float(segment.get("actual_unwrapped_yaw_delta_rad", 0.0) or 0.0)
-                if not segment.get("spin_completed", False):
-                    stop_reason = str(segment.get("spin_stop_reason", "incomplete"))
-                    completed = False
-                    break
-            observation = self._capture_settled_scan_observation()
-            if observation is not None:
-                observations.append(observation)
-        if completed and sample_count > 1:
-            restore_segment = self._spin_by_delta(step_radians, should_cancel=should_cancel)
-            total_yaw_delta += float(restore_segment.get("actual_unwrapped_yaw_delta_rad", 0.0) or 0.0)
-            if not restore_segment.get("spin_completed", False):
-                stop_reason = str(restore_segment.get("spin_stop_reason", "restore_incomplete"))
-                completed = False
-        self.spin_for(self.config.turn_scan_settle_s)
+        spin_event = self._manual_spin(should_cancel=should_cancel)
+        settle_result = self.hold_stop_until_stable(duration_s=self.config.turn_scan_settle_s)
+        raw_observations, observation_stop_index = self.drain_scan_observations(observation_start_index)
+        observations = _select_turnaround_scan_observations(raw_observations, sample_count=sample_count)
         end_pose = self.current_pose()
         event["elapsed_s"] = round(time.time() - start_time, 3)
-        event["spin_completed"] = completed
-        event["spin_stop_reason"] = stop_reason
-        event["spin_feedback_frame"] = self.config.odom_frame
-        event["actual_unwrapped_yaw_delta_rad"] = round(total_yaw_delta, 3)
-        event["spin_command_angular_speed_rad_s"] = round(float(self.config.manual_spin_angular_speed_rad_s), 3)
-        event["spin_timeout_s"] = round(float(self.config.turn_scan_timeout_s), 3)
+        event["spin_completed"] = bool(spin_event.get("spin_completed", False))
+        event["spin_stop_reason"] = spin_event.get("spin_stop_reason", "unknown")
+        event["spin_feedback_frame"] = spin_event.get("spin_feedback_frame", self.config.odom_frame)
+        event["actual_unwrapped_yaw_delta_rad"] = round(
+            float(spin_event.get("actual_unwrapped_yaw_delta_rad", 0.0) or 0.0),
+            3,
+        )
+        event["spin_command_angular_speed_rad_s"] = round(
+            float(spin_event.get("spin_command_angular_speed_rad_s", self.config.manual_spin_angular_speed_rad_s)),
+            3,
+        )
+        event["spin_timeout_s"] = round(float(spin_event.get("spin_timeout_s", self.config.turn_scan_timeout_s)), 3)
+        event["settle_stable"] = bool(settle_result.get("stable", False))
+        event["settle_observed_yaw_delta_rad"] = round(float(settle_result.get("observed_yaw_delta_rad", 0.0)), 3)
         event["captured_observation_count"] = len(observations)
+        event["raw_observation_count"] = len(raw_observations)
         if start_pose is not None:
             event["start_pose"] = start_pose.to_dict()
         if end_pose is not None:
@@ -474,7 +644,7 @@ class RosExplorationRuntime(Node):
             )
         response = dict(event)
         response["observations"] = observations
-        response["observation_stop_index"] = len(self.scan_observations)
+        response["observation_stop_index"] = observation_stop_index
         self._nav_scan_history.append(event)
         return response
 
@@ -557,94 +727,80 @@ class RosExplorationRuntime(Node):
         should_cancel: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
         twist = Twist()
-        direction = 1.0 if target_yaw_rad >= 0.0 else -1.0
+        target_direction = 1.0 if target_yaw_rad >= 0.0 else -1.0
+        command_direction = target_direction * (-1.0 if float(self.config.manual_spin_direction_sign) < 0.0 else 1.0)
         max_command_speed = abs(float(self.config.manual_spin_angular_speed_rad_s))
-        twist.angular.z = direction * max_command_speed
+        requested_angular_rad_s = command_direction * max_command_speed
         fallback_duration_s = abs(target_yaw_rad) / max(max_command_speed, 1e-6)
         step_s = 1.0 / max(self.config.manual_spin_publish_hz, 1e-6)
         timeout_s = max(float(self.config.turn_scan_timeout_s), fallback_duration_s * 3.0, fallback_duration_s + 5.0)
         deadline = time.time() + timeout_s
         start_time = time.time()
-        pose = self.current_pose_in_frame(self.config.odom_frame)
-        previous_yaw = pose.yaw if pose is not None else None
-        accumulated_yaw = 0.0
-        used_odom_feedback = pose is not None
+        feedback_frame, start_yaw = self._current_turn_feedback()
+        feedback_yaw_rad = 0.0 if start_yaw is not None else None
+        used_feedback = start_yaw is not None
         timed_fallback_deadline = start_time + fallback_duration_s
-        stop_tolerance_rad = math.radians(2.0)
-        slowdown_zone_rad = math.radians(50.0)
-        minimum_command_speed = min(max_command_speed, 0.18)
+        last_feedback_yaw = start_yaw
+        last_relative_yaw = 0.0
         while time.time() < deadline:
             if should_cancel is not None and should_cancel():
                 stop_reason = "canceled"
                 break
-            if pose is not None and previous_yaw is not None:
-                remaining_yaw = max(abs(target_yaw_rad) - abs(accumulated_yaw), 0.0)
-                if remaining_yaw <= stop_tolerance_rad:
-                    stop_reason = "target_yaw_reached"
-                    break
-                if remaining_yaw < slowdown_zone_rad:
-                    scaled_speed = max_command_speed * (remaining_yaw / slowdown_zone_rad)
-                    twist.angular.z = direction * max(minimum_command_speed, scaled_speed)
-                else:
-                    twist.angular.z = direction * max_command_speed
+            twist.angular.z, target_reached = compute_turn_command(
+                requested_angular_rad_s=requested_angular_rad_s,
+                target_yaw_rad=target_yaw_rad,
+                feedback_yaw_rad=feedback_yaw_rad,
+                minimum_command_rad_s=min(max_command_speed, 0.12),
+            )
+            if target_reached:
+                stop_reason = "target_yaw_reached"
+                break
             self._cmd_vel_pub.publish(twist)
             rclpy.spin_once(self, timeout_sec=0.0)
-            pose = self.current_pose_in_frame(self.config.odom_frame)
-            if pose is not None and previous_yaw is not None:
-                delta = math.atan2(
-                    math.sin(pose.yaw - previous_yaw),
-                    math.cos(pose.yaw - previous_yaw),
+            feedback_frame, current_yaw = self._current_turn_feedback()
+            if current_yaw is not None and start_yaw is not None:
+                relative_yaw = math.atan2(
+                    math.sin(current_yaw - start_yaw),
+                    math.cos(current_yaw - start_yaw),
                 )
-                accumulated_yaw += delta
-                previous_yaw = pose.yaw
-                used_odom_feedback = True
-            elif not used_odom_feedback and time.time() >= timed_fallback_deadline:
+                if last_feedback_yaw is not None:
+                    unwrapped_delta = math.atan2(
+                        math.sin(current_yaw - last_feedback_yaw),
+                        math.cos(current_yaw - last_feedback_yaw),
+                    )
+                    last_relative_yaw += unwrapped_delta
+                else:
+                    last_relative_yaw = relative_yaw
+                last_feedback_yaw = current_yaw
+                feedback_yaw_rad = last_relative_yaw
+                used_feedback = True
+            elif not used_feedback and time.time() >= timed_fallback_deadline:
                 stop_reason = "time_fallback_elapsed"
                 break
             time.sleep(step_s)
         else:
             stop_reason = "timeout"
         self._cmd_vel_pub.publish(Twist())
-        if used_odom_feedback and previous_yaw is not None:
-            brake_deadline = time.time() + max(step_s * 6.0, 0.4)
-            stable_cycles = 0
-            while time.time() < brake_deadline:
-                self._cmd_vel_pub.publish(Twist())
-                rclpy.spin_once(self, timeout_sec=0.0)
-                pose = self.current_pose_in_frame(self.config.odom_frame)
-                if pose is None:
-                    time.sleep(step_s)
-                    continue
-                delta = math.atan2(
-                    math.sin(pose.yaw - previous_yaw),
-                    math.cos(pose.yaw - previous_yaw),
-                )
-                accumulated_yaw += delta
-                previous_yaw = pose.yaw
-                if abs(delta) <= math.radians(0.6):
-                    stable_cycles += 1
-                    if stable_cycles >= 2:
-                        break
-                else:
-                    stable_cycles = 0
-                time.sleep(step_s)
+        stop_hold = self.hold_stop_until_stable(duration_s=max(step_s * 6.0, 0.4), min_stable_cycles=2)
+        if used_feedback:
+            last_relative_yaw += float(stop_hold.get("observed_yaw_delta_rad", 0.0))
         completed = bool(
-            (used_odom_feedback and abs(accumulated_yaw) >= max(abs(target_yaw_rad) - stop_tolerance_rad, 0.0))
-            or (not used_odom_feedback and stop_reason == "time_fallback_elapsed")
+            (used_feedback and abs(last_relative_yaw) >= max(abs(target_yaw_rad) - math.radians(2.0), 0.0))
+            or (not used_feedback and stop_reason == "time_fallback_elapsed")
         )
         return {
             "spin_completed": completed,
             "spin_stop_reason": stop_reason,
-            "spin_feedback_frame": self.config.odom_frame if used_odom_feedback else "time_fallback",
-            "actual_unwrapped_yaw_delta_rad": round(accumulated_yaw, 3) if used_odom_feedback else None,
-            "spin_command_angular_speed_rad_s": round(direction * max_command_speed, 3),
+            "spin_feedback_frame": feedback_frame if used_feedback else "time_fallback",
+            "actual_unwrapped_yaw_delta_rad": round(last_relative_yaw, 3) if used_feedback else None,
+            "spin_command_angular_speed_rad_s": round(command_direction * max_command_speed, 3),
             "spin_timeout_s": round(timeout_s, 3),
         }
 
     def _capture_settled_scan_observation(self) -> dict[str, Any] | None:
         reference_frame = self.config.odom_frame if self.config.publish_internal_navigation_map else self.config.map_frame
         capture_start = len(self.scan_observations)
-        self.spin_for(self.config.turn_scan_settle_s)
+        self.hold_stop_until_stable(duration_s=self.config.turn_scan_settle_s)
         observation = self._wait_for_next_scan_observation(capture_start)
         if observation is not None:
             return observation

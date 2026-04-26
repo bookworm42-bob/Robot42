@@ -1,22 +1,32 @@
 from __future__ import annotations
 
+from io import BytesIO
 from pathlib import Path
 import tempfile
 import unittest
+from urllib.error import HTTPError
 
+import xlerobot_playground.real_ros_bridge as real_ros_bridge
 from xlerobot_playground.real_ros_bridge import (
     OrbbecFilesystemConfig,
     OrbbecFilesystemRgbdSource,
     RobotBrainRgbdSource,
+    _build_camera_info_from_metadata,
+    _motion_result_error,
     build_parser,
     config_from_args,
+    _format_runtime_error,
+    imu_ros_timestamp_s,
+    parse_imu_json,
     parse_depth_pgm_mm,
     parse_rgb_ppm,
     read_depth_pgm_mm,
+    synthesize_scan_from_depth_be,
     synthesize_scan_from_depth_rows,
     twist_to_base_velocity,
     yaw_to_quaternion_xyzw,
 )
+from xlerobot_playground.rgbd_transport import pack_rgbd_frame
 
 
 class _Vector:
@@ -32,13 +42,36 @@ class _Twist:
 
 
 class _FakeBrainClient:
-    def __init__(self) -> None:
+    def __init__(self, *, paired: bool = False) -> None:
+        self.requested_paths: list[str] = []
         self.payloads = {
             "/rgb": b"P6\n1 1\n255\nabc",
             "/depth": b"P5\n1 1\n65535\n" + (1234).to_bytes(2, "big"),
         }
+        if paired:
+            self.payloads["/rgbd"] = pack_rgbd_frame(
+                frame_index=7,
+                timestamp_us=1_250_000,
+                rgb=b"abc",
+                rgb_width=1,
+                rgb_height=1,
+                depth_be=(1234).to_bytes(2, "big"),
+                depth_width=1,
+                depth_height=1,
+                metadata={
+                    "camera_intrinsics": {
+                        "fx": 500.0,
+                        "fy": 510.0,
+                        "cx": 300.0,
+                        "cy": 200.0,
+                        "width": 640,
+                        "height": 480,
+                    }
+                },
+            )
 
     def get_bytes(self, path: str) -> bytes:
+        self.requested_paths.append(path)
         return self.payloads[path]
 
 
@@ -74,10 +107,46 @@ class RealRosBridgeTests(unittest.TestCase):
         self.assertEqual(config.odom_source, "commanded")
 
     def test_robot_brain_url_selects_remote_hardware_endpoint(self) -> None:
-        args = build_parser().parse_args(["--robot-brain-url", "http://robot-brain.local:8765"])
+        args = build_parser().parse_args(
+            [
+                "--robot-brain-url",
+                "http://robot-brain.local:8765",
+                "--imu-ws-path",
+                "/ws/imu",
+                "--imu-ws-reconnect-delay-s",
+                "0.5",
+            ]
+        )
         config = config_from_args(args)
 
         self.assertEqual(config.robot_brain_url, "http://robot-brain.local:8765")
+        self.assertEqual(config.imu_topic, "/imu")
+        self.assertEqual(config.imu_ws_path, "/ws/imu")
+        self.assertEqual(config.imu_ws_reconnect_delay_s, 0.5)
+
+    def test_runtime_error_formatter_includes_robot_brain_http_body(self) -> None:
+        exc = HTTPError(
+            url="http://robot-brain.local:8765/cmd_vel",
+            code=500,
+            msg="Internal Server Error",
+            hdrs={},
+            fp=BytesIO(b"(6, 'Device not configured')"),
+        )
+
+        self.assertEqual(_format_runtime_error(exc), "HTTP 500: (6, 'Device not configured')")
+
+    def test_motion_result_error_reports_rejected_remote_command(self) -> None:
+        self.assertEqual(
+            _motion_result_error(
+                {
+                    "succeeded": False,
+                    "message": "Real motion commands are disabled.",
+                    "metadata": {"requested_angular_rad_s": 0.3},
+                }
+            ),
+            "Real motion commands are disabled. metadata={'requested_angular_rad_s': 0.3}",
+        )
+        self.assertIsNone(_motion_result_error({"succeeded": True, "message": "ok"}))
 
     def test_twist_to_base_velocity_uses_forward_and_yaw_only(self) -> None:
         self.assertEqual(twist_to_base_velocity(_Twist()), (0.04, 0.12))
@@ -151,6 +220,34 @@ class RealRosBridgeTests(unittest.TestCase):
         self.assertEqual(depth, ((1234,),))
         self.assertEqual((depth_width, depth_height), (1, 1))
 
+    def test_parse_imu_json_reads_nested_metadata_contract(self) -> None:
+        sample = parse_imu_json(
+            b'{"imu":{"angular_velocity_rad_s":{"x":0.1,"y":0.2,"z":0.3},"linear_acceleration_m_s2":{"x":1.0,"y":2.0,"z":3.0},"system_timestamp_us":1234567}}'
+        )
+
+        self.assertEqual(sample["angular_velocity_rad_s"]["z"], 0.3)
+        self.assertEqual(sample["linear_acceleration_m_s2"]["x"], 1.0)
+        self.assertAlmostEqual(sample["timestamp_s"], 1.234567)
+
+    def test_imu_ros_timestamp_prefers_accel_frame_time(self) -> None:
+        sample = parse_imu_json(
+            b'{"timestamp_s":2.0,"has_accel":true,"has_gyro":true,'
+            b'"accel_timestamp_us":1500000,"gyro_timestamp_us":2000000,'
+            b'"angular_velocity_rad_s":{"x":0.1,"y":0.2,"z":0.3},'
+            b'"linear_acceleration_m_s2":{"x":1.0,"y":2.0,"z":3.0}}'
+        )
+
+        self.assertAlmostEqual(imu_ros_timestamp_s(sample), 1.5)
+
+    def test_imu_ros_timestamp_keeps_gyro_time_for_gyro_only_samples(self) -> None:
+        sample = parse_imu_json(
+            b'{"timestamp_s":2.0,"has_accel":false,"has_gyro":true,'
+            b'"gyro_timestamp_us":2000000,'
+            b'"angular_velocity_rad_s":{"x":0.1,"y":0.2,"z":0.3}}'
+        )
+
+        self.assertAlmostEqual(imu_ros_timestamp_s(sample), 2.0)
+
     def test_filesystem_source_can_return_rgb_without_depth(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             output_dir = Path(tmpdir)
@@ -165,7 +262,8 @@ class RealRosBridgeTests(unittest.TestCase):
         self.assertIsNone(frame.depth_mm)
 
     def test_robot_brain_rgbd_source_reads_remote_pnm_payloads(self) -> None:
-        source = RobotBrainRgbdSource(_FakeBrainClient())
+        client = _FakeBrainClient()
+        source = RobotBrainRgbdSource(client)
 
         frame = source.capture()
 
@@ -173,6 +271,93 @@ class RealRosBridgeTests(unittest.TestCase):
         self.assertEqual(frame.rgb_width, 1)
         self.assertEqual(frame.depth_mm, ((1234,),))
         self.assertEqual(frame.depth_width, 1)
+        self.assertIsNone(frame.imu_sample)
+        self.assertEqual(client.requested_paths, ["/rgbd", "/rgb", "/depth"])
+
+    def test_robot_brain_rgbd_source_prefers_paired_payload(self) -> None:
+        client = _FakeBrainClient(paired=True)
+        source = RobotBrainRgbdSource(client)
+
+        frame = source.capture()
+
+        self.assertEqual(frame.rgb, b"abc")
+        self.assertEqual(frame.rgb_width, 1)
+        self.assertIsNone(frame.depth_mm)
+        self.assertEqual(frame.depth_be, (1234).to_bytes(2, "big"))
+        self.assertEqual(frame.depth_width, 1)
+        self.assertEqual(frame.metadata["camera_intrinsics"]["fy"], 510.0)
+        self.assertEqual(frame.frame_index, 7)
+        self.assertAlmostEqual(frame.timestamp_s, 1.25)
+        self.assertEqual(client.requested_paths, ["/rgbd"])
+
+    def test_camera_info_from_metadata_scales_intrinsics(self) -> None:
+        class _Header:
+            frame_id = ""
+
+        class _CameraInfo:
+            def __init__(self) -> None:
+                self.header = _Header()
+                self.width = 0
+                self.height = 0
+                self.distortion_model = ""
+                self.k = []
+                self.p = []
+
+        original_camera_info = real_ros_bridge.CameraInfo
+        real_ros_bridge.CameraInfo = _CameraInfo
+        try:
+            msg = _build_camera_info_from_metadata(
+                frame_id="camera",
+                width=320,
+                height=240,
+                metadata={
+                    "camera_intrinsics": {
+                        "fx": 500.0,
+                        "fy": 520.0,
+                        "cx": 300.0,
+                        "cy": 220.0,
+                        "width": 640,
+                        "height": 480,
+                    }
+                },
+            )
+        finally:
+            real_ros_bridge.CameraInfo = original_camera_info
+
+        self.assertIsNotNone(msg)
+        self.assertEqual(msg.width, 320)
+        self.assertEqual(msg.height, 240)
+        self.assertAlmostEqual(msg.k[0], 250.0)
+        self.assertAlmostEqual(msg.k[4], 260.0)
+        self.assertAlmostEqual(msg.k[2], 150.0)
+        self.assertAlmostEqual(msg.k[5], 110.0)
+
+    def test_synthesize_scan_from_depth_be_matches_row_path(self) -> None:
+        rows = (
+            (1000, 0, 2000),
+            (1500, 1200, 0),
+            (0, 1800, 2500),
+        )
+        depth_be = b"".join(value.to_bytes(2, "big") for row in rows for value in row)
+
+        from_rows = synthesize_scan_from_depth_rows(
+            rows,
+            horizontal_fov_rad=1.0,
+            band_height_px=2,
+            range_min_m=0.05,
+            range_max_m=6.0,
+        )
+        from_bytes = synthesize_scan_from_depth_be(
+            depth_be,
+            width=3,
+            height=3,
+            horizontal_fov_rad=1.0,
+            band_height_px=2,
+            range_min_m=0.05,
+            range_max_m=6.0,
+        )
+
+        self.assertEqual(from_bytes, from_rows)
 
 
 if __name__ == "__main__":

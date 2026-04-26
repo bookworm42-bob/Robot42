@@ -60,6 +60,7 @@ from xlerobot_playground.map_editing import (
     overlay_known_cells,
     overlay_occupancy_payload,
 )
+from xlerobot_playground.nav2_defaults import default_nav2_behavior_tree
 from xlerobot_playground.scan_fusion import integrate_planar_scan
 
 
@@ -111,13 +112,14 @@ class SimExplorationConfig:
     max_decisions: int = 32
     nav2_planner_id: str = "GridBased"
     nav2_controller_id: str = "FollowPath"
-    nav2_behavior_tree: str = "navigate_to_pose_w_replanning_and_recovery.xml"
+    nav2_behavior_tree: str = field(default_factory=default_nav2_behavior_tree)
     nav2_recovery_enabled: bool = True
     nav2_mode: str = "simulated"
     ros_navigation_map_source: str = "fused_scan"
     ros_map_topic: str = "/map"
     ros_scan_topic: str = "/scan"
     ros_rgb_topic: str = "/camera/head/image_raw"
+    ros_imu_topic: str = "/imu/filtered_yaw"
     ros_cmd_vel_topic: str = "/cmd_vel"
     ros_map_frame: str = "map"
     ros_odom_frame: str = "odom"
@@ -140,6 +142,9 @@ class SimExplorationConfig:
     semantic_llm_base_url: str | None = None
     semantic_llm_api_key: str | None = None
     semantic_vlm_async: bool = True
+    wait_for_ui_start: bool = False
+    pause_for_operator_approval: bool = False
+    stop_after_initial_scan: bool = False
     use_keyboard_controls: bool = False
     keyboard_speed: str = "normal"
 
@@ -2882,6 +2887,7 @@ class RosExplorationSession:
                     map_topic=config.ros_map_topic,
                     scan_topic=config.ros_scan_topic,
                     rgb_topic=config.ros_rgb_topic,
+                    imu_topic=config.ros_imu_topic,
                     cmd_vel_topic=config.ros_cmd_vel_topic,
                     map_frame=config.ros_map_frame,
                     odom_frame=config.ros_odom_frame,
@@ -2897,13 +2903,20 @@ class RosExplorationSession:
                     publish_internal_navigation_map=config.ros_navigation_map_source == "fused_scan",
                 )
             )
+        self.scan_known_cells: dict[GridCell, str] = {}
+        self.scan_occupancy_evidence: dict[GridCell, float] = {}
+        self.scan_range_edge_cells: set[GridCell] = set()
+        if self.runtime.latest_map is not None:
+            self.scan_map_resolution = float(self.runtime.latest_map.resolution)
+        else:
+            self.scan_map_resolution = config.occupancy_resolution
+        self.scan_observation_index = self.runtime.scan_observation_count()
         self.nav2 = RosNav2NavigationModule(
             config,
             self.runtime,
             current_map=self._current_effective_map,
             should_cancel=self._pause_requested_or_canceled,
         )
-        self.scan_observation_index = self.runtime.scan_observation_count()
 
     def close(self) -> None:
         try:
@@ -2915,6 +2928,17 @@ class RosExplorationSession:
     def run(self) -> dict[str, Any]:
         self._initialize_scan_state()
         self._publish_live_map("Initial ROS/Nav2 scan complete.")
+        if self.config.stop_after_initial_scan:
+            self.backend.update_external_task(
+                self.task_id,
+                message="Initial 360 degree scan complete. Stopping before frontier navigation as requested.",
+            )
+            self.status = "finished"
+            return self._build_map_payload()
+        if not self._pause_for_operator_approval(
+            "Initial 360 degree scan complete. Review the map and click Resume to continue."
+        ):
+            return self._build_map_payload()
 
         while self.decision_index < self.config.max_decisions:
             if not self._wait_until_task_active():
@@ -3016,6 +3040,11 @@ class RosExplorationSession:
                     message=f"Marked {record.frontier_id} visited after Nav2 failed to reach it: {nav_result.reason}",
                     frontier_id=record.frontier_id,
                 )
+                if not self._pause_for_operator_approval(
+                    f"Step {self.decision_index} complete. {record.frontier_id} was marked visited after Nav2 failed. "
+                    "Review the state and click Resume to continue."
+                ):
+                    break
                 continue
 
             self._perform_turnaround_scan(reason=f"arrive_frontier::{record.frontier_id}")
@@ -3031,6 +3060,11 @@ class RosExplorationSession:
                 message=f"Explored {record.frontier_id} from live ROS/Nav2 state.",
                 frontier_id=record.frontier_id,
             )
+            if not self._pause_for_operator_approval(
+                f"Step {self.decision_index} complete. Explored {record.frontier_id}. "
+                "Review the state and click Resume to continue."
+            ):
+                break
 
         return self._build_map_payload()
 
@@ -3246,6 +3280,10 @@ class RosExplorationSession:
             return self.snapshot()
 
     def _initialize_scan_state(self) -> None:
+        self.backend.update_external_task(
+            self.task_id,
+            message="Waiting for ROS pose and scan data before the initial 360 degree scan.",
+        )
         self.runtime.spin_until_ready(timeout_s=self.config.ros_ready_timeout_s)
         initial_pose = self._require_pose()
         self._update_pose_history(initial_pose)
@@ -3255,7 +3293,12 @@ class RosExplorationSession:
             step_index=0,
             reason="initial_pose",
         )
+        self.backend.update_external_task(
+            self.task_id,
+            message="Running the initial 360 degree scan.",
+        )
         self._perform_turnaround_scan(reason="initial_turnaround_scan")
+        self._push_progress_update(message="Initial 360 degree scan complete.", frontier_id=None)
 
     def _prepare_decision_locked(self) -> None:
         if self._budget_exhausted():
@@ -3454,6 +3497,17 @@ class RosExplorationSession:
                 self._sync_manual_occupancy_edits()
                 return True
             time.sleep(0.1)
+
+    def _pause_for_operator_approval(self, message: str) -> bool:
+        if not self.config.pause_for_operator_approval:
+            return True
+        self.backend.pause_task(self.task_id)
+        self.backend.update_external_task(
+            self.task_id,
+            message=message,
+        )
+        self.status = "paused"
+        return self._wait_until_task_active()
 
     def _pause_requested_or_canceled(self) -> bool:
         task = self.backend.get_task(self.task_id)
@@ -4247,6 +4301,7 @@ class RosExplorationSession:
                     "map_topic": self.config.ros_map_topic,
                     "scan_topic": self.config.ros_scan_topic,
                     "rgb_topic": self.config.ros_rgb_topic,
+                    "imu_topic": self.config.ros_imu_topic,
                     "navigation_map_source": self.config.ros_navigation_map_source,
                     "base_frame": self.config.ros_base_frame,
                     "odom_frame": self.config.ros_odom_frame,
@@ -4273,12 +4328,70 @@ class RosExplorationSession:
         )
 
 
+class _ExplorationStartGate:
+    def __init__(self, config: SimExplorationConfig, *, apply_payload_metadata: bool = False) -> None:
+        self.config = config
+        self.apply_payload_metadata = apply_payload_metadata
+        self._event = threading.Event()
+        self._lock = threading.Lock()
+        self._payload: dict[str, str | None] = {}
+
+    def request_start(self, *, area: str, session: str | None, source: str = "operator") -> dict[str, Any]:
+        with self._lock:
+            if area:
+                self._payload["area"] = area
+            if session:
+                self._payload["session"] = session
+            self._payload["source"] = source
+            self._event.set()
+        return {
+            "status": "starting",
+            "message": "Accepted UI start request. Initial 360 degree scan will begin now.",
+            "area": self.config.area,
+            "session": self.config.session,
+            "source": source,
+        }
+
+    def wait(self) -> None:
+        self._event.wait()
+        if not self.apply_payload_metadata:
+            return
+        with self._lock:
+            area = self._payload.get("area")
+            session = self._payload.get("session")
+            source = self._payload.get("source")
+        if area:
+            self.config.area = area
+        if session:
+            self.config.session = session
+        if source:
+            self.config.source = source
+
+
+class _GatedExplorationUIController(LocalExplorationUIController):
+    def __init__(self, backend: ExplorationBackend, start_gate: _ExplorationStartGate) -> None:
+        super().__init__(backend)
+        self.start_gate = start_gate
+
+    def start_explore(self, *, area: str, session: str | None = None, source: str = "operator") -> dict[str, Any]:
+        return self.start_gate.request_start(area=area, session=session, source=source)
+
+
 class ManiSkillExplorationRunner:
-    def __init__(self, config: SimExplorationConfig, backend: ExplorationBackend) -> None:
+    def __init__(
+        self,
+        config: SimExplorationConfig,
+        backend: ExplorationBackend,
+        *,
+        start_gate: _ExplorationStartGate | None = None,
+    ) -> None:
         self.config = config
         self.backend = backend
+        self.start_gate = start_gate
 
     def run(self) -> dict[str, Any]:
+        if self.start_gate is not None:
+            self.start_gate.wait()
         task = self.backend.begin_external_task(
             tool_id="explore",
             area=self.config.area,
@@ -4331,6 +4444,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--repo-root", default=str(resolve_xlerobot_repo_root()))
     parser.add_argument("--persist-path", default="./artifacts/xlerobot_exploration_map.json")
+    parser.add_argument("--restore-persisted-state", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--area", default="apartment")
     parser.add_argument("--session", default="house_v1")
     parser.add_argument("--source", default="operator")
@@ -4386,12 +4500,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--nav2-mode", choices=("simulated", "ros"), default="simulated")
     parser.add_argument("--nav2-planner-id", default="GridBased")
     parser.add_argument("--nav2-controller-id", default="FollowPath")
-    parser.add_argument("--nav2-behavior-tree", default="navigate_to_pose_w_replanning_and_recovery.xml")
+    parser.add_argument("--nav2-behavior-tree", default=default_nav2_behavior_tree())
     parser.add_argument("--nav2-recovery-enabled", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--ros-navigation-map-source", choices=("fused_scan", "external"), default="fused_scan")
     parser.add_argument("--ros-map-topic", default="/map")
     parser.add_argument("--ros-scan-topic", default="/scan")
     parser.add_argument("--ros-rgb-topic", default="/camera/head/image_raw")
+    parser.add_argument("--ros-imu-topic", default="/imu/filtered_yaw")
     parser.add_argument("--ros-cmd-vel-topic", default="/cmd_vel")
     parser.add_argument("--ros-map-frame", default="map")
     parser.add_argument("--ros-adapter-url", default=None)
@@ -4418,6 +4533,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--semantic-llm-base-url", default=None)
     parser.add_argument("--semantic-llm-api-key", default=None)
     parser.add_argument("--semantic-vlm-async", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--wait-for-ui-start", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--pause-for-operator-approval",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Pause after the initial scan and after each completed exploration step until the operator clicks Resume.",
+    )
+    parser.add_argument(
+        "--stop-after-initial-scan",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Perform the initial 360 degree scan, publish the map state, and exit before frontier navigation.",
+    )
     parser.add_argument(
         "--experimental-free-space-semantic-waypoints",
         action=argparse.BooleanOptionalAction,
@@ -4436,6 +4564,7 @@ def main(argv: list[str] | None = None) -> int:
         ExplorationBackendConfig(
             mode="sim",
             persist_path=args.persist_path,
+            restore_persisted_state=args.restore_persisted_state,
             occupancy_resolution=args.occupancy_resolution,
         )
     )
@@ -4490,6 +4619,7 @@ def main(argv: list[str] | None = None) -> int:
             ros_map_topic=args.ros_map_topic,
             ros_scan_topic=args.ros_scan_topic,
             ros_rgb_topic=args.ros_rgb_topic,
+            ros_imu_topic=args.ros_imu_topic,
             ros_cmd_vel_topic=args.ros_cmd_vel_topic,
             ros_map_frame=args.ros_map_frame,
             ros_adapter_url=args.ros_adapter_url,
@@ -4512,18 +4642,26 @@ def main(argv: list[str] | None = None) -> int:
             semantic_llm_base_url=args.semantic_llm_base_url,
             semantic_llm_api_key=args.semantic_llm_api_key,
             semantic_vlm_async=args.semantic_vlm_async,
+            wait_for_ui_start=args.wait_for_ui_start,
+            pause_for_operator_approval=args.pause_for_operator_approval,
+            stop_after_initial_scan=args.stop_after_initial_scan,
         ),
         backend,
     )
     server: ExplorationReviewServer | None = None
+    start_gate: _ExplorationStartGate | None = None
     if args.serve_review_ui:
-        controller = LocalExplorationUIController(backend)
+        if args.wait_for_ui_start:
+            start_gate = _ExplorationStartGate(runner.config)
+            controller = _GatedExplorationUIController(backend, start_gate)
+        else:
+            controller = LocalExplorationUIController(backend)
         server = ExplorationReviewServer(
             controller,
             host=args.review_host,
             port=args.review_port,
             allow_task_controls=False,
-            allow_task_launch_controls=False,
+            allow_task_launch_controls=bool(args.wait_for_ui_start),
             allow_task_state_controls=True,
             allow_map_approval=True,
             ui_flavor=args.review_ui_flavor,
@@ -4535,6 +4673,9 @@ def main(argv: list[str] | None = None) -> int:
         )
         if args.open_browser:
             webbrowser.open(f"http://{args.review_host}:{args.review_port}")
+    if args.wait_for_ui_start and start_gate is None:
+        print("`--wait-for-ui-start` was set without `--serve-review-ui`; starting immediately.")
+    runner.start_gate = start_gate
     try:
         snapshot = runner.run()
         current_map = snapshot.get("current_map") or {}

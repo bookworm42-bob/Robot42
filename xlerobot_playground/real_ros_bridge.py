@@ -1,32 +1,49 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 from dataclasses import dataclass
 import json
 import math
 from pathlib import Path
+import threading
 import time
 from typing import Any, Protocol, Sequence
-from urllib import request
+from urllib import error, request
 from urllib.parse import urljoin
 
 from multido_xlerobot.bootstrap import resolve_xlerobot_repo_root
+from xlerobot_playground.imu_transport import build_websocket_url, parse_imu_json
 from xlerobot_playground.real_exploration_runtime import (
     RealXLeRobotDirectRuntime,
     RealXLeRobotRuntimeConfig,
 )
+from xlerobot_playground.rgbd_transport import unpack_rgbd_frame
+
+try:
+    import aiohttp
+except Exception as exc:  # pragma: no cover - runtime dependency guard.
+    aiohttp = None
+    AIOHTTP_IMPORT_ERROR: Exception | None = exc
+else:
+    AIOHTTP_IMPORT_ERROR = None
 
 IMPORT_ERROR: Exception | None = None
 try:
     import rclpy
+    from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+    from rclpy.executors import MultiThreadedExecutor
     from geometry_msgs.msg import Quaternion, TransformStamped, Twist
     from nav_msgs.msg import Odometry
     from rclpy.node import Node
-    from sensor_msgs.msg import CameraInfo, Image, LaserScan
+    from sensor_msgs.msg import CameraInfo, Image, Imu, LaserScan
+    from std_msgs.msg import Float32
     from tf2_ros import TransformBroadcaster
 except Exception as exc:  # pragma: no cover - exercised as a runtime guard.
     IMPORT_ERROR = exc
     rclpy = None
+    MutuallyExclusiveCallbackGroup = None
+    MultiThreadedExecutor = None
     Quaternion = None
     TransformStamped = None
     Twist = None
@@ -34,7 +51,9 @@ except Exception as exc:  # pragma: no cover - exercised as a runtime guard.
     Node = object
     CameraInfo = None
     Image = None
+    Imu = None
     LaserScan = None
+    Float32 = None
     TransformBroadcaster = None
 
 
@@ -46,6 +65,7 @@ class OrbbecFilesystemConfig:
     output_dir: Path = Path("artifacts/orbbec_rgbd")
     rgb_filename: str = "latest.ppm"
     depth_filename: str = "latest_depth.pgm"
+    imu_filename: str = "latest_imu.json"
     horizontal_fov_rad: float = DEFAULT_ORBBEC_HORIZONTAL_FOV_RAD
 
 
@@ -64,6 +84,7 @@ class RealRosBridgeConfig:
     odom_source: str = "none"
     odom_topic: str = "/odom"
     scan_topic: str = "/scan"
+    imu_topic: str = "/imu"
     base_frame: str = "base_link"
     odom_frame: str = "odom"
     head_camera_frame: str = "head_camera_link"
@@ -72,8 +93,14 @@ class RealRosBridgeConfig:
     camera_y_m: float = 0.0
     camera_z_m: float = 0.35
     camera_yaw_rad: float = 0.0
+    camera_pitch_rad: float = 0.0
+    camera_pitch_topic: str = "/camera/head/pitch_rad"
+    camera_pose_poll_period_s: float = 0.2
     publish_head_camera: bool = True
-    publish_rate_hz: float = 10.0
+    publish_rate_hz: float = 30.0
+    imu_publish_rate_hz: float = 200.0
+    imu_ws_path: str = "/ws/imu"
+    imu_ws_reconnect_delay_s: float = 1.0
     cmd_vel_timeout_s: float = 0.5
     laser_min_range_m: float = 0.05
     laser_max_range_m: float = 6.0
@@ -91,7 +118,11 @@ class RgbdFrame:
     depth_mm: tuple[tuple[int, ...], ...] | None
     depth_width: int | None
     depth_height: int | None
+    imu_sample: dict[str, Any] | None
     timestamp_s: float
+    frame_index: int | None = None
+    depth_be: bytes | None = None
+    metadata: dict[str, Any] | None = None
 
 
 class RgbdSource(Protocol):
@@ -118,9 +149,48 @@ def require_ros_dependencies() -> None:
         ) from IMPORT_ERROR
 
 
+def require_aiohttp() -> None:
+    if AIOHTTP_IMPORT_ERROR is not None:
+        raise RuntimeError(
+            "The websocket IMU bridge requires `aiohttp`. Install it with "
+            "`python -m pip install aiohttp` in the active environment."
+        ) from AIOHTTP_IMPORT_ERROR
+
+
 def yaw_to_quaternion_xyzw(yaw_rad: float) -> tuple[float, float, float, float]:
     half = yaw_rad / 2.0
     return 0.0, 0.0, math.sin(half), math.cos(half)
+
+
+def rpy_to_quaternion_xyzw(roll_rad: float, pitch_rad: float, yaw_rad: float) -> tuple[float, float, float, float]:
+    cr = math.cos(roll_rad * 0.5)
+    sr = math.sin(roll_rad * 0.5)
+    cp = math.cos(pitch_rad * 0.5)
+    sp = math.sin(pitch_rad * 0.5)
+    cy = math.cos(yaw_rad * 0.5)
+    sy = math.sin(yaw_rad * 0.5)
+    return (
+        sr * cp * cy - cr * sp * sy,
+        cr * sp * cy + sr * cp * sy,
+        cr * cp * sy - sr * sp * cy,
+        cr * cp * cy + sr * sp * sy,
+    )
+
+
+def imu_ros_timestamp_s(imu_sample: dict[str, Any]) -> float | None:
+    if imu_sample.get("has_accel", True) and "accel_timestamp_us" in imu_sample:
+        return float(imu_sample["accel_timestamp_us"]) / 1_000_000.0
+    if "timestamp_s" in imu_sample:
+        return float(imu_sample["timestamp_s"])
+    if "timestamp_us" in imu_sample:
+        return float(imu_sample["timestamp_us"]) / 1_000_000.0
+    if "system_timestamp_us" in imu_sample:
+        return float(imu_sample["system_timestamp_us"]) / 1_000_000.0
+    if "device_timestamp_us" in imu_sample:
+        return float(imu_sample["device_timestamp_us"]) / 1_000_000.0
+    if "gyro_timestamp_us" in imu_sample:
+        return float(imu_sample["gyro_timestamp_us"]) / 1_000_000.0
+    return None
 
 
 def twist_to_base_velocity(message: Any) -> tuple[float, float]:
@@ -160,6 +230,57 @@ def synthesize_scan_from_depth_rows(
             if not math.isfinite(raw_depth) or raw_depth <= 0.0:
                 continue
             planar_range_m = (raw_depth / 1000.0) / max(math.cos(image_angle), 1e-3)
+            if range_min_m <= planar_range_m <= range_max_m:
+                best = min(best, planar_range_m)
+        scan_index = width - 1 - column
+        ranges[scan_index] = best
+    if fill_no_return:
+        ranges = [range_max_m if math.isinf(value) else value for value in ranges]
+    if width == 1:
+        angles = [0.0]
+    else:
+        angles = [
+            -horizontal_fov_rad / 2.0 + (horizontal_fov_rad * index / (width - 1))
+            for index in range(width)
+        ]
+    return tuple(float(value) for value in ranges), tuple(float(value) for value in angles)
+
+
+def synthesize_scan_from_depth_be(
+    depth_be: bytes,
+    *,
+    width: int,
+    height: int,
+    horizontal_fov_rad: float,
+    band_height_px: int,
+    range_min_m: float,
+    range_max_m: float,
+    fill_no_return: bool = True,
+) -> tuple[tuple[float, ...], tuple[float, ...]]:
+    if width <= 0 or height <= 0:
+        raise ValueError("Expected a non-empty depth image.")
+    expected_size = width * height * 2
+    if len(depth_be) < expected_size:
+        raise ValueError(f"Depth payload is truncated: expected {expected_size} bytes, got {len(depth_be)}.")
+
+    band_half = max(1, int(band_height_px) // 2)
+    center = height // 2
+    row_start = max(0, center - band_half)
+    row_stop = min(height, center + band_half)
+    fx = width / (2.0 * math.tan(horizontal_fov_rad / 2.0))
+    cx = width / 2.0
+    payload = memoryview(depth_be)
+    ranges = [math.inf for _ in range(width)]
+    for column in range(width):
+        image_angle = -math.atan2((column - cx) / max(fx, 1e-6), 1.0)
+        cos_angle = max(math.cos(image_angle), 1e-3)
+        best = math.inf
+        for row in range(row_start, row_stop):
+            offset = (row * width + column) * 2
+            raw_depth = int.from_bytes(payload[offset : offset + 2], "big")
+            if raw_depth <= 0:
+                continue
+            planar_range_m = (float(raw_depth) / 1000.0) / cos_angle
             if range_min_m <= planar_range_m <= range_max_m:
                 best = min(best, planar_range_m)
         scan_index = width - 1 - column
@@ -245,6 +366,10 @@ def parse_rgb_ppm(data: bytes) -> tuple[bytes, int, int]:
     return payload[:expected], width, height
 
 
+def read_imu_json(path: Path) -> dict[str, Any] | None:
+    return parse_imu_json(path.read_bytes())
+
+
 class OrbbecFilesystemRgbdSource:
     """Reads frames produced by the native Orbbec RGB-D sidecar.
 
@@ -264,12 +389,19 @@ class OrbbecFilesystemRgbdSource:
         depth = None
         depth_width = None
         depth_height = None
+        imu_sample = None
         rgb_path = output_dir / self.config.rgb_filename
         depth_path = output_dir / self.config.depth_filename
+        imu_path = output_dir / self.config.imu_filename
         if rgb_path.exists():
             rgb, rgb_width, rgb_height = read_rgb_ppm(rgb_path)
         if depth_path.exists():
             depth, depth_width, depth_height = read_depth_pgm_mm(depth_path)
+        if imu_path.exists():
+            try:
+                imu_sample = read_imu_json(imu_path)
+            except Exception:
+                imu_sample = None
         return RgbdFrame(
             rgb=rgb,
             rgb_width=rgb_width,
@@ -277,6 +409,7 @@ class OrbbecFilesystemRgbdSource:
             depth_mm=depth,
             depth_width=depth_width,
             depth_height=depth_height,
+            imu_sample=imu_sample,
             timestamp_s=time.time(),
         )
 
@@ -304,12 +437,38 @@ class RobotBrainClient:
             return {}
         return json.loads(data.decode("utf-8"))
 
+    def get_json(self, path: str) -> dict[str, Any]:
+        data = self.get_bytes(path)
+        if not data:
+            return {}
+        return json.loads(data.decode("utf-8"))
+
+    def websocket_url(self, path: str) -> str:
+        return build_websocket_url(self.base_url, path)
+
 
 class RobotBrainRgbdSource:
     def __init__(self, client: RobotBrainClient) -> None:
         self.client = client
 
     def capture(self) -> RgbdFrame:
+        try:
+            frame = unpack_rgbd_frame(self.client.get_bytes("/rgbd"))
+            return RgbdFrame(
+                rgb=frame.rgb,
+                rgb_width=frame.rgb_width,
+                rgb_height=frame.rgb_height,
+                depth_mm=None,
+                depth_width=frame.depth_width,
+                depth_height=frame.depth_height,
+                imu_sample=None,
+                timestamp_s=frame.timestamp_s,
+                frame_index=frame.frame_index,
+                depth_be=frame.depth_be,
+                metadata=frame.metadata,
+            )
+        except Exception:
+            pass
         rgb = None
         rgb_width = None
         rgb_height = None
@@ -331,7 +490,9 @@ class RobotBrainRgbdSource:
             depth_mm=depth,
             depth_width=depth_width,
             depth_height=depth_height,
+            imu_sample=None,
             timestamp_s=time.time(),
+            metadata=None,
         )
 
 
@@ -355,6 +516,21 @@ class RobotBrainVelocityRuntime:
             pass
 
 
+def _motion_result_error(response: Any) -> str | None:
+    if not isinstance(response, dict):
+        return None
+    succeeded = response.get("succeeded")
+    if succeeded is None or bool(succeeded):
+        return None
+    message = str(response.get("message", "")).strip()
+    metadata = response.get("metadata")
+    if message and metadata:
+        return f"{message} metadata={metadata}"
+    if message:
+        return message
+    return json.dumps(response, sort_keys=True)
+
+
 class RealXLeRobotRosBridge(Node):
     def __init__(
         self,
@@ -367,6 +543,7 @@ class RealXLeRobotRosBridge(Node):
         super().__init__("xlerobot_real_ros_bridge")
         self.config = config
         brain_client = RobotBrainClient(config.robot_brain_url) if config.robot_brain_url else None
+        self.brain_client = brain_client
         if runtime is not None:
             self.runtime = runtime
         elif brain_client is not None:
@@ -399,20 +576,62 @@ class RealXLeRobotRosBridge(Node):
         self._yaw = 0.0
         self._last_linear = 0.0
         self._last_angular = 0.0
+        self._last_motion_error = ""
+        self._last_imu_timestamp_s: float | None = None
+        self._max_imu_timestamp_s: float | None = None
+        self._last_accel_frame_index: int | None = None
+        self._last_gyro_frame_index: int | None = None
+        self._imu_duplicate_timestamps = 0
+        self._imu_stale_timestamps = 0
+        self._imu_inferred_drop_count = 0
+        self._imu_received_count = 0
+        self._imu_published_count = 0
+        self._imu_log_started_at = time.monotonic()
+        self._imu_log_received_at = 0
+        self._imu_log_published_at = 0
+        self._imu_stream_stop = threading.Event()
+        self._imu_stream_thread: threading.Thread | None = None
+        self._cmd_vel_callback_group = MutuallyExclusiveCallbackGroup()
+        self._step_callback_group = MutuallyExclusiveCallbackGroup()
+        self._imu_callback_group = MutuallyExclusiveCallbackGroup()
 
-        self.create_subscription(Twist, config.cmd_vel_topic, self._on_cmd_vel, 10)
+        self.create_subscription(
+            Twist,
+            config.cmd_vel_topic,
+            self._on_cmd_vel,
+            10,
+            callback_group=self._cmd_vel_callback_group,
+        )
         self.odom_publisher = None
         if config.odom_source == "commanded":
             self.odom_publisher = self.create_publisher(Odometry, config.odom_topic, 10)
         self.scan_publisher = self.create_publisher(LaserScan, config.scan_topic, 10)
+        self.imu_publisher = self.create_publisher(Imu, config.imu_topic, 10)
         self.head_rgb_publisher = None
         self.head_depth_publisher = None
         self.head_camera_info_publisher = None
+        self.camera_pitch_publisher = self.create_publisher(Float32, config.camera_pitch_topic, 10)
+        self._camera_pitch_rad = float(config.camera_pitch_rad)
+        self._last_camera_pose_poll_s = 0.0
         if config.publish_head_camera:
             self.head_rgb_publisher = self.create_publisher(Image, "/camera/head/image_raw", 10)
             self.head_depth_publisher = self.create_publisher(Image, "/camera/head/depth/image_raw", 10)
             self.head_camera_info_publisher = self.create_publisher(CameraInfo, "/camera/head/camera_info", 10)
-        self.timer = self.create_timer(1.0 / max(config.publish_rate_hz, 1e-6), self.step)
+        self.timer = self.create_timer(
+            1.0 / max(config.publish_rate_hz, 1e-6),
+            self.step,
+            callback_group=self._step_callback_group,
+        )
+        self.imu_timer = None
+        if brain_client is not None:
+            require_aiohttp()
+            self._start_imu_stream_thread(brain_client.websocket_url(config.imu_ws_path))
+        else:
+            self.imu_timer = self.create_timer(
+                1.0 / max(config.imu_publish_rate_hz, 1e-6),
+                self._poll_and_publish_imu,
+                callback_group=self._imu_callback_group,
+            )
         self.get_logger().info(
             "Real bridge ready: "
             f"robot={config.robot_kind} port1={config.port1} port2={config.port2} "
@@ -436,23 +655,177 @@ class RealXLeRobotRosBridge(Node):
         now = time.monotonic()
         dt = max(0.0, now - self._last_step_stamp)
         self._last_step_stamp = now
+        self._poll_camera_pose(now_s=now)
         linear, angular = self._active_velocity()
-        self._drive_or_stop(linear=linear, angular=angular)
-        self._integrate_commanded_odom(linear=linear, angular=angular, dt=dt)
+        motion_sent = self._drive_or_stop(linear=linear, angular=angular)
+        if motion_sent:
+            self._integrate_commanded_odom(linear=linear, angular=angular, dt=dt)
         frame = self.rgbd_source.capture()
         stamp = self.get_clock().now().to_msg()
         self._publish_transforms(stamp=stamp, linear=linear, angular=angular)
         self._publish_scan(frame=frame, stamp=stamp)
         self._publish_head_images(frame=frame, stamp=stamp)
 
-    def _drive_or_stop(self, *, linear: float, angular: float) -> None:
-        if abs(linear) <= 1e-6 and abs(angular) <= 1e-6:
-            if abs(self._last_linear) > 1e-6 or abs(self._last_angular) > 1e-6:
-                self.runtime.stop()
-        else:
-            self.runtime.drive_velocity(linear_m_s=linear, angular_rad_s=angular)
+    def _poll_camera_pose(self, *, now_s: float) -> None:
+        if self.brain_client is not None and now_s - self._last_camera_pose_poll_s >= self.config.camera_pose_poll_period_s:
+            self._last_camera_pose_poll_s = now_s
+            try:
+                state = self.brain_client.get_json("/camera/head/pose")
+                if "pitch_rad" in state:
+                    self._camera_pitch_rad = float(state["pitch_rad"])
+            except Exception as exc:
+                self.get_logger().warning(f"Failed to fetch camera head pose: {_format_runtime_error(exc)}")
+        msg = Float32()
+        msg.data = float(self._camera_pitch_rad)
+        self.camera_pitch_publisher.publish(msg)
+
+    def _start_imu_stream_thread(self, websocket_url: str) -> None:
+        self._imu_stream_thread = threading.Thread(
+            target=self._run_imu_stream_thread,
+            args=(websocket_url,),
+            name="robot-brain-imu-ws",
+            daemon=True,
+        )
+        self._imu_stream_thread.start()
+
+    def _run_imu_stream_thread(self, websocket_url: str) -> None:
+        asyncio.run(self._imu_stream_loop(websocket_url))
+
+    async def _imu_stream_loop(self, websocket_url: str) -> None:
+        timeout = aiohttp.ClientTimeout(total=None, sock_connect=5.0, sock_read=None)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            while not self._imu_stream_stop.is_set():
+                try:
+                    self.get_logger().info(f"Connecting IMU websocket: {websocket_url}")
+                    async with session.ws_connect(websocket_url, heartbeat=20.0) as ws:
+                        self.get_logger().info(f"IMU websocket connected: {websocket_url}")
+                        while not self._imu_stream_stop.is_set():
+                            try:
+                                message = await ws.receive(timeout=1.0)
+                            except asyncio.TimeoutError:
+                                continue
+                            if message.type == aiohttp.WSMsgType.TEXT:
+                                payload = message.data
+                            elif message.type == aiohttp.WSMsgType.BINARY:
+                                payload = message.data
+                            elif message.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED):
+                                raise RuntimeError("IMU websocket closed")
+                            elif message.type == aiohttp.WSMsgType.ERROR:
+                                raise ws.exception() or RuntimeError("IMU websocket error")
+                            else:
+                                continue
+                            try:
+                                sample = parse_imu_json(payload)
+                            except Exception as exc:
+                                self.get_logger().warning(f"Failed to decode IMU websocket payload: {exc}")
+                                continue
+                            if sample is None:
+                                continue
+                            self._handle_streamed_imu_sample(sample)
+                except Exception as exc:
+                    if self._imu_stream_stop.is_set():
+                        break
+                    self.get_logger().warning(
+                        "IMU websocket disconnected: "
+                        f"{_format_runtime_error(exc)}; retrying in {self.config.imu_ws_reconnect_delay_s:.1f}s"
+                    )
+                    await asyncio.sleep(max(self.config.imu_ws_reconnect_delay_s, 0.1))
+
+    def _handle_streamed_imu_sample(self, imu_sample: dict[str, Any]) -> None:
+        timestamp_s = imu_ros_timestamp_s(imu_sample)
+        if timestamp_s is None:
+            timestamp_s = time.time()
+        self._imu_received_count += 1
+        if self._last_imu_timestamp_s is not None and timestamp_s == self._last_imu_timestamp_s:
+            self._imu_duplicate_timestamps += 1
+            return
+        if self._max_imu_timestamp_s is not None and timestamp_s < self._max_imu_timestamp_s:
+            self._imu_stale_timestamps += 1
+            return
+        self._last_imu_timestamp_s = timestamp_s
+        self._max_imu_timestamp_s = timestamp_s if self._max_imu_timestamp_s is None else max(
+            self._max_imu_timestamp_s,
+            timestamp_s,
+        )
+        self._track_imu_frame_gap(imu_sample, "accel_frame_index", "_last_accel_frame_index")
+        self._track_imu_frame_gap(imu_sample, "gyro_frame_index", "_last_gyro_frame_index")
+        self._publish_imu_sample(imu_sample=imu_sample)
+        self._imu_published_count += 1
+        self._log_imu_stream_stats()
+
+    def _track_imu_frame_gap(self, imu_sample: dict[str, Any], key: str, attr_name: str) -> None:
+        current = imu_sample.get(key)
+        if current is None:
+            return
+        current_index = int(current)
+        previous = getattr(self, attr_name)
+        if previous is not None and current_index > previous + 1:
+            self._imu_inferred_drop_count += current_index - previous - 1
+        setattr(self, attr_name, current_index)
+
+    def _log_imu_stream_stats(self) -> None:
+        if self._imu_published_count <= 0 or self._imu_published_count % 200 != 0:
+            return
+        now = time.monotonic()
+        dt = max(now - self._imu_log_started_at, 1e-6)
+        received_delta = self._imu_received_count - self._imu_log_received_at
+        published_delta = self._imu_published_count - self._imu_log_published_at
+        self.get_logger().info(
+            "IMU stream "
+            f"rx~={received_delta / dt:.1f}Hz publish~={published_delta / dt:.1f}Hz "
+            f"duplicates={self._imu_duplicate_timestamps} stale={self._imu_stale_timestamps} "
+            f"inferred_drops={self._imu_inferred_drop_count}"
+        )
+        self._imu_log_started_at = now
+        self._imu_log_received_at = self._imu_received_count
+        self._imu_log_published_at = self._imu_published_count
+
+    def _capture_imu_sample(self) -> dict[str, Any] | None:
+        imu_path = self.config.orbbec.output_dir.expanduser().resolve() / self.config.orbbec.imu_filename
+        if not imu_path.exists():
+            return None
+        try:
+            return read_imu_json(imu_path)
+        except Exception:
+            return None
+
+    def _poll_and_publish_imu(self) -> None:
+        imu_sample = self._capture_imu_sample()
+        if imu_sample is None:
+            return
+        timestamp_s = imu_ros_timestamp_s(imu_sample)
+        if timestamp_s is None:
+            timestamp_s = time.time()
+        if self._last_imu_timestamp_s is not None and timestamp_s <= self._last_imu_timestamp_s:
+            return
+        self._last_imu_timestamp_s = timestamp_s
+        self._publish_imu_sample(imu_sample=imu_sample)
+
+    def _drive_or_stop(self, *, linear: float, angular: float) -> bool:
+        try:
+            if abs(linear) <= 1e-6 and abs(angular) <= 1e-6:
+                if abs(self._last_linear) > 1e-6 or abs(self._last_angular) > 1e-6:
+                    response = self.runtime.stop()
+                    motion_error = _motion_result_error(response)
+                    if motion_error is not None:
+                        raise RuntimeError(f"Stop rejected by runtime: {motion_error}")
+            else:
+                response = self.runtime.drive_velocity(linear_m_s=linear, angular_rad_s=angular)
+                motion_error = _motion_result_error(response)
+                if motion_error is not None:
+                    raise RuntimeError(f"Motion rejected by runtime: {motion_error}")
+        except Exception as exc:
+            message = _format_runtime_error(exc)
+            if message != self._last_motion_error:
+                self.get_logger().error(f"Motion command failed: {message}")
+                self._last_motion_error = message
+            self._last_linear = 0.0
+            self._last_angular = 0.0
+            return False
+        self._last_motion_error = ""
         self._last_linear = linear
         self._last_angular = angular
+        return True
 
     def _integrate_commanded_odom(self, *, linear: float, angular: float, dt: float) -> None:
         if dt <= 0.0:
@@ -495,7 +868,7 @@ class RealXLeRobotRosBridge(Node):
         camera_tf.transform.translation.x = self.config.camera_x_m
         camera_tf.transform.translation.y = self.config.camera_y_m
         camera_tf.transform.translation.z = self.config.camera_z_m
-        cx, cy, cz, cw = yaw_to_quaternion_xyzw(self.config.camera_yaw_rad)
+        cx, cy, cz, cw = rpy_to_quaternion_xyzw(0.0, self._camera_pitch_rad, self.config.camera_yaw_rad)
         camera_tf.transform.rotation = _quaternion_msg(cx, cy, cz, cw)
 
         laser_tf = TransformStamped()
@@ -509,17 +882,73 @@ class RealXLeRobotRosBridge(Node):
         transforms.extend([camera_tf, laser_tf])
         self.tf_broadcaster.sendTransform(transforms)
 
+    def _publish_imu_sample(self, *, imu_sample: dict[str, Any]) -> None:
+        msg = Imu()
+        imu_timestamp_s = imu_ros_timestamp_s(imu_sample)
+        if imu_timestamp_s is None:
+            stamp = self.get_clock().now().to_msg()
+            msg.header.stamp = stamp
+        else:
+            timestamp_s = float(imu_timestamp_s)
+            sec = int(math.floor(timestamp_s))
+            nanosec = int(round((timestamp_s - sec) * 1_000_000_000.0))
+            if nanosec >= 1_000_000_000:
+                sec += 1
+                nanosec -= 1_000_000_000
+            msg.header.stamp.sec = sec
+            msg.header.stamp.nanosec = nanosec
+        msg.header.frame_id = self.config.head_camera_frame
+        msg.orientation_covariance[0] = -1.0
+        angular = imu_sample.get("angular_velocity_rad_s", {})
+        linear = imu_sample.get("linear_acceleration_m_s2", {})
+        msg.angular_velocity.x = float(angular.get("x", 0.0))
+        msg.angular_velocity.y = float(angular.get("y", 0.0))
+        msg.angular_velocity.z = float(angular.get("z", 0.0))
+        msg.linear_acceleration.x = float(linear.get("x", 0.0))
+        msg.linear_acceleration.y = float(linear.get("y", 0.0))
+        msg.linear_acceleration.z = float(linear.get("z", 0.0))
+        msg.angular_velocity_covariance[0] = 0.01
+        msg.angular_velocity_covariance[4] = 0.01
+        msg.angular_velocity_covariance[8] = 0.01
+        msg.linear_acceleration_covariance[0] = 0.1
+        msg.linear_acceleration_covariance[4] = 0.1
+        msg.linear_acceleration_covariance[8] = 0.1
+        orientation = imu_sample.get("orientation_xyzw")
+        if isinstance(orientation, dict):
+            msg.orientation = _quaternion_msg(
+                float(orientation.get("x", 0.0)),
+                float(orientation.get("y", 0.0)),
+                float(orientation.get("z", 0.0)),
+                float(orientation.get("w", 1.0)),
+            )
+            msg.orientation_covariance[0] = 0.05
+            msg.orientation_covariance[4] = 0.05
+            msg.orientation_covariance[8] = 0.05
+        self.imu_publisher.publish(msg)
+
     def _publish_scan(self, *, frame: RgbdFrame, stamp: Any) -> None:
-        if frame.depth_mm is None:
+        if frame.depth_be is not None and frame.depth_width is not None and frame.depth_height is not None:
+            ranges, angles = synthesize_scan_from_depth_be(
+                frame.depth_be,
+                width=int(frame.depth_width),
+                height=int(frame.depth_height),
+                horizontal_fov_rad=self.config.orbbec.horizontal_fov_rad,
+                band_height_px=self.config.scan_band_height_px,
+                range_min_m=self.config.laser_min_range_m,
+                range_max_m=self.config.laser_max_range_m,
+                fill_no_return=self.config.laser_fill_no_return,
+            )
+        elif frame.depth_mm is not None:
+            ranges, angles = synthesize_scan_from_depth_rows(
+                frame.depth_mm,
+                horizontal_fov_rad=self.config.orbbec.horizontal_fov_rad,
+                band_height_px=self.config.scan_band_height_px,
+                range_min_m=self.config.laser_min_range_m,
+                range_max_m=self.config.laser_max_range_m,
+                fill_no_return=self.config.laser_fill_no_return,
+            )
+        else:
             return
-        ranges, angles = synthesize_scan_from_depth_rows(
-            frame.depth_mm,
-            horizontal_fov_rad=self.config.orbbec.horizontal_fov_rad,
-            band_height_px=self.config.scan_band_height_px,
-            range_min_m=self.config.laser_min_range_m,
-            range_max_m=self.config.laser_max_range_m,
-            fill_no_return=self.config.laser_fill_no_return,
-        )
         msg = LaserScan()
         msg.header.stamp = stamp
         msg.header.frame_id = self.config.head_laser_frame
@@ -547,7 +976,18 @@ class RealXLeRobotRosBridge(Node):
             rgb_msg.step = int(frame.rgb_width) * 3
             rgb_msg.data = frame.rgb
             self.head_rgb_publisher.publish(rgb_msg)
-        if frame.depth_mm is not None and frame.depth_width is not None and frame.depth_height is not None:
+        if frame.depth_be is not None and frame.depth_width is not None and frame.depth_height is not None:
+            depth_msg = Image()
+            depth_msg.header.stamp = stamp
+            depth_msg.header.frame_id = self.config.head_camera_frame
+            depth_msg.height = int(frame.depth_height)
+            depth_msg.width = int(frame.depth_width)
+            depth_msg.encoding = "mono16"
+            depth_msg.is_bigendian = True
+            depth_msg.step = int(frame.depth_width) * 2
+            depth_msg.data = frame.depth_be
+            self.head_depth_publisher.publish(depth_msg)
+        elif frame.depth_mm is not None and frame.depth_width is not None and frame.depth_height is not None:
             depth_msg = Image()
             depth_msg.header.stamp = stamp
             depth_msg.header.frame_id = self.config.head_camera_frame
@@ -566,19 +1006,35 @@ class RealXLeRobotRosBridge(Node):
         height = frame.depth_height or frame.rgb_height
         if width is None or height is None:
             return
-        camera_info = _build_camera_info(
-            frame_id=self.config.head_camera_frame,
-            width=int(width),
-            height=int(height),
-            horizontal_fov_rad=self.config.orbbec.horizontal_fov_rad,
-        )
+        camera_info = None
+        if frame.metadata:
+            camera_info = _build_camera_info_from_metadata(
+                frame_id=self.config.head_camera_frame,
+                width=int(width),
+                height=int(height),
+                metadata=frame.metadata,
+            )
+        if camera_info is None:
+            camera_info = _build_camera_info(
+                frame_id=self.config.head_camera_frame,
+                width=int(width),
+                height=int(height),
+                horizontal_fov_rad=self.config.orbbec.horizontal_fov_rad,
+            )
         camera_info.header.stamp = stamp
         self.head_camera_info_publisher.publish(camera_info)
 
     def close(self) -> None:
         try:
-            self.runtime.stop()
-            self.runtime.close()
+            self._imu_stream_stop.set()
+            if self._imu_stream_thread is not None:
+                self._imu_stream_thread.join(timeout=max(2.0, self.config.imu_ws_reconnect_delay_s + 1.0))
+            try:
+                self.runtime.stop()
+            except Exception as exc:
+                self.get_logger().warning(f"Failed to send stop during bridge shutdown: {_format_runtime_error(exc)}")
+            finally:
+                self.runtime.close()
         finally:
             self.destroy_node()
 
@@ -605,6 +1061,52 @@ def _build_camera_info(*, frame_id: str, width: int, height: int, horizontal_fov
     msg.k = [fx, 0.0, cx, 0.0, fy, cy, 0.0, 0.0, 1.0]
     msg.p = [fx, 0.0, cx, 0.0, 0.0, fy, cy, 0.0, 0.0, 0.0, 1.0, 0.0]
     return msg
+
+
+def _build_camera_info_from_metadata(
+    *,
+    frame_id: str,
+    width: int,
+    height: int,
+    metadata: dict[str, Any],
+) -> Any | None:
+    intrinsics = metadata.get("camera_intrinsics")
+    if not isinstance(intrinsics, dict):
+        return None
+    try:
+        source_width = float(intrinsics.get("width") or width)
+        source_height = float(intrinsics.get("height") or height)
+        if source_width <= 0.0 or source_height <= 0.0:
+            return None
+        scale_x = float(width) / source_width
+        scale_y = float(height) / source_height
+        fx = float(intrinsics["fx"]) * scale_x
+        fy = float(intrinsics["fy"]) * scale_y
+        cx = float(intrinsics["cx"]) * scale_x
+        cy = float(intrinsics["cy"]) * scale_y
+    except (KeyError, TypeError, ValueError):
+        return None
+    msg = CameraInfo()
+    msg.header.frame_id = frame_id
+    msg.width = int(width)
+    msg.height = int(height)
+    msg.distortion_model = "plumb_bob"
+    msg.k = [fx, 0.0, cx, 0.0, fy, cy, 0.0, 0.0, 1.0]
+    msg.p = [fx, 0.0, cx, 0.0, 0.0, fy, cy, 0.0, 0.0, 0.0, 1.0, 0.0]
+    return msg
+
+
+def _format_runtime_error(exc: Exception) -> str:
+    if isinstance(exc, error.HTTPError):
+        detail = str(exc.reason)
+        try:
+            body = exc.read().decode("utf-8", errors="replace").strip()
+        except Exception:
+            body = ""
+        if body:
+            detail = body
+        return f"HTTP {exc.code}: {detail}"
+    return str(exc)
 
 
 def _angle_wrap(angle_rad: float) -> float:
@@ -634,6 +1136,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--odom-topic", default="/odom")
     parser.add_argument("--scan-topic", default="/scan")
+    parser.add_argument("--imu-topic", default="/imu")
     parser.add_argument("--base-frame", default="base_link")
     parser.add_argument("--odom-frame", default="odom")
     parser.add_argument("--head-camera-frame", default="head_camera_link")
@@ -642,8 +1145,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--camera-y-m", type=float, default=0.0)
     parser.add_argument("--camera-z-m", type=float, default=0.35)
     parser.add_argument("--camera-yaw-rad", type=float, default=0.0)
+    parser.add_argument("--camera-pitch-rad", type=float, default=0.0)
+    parser.add_argument("--camera-pitch-topic", default="/camera/head/pitch_rad")
+    parser.add_argument("--camera-pose-poll-period-s", type=float, default=0.2)
     parser.add_argument("--publish-head-camera", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--publish-rate-hz", type=float, default=10.0)
+    parser.add_argument("--publish-rate-hz", type=float, default=30.0)
+    parser.add_argument(
+        "--imu-publish-rate-hz",
+        type=float,
+        default=200.0,
+        help="Local filesystem IMU poll rate. Remote robot_brain IMU uses websocket push instead.",
+    )
+    parser.add_argument("--imu-ws-path", default="/ws/imu")
+    parser.add_argument("--imu-ws-reconnect-delay-s", type=float, default=1.0)
     parser.add_argument("--cmd-vel-timeout-s", type=float, default=0.5)
     parser.add_argument("--laser-min-range-m", type=float, default=0.05)
     parser.add_argument("--laser-max-range-m", type=float, default=6.0)
@@ -652,6 +1166,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--orbbec-output-dir", default="artifacts/orbbec_rgbd")
     parser.add_argument("--orbbec-rgb-filename", default="latest.ppm")
     parser.add_argument("--orbbec-depth-filename", default="latest_depth.pgm")
+    parser.add_argument(
+        "--orbbec-imu-filename",
+        default="latest_imu.json",
+        help="JSON file that carries the latest Orbbec IMU sample. Default uses latest_imu.json.",
+    )
     parser.add_argument("--orbbec-horizontal-fov-rad", type=float, default=DEFAULT_ORBBEC_HORIZONTAL_FOV_RAD)
     parser.add_argument(
         "--robot-brain-url",
@@ -679,6 +1198,7 @@ def config_from_args(args: argparse.Namespace) -> RealRosBridgeConfig:
         odom_source=args.odom_source,
         odom_topic=args.odom_topic,
         scan_topic=args.scan_topic,
+        imu_topic=args.imu_topic,
         base_frame=args.base_frame,
         odom_frame=args.odom_frame,
         head_camera_frame=args.head_camera_frame,
@@ -687,8 +1207,14 @@ def config_from_args(args: argparse.Namespace) -> RealRosBridgeConfig:
         camera_y_m=args.camera_y_m,
         camera_z_m=args.camera_z_m,
         camera_yaw_rad=args.camera_yaw_rad,
+        camera_pitch_rad=args.camera_pitch_rad,
+        camera_pitch_topic=args.camera_pitch_topic,
+        camera_pose_poll_period_s=args.camera_pose_poll_period_s,
         publish_head_camera=args.publish_head_camera,
         publish_rate_hz=args.publish_rate_hz,
+        imu_publish_rate_hz=args.imu_publish_rate_hz,
+        imu_ws_path=args.imu_ws_path,
+        imu_ws_reconnect_delay_s=args.imu_ws_reconnect_delay_s,
         cmd_vel_timeout_s=args.cmd_vel_timeout_s,
         laser_min_range_m=args.laser_min_range_m,
         laser_max_range_m=args.laser_max_range_m,
@@ -698,6 +1224,7 @@ def config_from_args(args: argparse.Namespace) -> RealRosBridgeConfig:
             output_dir=Path(args.orbbec_output_dir),
             rgb_filename=args.orbbec_rgb_filename,
             depth_filename=args.orbbec_depth_filename,
+            imu_filename=args.orbbec_imu_filename,
             horizontal_fov_rad=args.orbbec_horizontal_fov_rad,
         ),
         robot_brain_url=args.robot_brain_url,
@@ -707,13 +1234,18 @@ def config_from_args(args: argparse.Namespace) -> RealRosBridgeConfig:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     require_ros_dependencies()
+    if args.robot_brain_url:
+        require_aiohttp()
     rclpy.init()
     bridge = RealXLeRobotRosBridge(config_from_args(args))
+    executor = MultiThreadedExecutor(num_threads=3)
+    executor.add_node(bridge)
     try:
-        rclpy.spin(bridge)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:
+        executor.shutdown()
         bridge.close()
         rclpy.shutdown()
     return 0

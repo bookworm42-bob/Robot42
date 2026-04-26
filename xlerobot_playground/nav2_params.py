@@ -104,6 +104,20 @@ def patch_nav2_params(
 ) -> dict[str, Any]:
     params = deepcopy(base_params)
 
+    def set_all_use_sim_time(value: bool) -> None:
+        def visit(item: Any) -> None:
+            if isinstance(item, dict):
+                ros_params = item.get("ros__parameters")
+                if isinstance(ros_params, dict):
+                    ros_params["use_sim_time"] = value
+                for child in item.values():
+                    visit(child)
+            elif isinstance(item, list):
+                for child in item:
+                    visit(child)
+
+        visit(params)
+
     def node_params(node_name: str) -> dict[str, Any]:
         node = params.setdefault(node_name, {})
         if isinstance(node, dict) and "ros__parameters" in node:
@@ -115,6 +129,8 @@ def patch_nav2_params(
 
     def set_if_present(mapping: dict[str, Any], key: str, value: Any) -> None:
         mapping[key] = value
+
+    set_all_use_sim_time(use_sim_time)
 
     for node_name in (
         "amcl",

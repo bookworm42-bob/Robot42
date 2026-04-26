@@ -100,6 +100,7 @@ class MapStore(Protocol):
 class ExplorationBackendConfig:
     mode: str = "sim"
     persist_path: str | None = None
+    restore_persisted_state: bool = True
     step_interval_s: float = 0.05
     occupancy_resolution: float = 0.5
 
@@ -239,7 +240,8 @@ class ExplorationBackend:
         self._map_store: FileMapStore | None = (
             FileMapStore(self.config.persist_path) if self.config.persist_path is not None else None
         )
-        self._restore()
+        if self.config.restore_persisted_state:
+            self._restore()
         self._persist()
 
     def start_explore(

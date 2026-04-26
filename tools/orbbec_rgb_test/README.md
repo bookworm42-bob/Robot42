@@ -19,12 +19,25 @@ The newest frame is written to `artifacts/orbbec_rgb/latest.ppm`, with metadata 
 
 Use `--frames 0 --latest-only` for continuous capture while the VR backend is running.
 
-For the real exploration ROS bridge, run the sidecar with depth enabled and point the bridge at the same directory:
+For the real exploration ROS bridge, start `xlerobot_playground.robot_brain_agent` first, then run the sidecar with depth enabled and paired RGB-D HTTP streaming:
 
 ```sh
-./build/orbbec_rgb_test/orbbec_rgb_test --frames 0 --latest-only --enable-depth --output-dir artifacts/orbbec_rgbd
+sudo ./build/orbbec_rgb_test/orbbec_rgb_test --list-profiles
+
+sudo ./build/orbbec_rgb_test/orbbec_rgb_test \
+  --frames 0 \
+  --no-file-output \
+  --enable-depth \
+  --enable-depth-registration \
+  --enable-imu \
+  --imu-udp-host 127.0.0.1 \
+  --imu-udp-port 8766 \
+  --camera-http-enable \
+  --camera-http-host 127.0.0.1 \
+  --camera-http-port 8765 \
+  --camera-http-path /camera/rgbd
 ```
 
-This writes `latest.ppm`, `latest_depth.pgm`, and `latest.json`.
+This sends each RGB-D pair to the robot brain as a single in-memory frame at the camera capture rate. With `--enable-imu`, the sidecar also pushes each IMU callback as a non-blocking UDP datagram to the robot brain, which then serves `/imu` as an in-memory debug snapshot and `/ws/imu` as the high-rate stream.
 
-Depth defaults to the camera's first matching Y16 profile. If you need to force a specific depth mode, pass `--depth-width`, `--depth-height`, and `--depth-fps`.
+Use `--enable-depth-registration` to request Orbbec hardware depth-to-color alignment for RGB-D odometry. Depth defaults to the camera's first matching D2C-compatible Y16 profile at the selected RGB FPS. If you need to force a specific depth source mode, run `--list-profiles`, then pass one of the listed depth profiles with `--depth-width`, `--depth-height`, and `--depth-fps`.

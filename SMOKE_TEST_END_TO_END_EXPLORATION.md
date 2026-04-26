@@ -34,22 +34,7 @@ Do not start the moving smoke test until `/camera/head/camera_info`, `/odom`, an
 
 ## Robot Brain
 
-### Terminal RB-1: Orbbec RGB-D Sidecar
-
-```bash
-cd /home/alin/Robot42
-
-cmake -S tools/orbbec_rgb_test -B build/orbbec_rgb_test -DORBBEC_SDK_ROOT="$HOME/orbbec/sdk"
-cmake --build build/orbbec_rgb_test
-
-./build/orbbec_rgb_test/orbbec_rgb_test \
-  --frames 0 \
-  --latest-only \
-  --enable-depth \
-  --output-dir artifacts/orbbec_rgbd
-```
-
-### Terminal RB-2: Robot Brain Agent
+### Terminal RB-1: Robot Brain Agent
 
 Keep the robot wheels raised for the first run.
 
@@ -59,8 +44,31 @@ cd /home/alin/Robot42
 python -m xlerobot_playground.robot_brain_agent \
   --allow-motion-commands \
   --max-linear-m-s 0.03 \
-  --max-angular-rad-s 0.10 \
-  --orbbec-output-dir artifacts/orbbec_rgbd
+  --max-angular-rad-s 0.10
+```
+
+### Terminal RB-2: Orbbec RGB-D Sidecar
+
+```bash
+cd /home/alin/Robot42
+
+cmake -S tools/orbbec_rgb_test -B build/orbbec_rgb_test -DORBBEC_SDK_ROOT="$HOME/orbbec/sdk"
+cmake --build build/orbbec_rgb_test
+
+sudo ./build/orbbec_rgb_test/orbbec_rgb_test --list-profiles
+
+sudo ./build/orbbec_rgb_test/orbbec_rgb_test \
+  --frames 0 \
+  --no-file-output \
+  --enable-depth \
+  --enable-depth-registration \
+  --enable-imu \
+  --imu-udp-host 127.0.0.1 \
+  --imu-udp-port 8766 \
+  --camera-http-enable \
+  --camera-http-host 127.0.0.1 \
+  --camera-http-port 8765 \
+  --camera-http-path /camera/rgbd
 ```
 
 Check the robot brain locally:
@@ -108,9 +116,11 @@ First verify the offload computer can fetch camera data from the robot brain:
 
 ```bash
 curl --max-time 3 http://ROBOT_BRAIN_IP:8765/health
+curl --max-time 3 http://ROBOT_BRAIN_IP:8765/rgbd --output /tmp/xlerobot_rgbd.bin
 curl --max-time 3 http://ROBOT_BRAIN_IP:8765/rgb --output /tmp/xlerobot_rgb.ppm
 curl --max-time 3 http://ROBOT_BRAIN_IP:8765/depth --output /tmp/xlerobot_depth.pgm
-ls -lh /tmp/xlerobot_rgb.ppm /tmp/xlerobot_depth.pgm
+curl --max-time 3 http://ROBOT_BRAIN_IP:8765/imu
+ls -lh /tmp/xlerobot_rgbd.bin /tmp/xlerobot_rgb.ppm /tmp/xlerobot_depth.pgm
 ```
 
 Then start the bridge:
@@ -121,12 +131,14 @@ source /opt/ros/humble/setup.bash
 
 python -m xlerobot_playground.real_ros_bridge \
   --robot-brain-url http://ROBOT_BRAIN_IP:8765 \
-  --publish-rate-hz 10 \
+  --publish-rate-hz 30 \
   --camera-x-m 0.0 \
   --camera-y-m 0.0 \
   --camera-z-m 0.35 \
   --camera-yaw-rad 0.0
 ```
+
+In robot-brain mode the IMU path now comes from `ws://ROBOT_BRAIN_IP:8765/ws/imu`, not from the old `/imu` polling timer.
 
 In another offload terminal, do not continue until these work:
 
@@ -135,9 +147,34 @@ ros2 topic echo /camera/head/camera_info --once
 ros2 topic echo /camera/head/image_raw --once
 ros2 topic echo /camera/head/depth/image_raw --once
 ros2 topic echo /scan --once
+ros2 topic echo /imu --once
 ```
 
-### Terminal OFF-2: RGB-D Visual Odometry
+### Terminal OFF-2: IMU Yaw Filter
+
+```bash
+cd /home/alin/Robot42
+source /opt/ros/humble/setup.bash
+
+python -m xlerobot_playground.imu_yaw_filter \
+  --imu-topic /imu \
+  --output-topic /imu/filtered_yaw \
+  --input-frame-convention camera_optical \
+  --yaw-source gyro_y \
+  --bias-calibration-s 0.5 \
+  --yaw-rate-lowpass-alpha 0.2
+```
+
+This matches the OrbbecViewer CSV path: integrate corrected `gyro_y`.
+Keep the robot still for the first 0.5 seconds after startup so the yaw filter calibrates gyro bias cleanly.
+
+In another offload terminal, do not continue until this works:
+
+```bash
+ros2 topic echo /imu/filtered_yaw --once
+```
+
+### Terminal OFF-3: RGB-D Visual Odometry
 
 Start this only after the `real_ros_bridge` camera topics above are alive. This process creates `/odom` from RGB-D and publishes `odom -> base_link`.
 
@@ -149,9 +186,14 @@ python -m xlerobot_playground.rgbd_visual_odometry \
   --rgb-topic /camera/head/image_raw \
   --depth-topic /camera/head/depth/image_raw \
   --camera-info-topic /camera/head/camera_info \
+  --imu-topic /imu/filtered_yaw \
   --odom-topic /odom \
-  --publish-rate-hz 15
+  --imu-frame-convention base_link \
+  --imu-bias-calibration-s 0.0 \
+  --publish-rate-hz 30
 ```
+
+This consumes the filtered yaw IMU topic, which is already bias-corrected and expressed in `base_link`.
 
 In another offload terminal, do not continue until these work:
 
@@ -160,7 +202,7 @@ ros2 topic echo /odom --once
 ros2 run tf2_ros tf2_echo odom base_link
 ```
 
-### Terminal OFF-3: SLAM Toolbox Or Fake Map
+### Terminal OFF-4: SLAM Toolbox Or Fake Map
 
 For the current tiny smoke-test experiment, use the fake map path first. Skip SLAM Toolbox and let the Nav2 router publish a small all-free map. This is enough for:
 
@@ -185,7 +227,7 @@ ros2 launch slam_toolbox online_async_launch.py \
 
 Use SLAM Toolbox later when the real `/scan` and odometry path are stable.
 
-### Terminal OFF-4: Nav2
+### Terminal OFF-5: Nav2
 
 ```bash
 cd /home/alin/Robot42
@@ -197,7 +239,7 @@ ros2 launch nav2_bringup navigation_launch.py \
   params_file:=/home/alin/Robot42/artifacts/nav2/xlerobot_nav2_params.yaml
 ```
 
-### Terminal OFF-5: Nav2 HTTP Router With Fake Map
+### Terminal OFF-6: Nav2 HTTP Router With Fake Map
 
 ```bash
 cd /home/alin/Robot42
