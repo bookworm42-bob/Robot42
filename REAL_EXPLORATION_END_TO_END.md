@@ -86,13 +86,17 @@ python -m xlerobot_playground.robot_brain_agent \
   --max-angular-rad-s 0.30 \
   --camera-pan-action-key head_motor_1.pos \
   --camera-pan-action-units deg \
+  --camera-pan-action-sign 1 \
   --camera-pan-settle-s 0.5 \
-  --initial-camera-pan-deg 0
+  --initial-camera-pan-deg 0 \
+  --camera-pan-action-sign -1
 ```
 
 `head_motor_1.pos` is the default horizontal head pan motor command. Keep `--allow-motion-commands` enabled here; camera-pan exploration scans use the same safe hardware command gate as wheel motion.
 
 Keep `--use-degrees` enabled for camera-pan scans. The XLeRobot head motors use degree units only in degree mode; without it, `head_motor_1.pos` is interpreted in normalized `-100..100` units while the scan pipeline would believe the camera reached `-180..180` degrees.
+
+Check the physical pan sign before trusting the 360 map. In ROS convention, positive pan/yaw is left/counter-clockwise viewed from above. If `+30 deg` turns the head right, restart `robot_brain_agent` with `--camera-pan-action-sign -1` so the motor command is inverted while the published camera pose remains correct.
 
 ### Terminal RB-2: Orbbec Sidecar
 
@@ -347,7 +351,7 @@ python -m xlerobot_playground.real_agentic_exploration \
   --robot-brain-url "http://${ROBOT_BRAIN_IP}:8765" \
   --camera-pan-action-key head_motor_1.pos \
   --camera-pan-settle-s 0.5 \
-  --camera-pan-sample-count 12 \
+  --camera-pan-sample-count 24 \
   --ros-manual-spin-angular-speed-rad-s 0.30 \
   --max-decisions 8 \
   --ros-imu-topic /imu/filtered_yaw \
@@ -428,6 +432,9 @@ If the map starts but the head does not pan, check the robot-brain head pose and
 ```bash
 curl "http://${ROBOT_BRAIN_IP}:8765/health"
 curl "http://${ROBOT_BRAIN_IP}:8765/camera/head/pose"
+curl -X POST "http://${ROBOT_BRAIN_IP}:8765/camera/head/pan" \
+  -H 'Content-Type: application/json' \
+  -d '{"pan_deg": 30, "action_key": "head_motor_1.pos", "settle_s": 0.5}'
 curl -X POST "http://${ROBOT_BRAIN_IP}:8765/camera/head/pan" \
   -H 'Content-Type: application/json' \
   -d '{"pan_deg": 0, "action_key": "head_motor_1.pos", "settle_s": 0.5}'

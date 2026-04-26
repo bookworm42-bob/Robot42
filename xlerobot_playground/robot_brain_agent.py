@@ -64,6 +64,7 @@ class RobotBrainAgentConfig:
     camera_pitch_settle_s: float = 2.0
     camera_pan_action_key: str | None = "head_motor_1.pos"
     camera_pan_action_units: str = "deg"
+    camera_pan_action_sign: float = 1.0
     camera_pan_settle_s: float = 0.5
 
 
@@ -401,7 +402,9 @@ class RobotBrainAgent:
                 "message": compatibility_error,
                 "metadata": {"requested_pan_rad": float(pan_rad), "action_units": units},
             }
-        action_value = self._head_action_value(rad=pan_rad, deg=pan_deg, units=units)
+        action_value = self._head_action_value(rad=pan_rad, deg=pan_deg, units=units) * self._head_action_sign(
+            self.config.camera_pan_action_sign
+        )
         action = {resolved_action_key: action_value}
         with self._motion_lock:
             self.runtime.connect()
@@ -439,6 +442,10 @@ class RobotBrainAgent:
         if units == "normalized":
             return max(-100.0, min(100.0, float(rad) / math.pi * 100.0))
         raise ValueError(f"Unsupported camera head action units: {units!r}")
+
+    @staticmethod
+    def _head_action_sign(value: float) -> float:
+        return -1.0 if float(value) < 0.0 else 1.0
 
     def close(self) -> None:
         with self._motion_lock:
@@ -777,6 +784,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Robot send_action key used for absolute head/camera pan; defaults to head_motor_1.pos.",
     )
     parser.add_argument("--camera-pan-action-units", choices=("deg", "rad", "normalized"), default="deg")
+    parser.add_argument(
+        "--camera-pan-action-sign",
+        type=float,
+        default=1.0,
+        help=(
+            "Set to -1 if positive ROS/head pan commands physically turn the camera right instead of left. "
+            "The published camera pose keeps the requested ROS sign; only the motor action is inverted."
+        ),
+    )
     parser.add_argument("--camera-pan-settle-s", type=float, default=0.5)
     return parser
 
@@ -820,6 +836,7 @@ def config_from_args(args: argparse.Namespace) -> RobotBrainAgentConfig:
         camera_pitch_settle_s=args.camera_pitch_settle_s,
         camera_pan_action_key=args.camera_pan_action_key,
         camera_pan_action_units=args.camera_pan_action_units,
+        camera_pan_action_sign=args.camera_pan_action_sign,
         camera_pan_settle_s=args.camera_pan_settle_s,
     )
 
