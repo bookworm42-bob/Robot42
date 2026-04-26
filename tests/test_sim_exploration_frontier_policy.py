@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import tempfile
 import unittest
 from pathlib import Path
@@ -479,6 +480,32 @@ class SimExplorationBackendTests(unittest.TestCase):
         self.assertTrue(any(state == "occupied" for state in known_cells.values()))
         self.assertTrue(range_edge_cells)
         self.assertTrue(visited_cells)
+
+    def test_common_scan_fusion_does_not_clear_infinite_no_return_beams(self) -> None:
+        known_cells: dict[GridCell, str] = {}
+        evidence: dict[GridCell, float] = {}
+        range_edge_cells: set[GridCell] = set()
+
+        summary = integrate_planar_scan(
+            pose=Pose2D(0.5, 0.5, 0.0),
+            ranges=(math.inf,),
+            angle_min=0.0,
+            angle_increment=0.0,
+            range_min_m=0.05,
+            range_max_m=2.0,
+            resolution_m=0.5,
+            cell_from_world=lambda x, y: GridCell(int(x / 0.5), int(y / 0.5)),
+            known_cells=known_cells,
+            evidence_scores=evidence,
+            range_edge_cells=range_edge_cells,
+            beam_stride=1,
+            config=DEFAULT_OCCUPANCY_FUSION_CONFIG,
+        )
+
+        self.assertEqual(summary.scan_beams, 1)
+        self.assertEqual(summary.integrated_beams, 1)
+        self.assertEqual(known_cells, {GridCell(1, 1): "free"})
+        self.assertFalse(range_edge_cells)
 
     def test_ros_adapter_serialization_round_trips_pose_map_and_scan(self) -> None:
         pose = Pose2D(1.0, 2.0, 0.5)

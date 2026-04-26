@@ -106,7 +106,7 @@ class RealRosBridgeConfig:
     laser_min_range_m: float = 0.05
     laser_max_range_m: float = 6.0
     scan_band_height_px: int = 12
-    laser_fill_no_return: bool = True
+    laser_fill_no_return: bool = False
     orbbec: OrbbecFilesystemConfig = OrbbecFilesystemConfig()
     robot_brain_url: str | None = None
 
@@ -1175,7 +1175,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--laser-min-range-m", type=float, default=0.05)
     parser.add_argument("--laser-max-range-m", type=float, default=6.0)
     parser.add_argument("--scan-band-height-px", type=int, default=12)
-    parser.add_argument("--laser-fill-no-return", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--laser-fill-no-return", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--orbbec-output-dir", default="artifacts/orbbec_rgbd")
     parser.add_argument("--orbbec-rgb-filename", default="latest.ppm")
     parser.add_argument("--orbbec-depth-filename", default="latest_depth.pgm")

@@ -192,10 +192,13 @@ python -m xlerobot_playground.real_ros_bridge \
   --camera-yaw-rad 0.0 \
   --camera-pitch-topic /camera/head/pitch_rad \
   --camera-pan-topic /camera/head/pan_rad \
+  --no-laser-fill-no-return \
   --allow-motion-commands
 ```
 
 This publishes camera images, depth-derived `/scan`, `/imu`, camera pan/pitch topics, camera transforms, and forwards ROS `/cmd_vel` to the robot brain.
+
+Keep `--no-laser-fill-no-return` for real Orbbec mapping. Missing/invalid depth should stay unknown; treating it as max-range free space creates false fan-shaped clear areas in the fused map.
 
 `/imu` is a raw `sensor_msgs/Imu` stream carrying both angular velocity and linear acceleration. In robot-brain mode it is now pushed over a persistent websocket, so `/imu` is no longer capped by the old poll timer.
 

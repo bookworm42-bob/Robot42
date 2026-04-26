@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from io import BytesIO
+import math
 from pathlib import Path
 import tempfile
 import unittest
@@ -10,6 +11,7 @@ import xlerobot_playground.real_ros_bridge as real_ros_bridge
 from xlerobot_playground.real_ros_bridge import (
     OrbbecFilesystemConfig,
     OrbbecFilesystemRgbdSource,
+    RealRosBridgeConfig,
     RobotBrainRgbdSource,
     _build_camera_info_from_metadata,
     _motion_result_error,
@@ -192,6 +194,30 @@ class RealRosBridgeTests(unittest.TestCase):
         self.assertEqual(ranges[0], 4.0)
         self.assertLess(ranges[2], 1.1)
         self.assertEqual(ranges[-1], 4.0)
+
+    def test_depth_rows_can_leave_no_return_beams_infinite(self) -> None:
+        depth = tuple(
+            tuple(1000 if column == 2 else 0 for column in range(5))
+            for _row in range(7)
+        )
+
+        ranges, _angles = synthesize_scan_from_depth_rows(
+            depth,
+            horizontal_fov_rad=1.0,
+            band_height_px=3,
+            range_min_m=0.05,
+            range_max_m=4.0,
+            fill_no_return=False,
+        )
+
+        self.assertTrue(math.isinf(ranges[0]))
+        self.assertLess(ranges[2], 1.1)
+        self.assertTrue(math.isinf(ranges[-1]))
+
+    def test_real_bridge_defaults_do_not_clear_missing_depth(self) -> None:
+        config = RealRosBridgeConfig()
+
+        self.assertFalse(config.laser_fill_no_return)
 
     def test_reads_16_bit_depth_pgm_as_millimetres(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
