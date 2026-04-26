@@ -63,6 +63,7 @@ class RgbdVoConfig:
     min_matches: int = 20
     min_inliers: int = 12
     max_translation_step_m: float = 0.25
+    min_translation_update_m: float = 0.005
     max_yaw_step_rad: float = math.radians(30.0)
     imu_stale_after_s: float = 0.5
     imu_frame_convention: str = "camera_optical"
@@ -87,6 +88,7 @@ class RgbdVoDiagnostics:
     too_few_depth_points: int = 0
     too_few_inliers: int = 0
     translation_step_too_large: int = 0
+    translation_step_too_small: int = 0
     yaw_step_too_large: int = 0
     exceptions: int = 0
 
@@ -311,6 +313,13 @@ class FeatureRgbdOdometry:
                 object_points=len(object_points),
                 inliers=inlier_count,
             )
+        if abs(camera_forward_m) < self.config.min_translation_update_m:
+            return VisualOdomRejection(
+                "translation_step_too_small",
+                matches=len(matches),
+                object_points=len(object_points),
+                inliers=inlier_count,
+            )
         if abs(camera_yaw_rad) > self.config.max_yaw_step_rad:
             return VisualOdomRejection(
                 "yaw_step_too_large",
@@ -387,6 +396,7 @@ class RgbdVisualOdometryNode(Node):
             too_few_depth_points=self._diagnostics.too_few_depth_points,
             too_few_inliers=self._diagnostics.too_few_inliers,
             translation_step_too_large=self._diagnostics.translation_step_too_large,
+            translation_step_too_small=self._diagnostics.translation_step_too_small,
             yaw_step_too_large=self._diagnostics.yaw_step_too_large,
             exceptions=self._diagnostics.exceptions,
         )
@@ -398,6 +408,7 @@ class RgbdVisualOdometryNode(Node):
             "too_few_depth_points": self._diagnostics.too_few_depth_points,
             "too_few_inliers": self._diagnostics.too_few_inliers,
             "translation_step_too_large": self._diagnostics.translation_step_too_large,
+            "translation_step_too_small": self._diagnostics.translation_step_too_small,
             "yaw_step_too_large": self._diagnostics.yaw_step_too_large,
         }
         if rejection.reason in counts:
@@ -415,6 +426,7 @@ class RgbdVisualOdometryNode(Node):
             too_few_depth_points=counts["too_few_depth_points"],
             too_few_inliers=counts["too_few_inliers"],
             translation_step_too_large=counts["translation_step_too_large"],
+            translation_step_too_small=counts["translation_step_too_small"],
             yaw_step_too_large=counts["yaw_step_too_large"],
             exceptions=self._diagnostics.exceptions,
         )
@@ -433,6 +445,7 @@ class RgbdVisualOdometryNode(Node):
             too_few_depth_points=self._diagnostics.too_few_depth_points,
             too_few_inliers=self._diagnostics.too_few_inliers,
             translation_step_too_large=self._diagnostics.translation_step_too_large,
+            translation_step_too_small=self._diagnostics.translation_step_too_small,
             yaw_step_too_large=self._diagnostics.yaw_step_too_large,
             exceptions=self._diagnostics.exceptions + 1,
         )
@@ -456,7 +469,8 @@ class RgbdVisualOdometryNode(Node):
             f"matches:{diagnostics.too_few_matches},"
             f"depth:{diagnostics.too_few_depth_points},"
             f"inliers:{diagnostics.too_few_inliers},"
-            f"step:{diagnostics.translation_step_too_large},"
+            f"big_step:{diagnostics.translation_step_too_large},"
+            f"small_step:{diagnostics.translation_step_too_small},"
             f"yaw:{diagnostics.yaw_step_too_large},"
             f"exceptions:{diagnostics.exceptions}"
         )
@@ -598,10 +612,12 @@ class RgbdVisualOdometryNode(Node):
                         self.planar_velocity_y_m_s = 0.0
                         self.accepted_updates += 1
                         self._record_estimate(estimate)
+                        self.previous_frame = frame
                     else:
                         self.rejected_updates += 1
                         self._record_rejection(estimate)
-                self.previous_frame = frame
+                else:
+                    self.previous_frame = frame
                 stamp = frame.stamp
             except Exception as exc:
                 self.rejected_updates += 1
@@ -690,6 +706,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-matches", type=int, default=20)
     parser.add_argument("--min-inliers", type=int, default=12)
     parser.add_argument("--max-translation-step-m", type=float, default=0.25)
+    parser.add_argument(
+        "--min-translation-update-m",
+        type=float,
+        default=0.005,
+        help="Keep the current RGB-D keyframe until estimated forward motion reaches this threshold.",
+    )
     parser.add_argument("--max-yaw-step-deg", type=float, default=30.0)
     parser.add_argument("--imu-stale-after-s", type=float, default=0.5)
     parser.add_argument("--imu-bias-calibration-s", type=float, default=2.0)
@@ -722,6 +744,7 @@ def config_from_args(args: argparse.Namespace) -> RgbdVoConfig:
         min_matches=args.min_matches,
         min_inliers=args.min_inliers,
         max_translation_step_m=args.max_translation_step_m,
+        min_translation_update_m=args.min_translation_update_m,
         max_yaw_step_rad=math.radians(args.max_yaw_step_deg),
         imu_stale_after_s=args.imu_stale_after_s,
         imu_bias_calibration_s=args.imu_bias_calibration_s,
