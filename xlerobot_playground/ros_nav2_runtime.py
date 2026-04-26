@@ -760,6 +760,16 @@ class RosExplorationRuntime(Node):
         event["captured_observation_count"] = len(observations)
         event["raw_observation_count"] = len(raw_observations)
         event["camera_pan_command_count"] = len(command_events)
+        event["camera_pan_commanded_deg"] = [
+            round(math.degrees(float(item.get("pan_rad", 0.0))), 1)
+            for item in command_events
+            if isinstance(item, dict) and "pan_rad" in item
+        ]
+        event["captured_pose_yaw_deg"] = [
+            round(math.degrees(float(item["pose"].yaw)), 1)
+            for item in observations
+            if isinstance(item.get("pose"), Pose2D)
+        ]
         event["camera_pan_action_key"] = camera_pan_action_key or self.config.camera_pan_action_key
         event["scan_stop_reason"] = event.get("scan_stop_reason", "completed")
         if start_pose is not None:

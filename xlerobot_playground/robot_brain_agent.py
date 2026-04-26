@@ -41,7 +41,7 @@ class RobotBrainAgentConfig:
     robot_kind: str = "xlerobot_2wheels"
     port1: str = "/dev/tty.usbmodem5B140330101"
     port2: str = "/dev/tty.usbmodem5B140332271"
-    use_degrees: bool = False
+    use_degrees: bool = True
     allow_motion_commands: bool = False
     max_linear_m_s: float = 0.05
     max_angular_rad_s: float = 0.20
@@ -347,7 +347,14 @@ class RobotBrainAgent:
             }
         pitch_deg = float(pitch_rad) * 180.0 / math.pi
         units = str(self.config.camera_pitch_action_units).strip().lower()
-        action_value = pitch_deg if units == "deg" else float(pitch_rad)
+        compatibility_error = self._head_action_mode_error(units)
+        if compatibility_error:
+            return {
+                "succeeded": False,
+                "message": compatibility_error,
+                "metadata": {"requested_pitch_rad": float(pitch_rad), "action_units": units},
+            }
+        action_value = self._head_action_value(rad=float(pitch_rad), deg=pitch_deg, units=units)
         action = {resolved_action_key: action_value}
         with self._motion_lock:
             self.runtime.connect()
@@ -387,7 +394,14 @@ class RobotBrainAgent:
         pan_rad = max(-math.pi, min(math.pi, float(pan_rad)))
         pan_deg = pan_rad * 180.0 / math.pi
         units = str(self.config.camera_pan_action_units).strip().lower()
-        action_value = pan_deg if units == "deg" else pan_rad
+        compatibility_error = self._head_action_mode_error(units)
+        if compatibility_error:
+            return {
+                "succeeded": False,
+                "message": compatibility_error,
+                "metadata": {"requested_pan_rad": float(pan_rad), "action_units": units},
+            }
+        action_value = self._head_action_value(rad=pan_rad, deg=pan_deg, units=units)
         action = {resolved_action_key: action_value}
         with self._motion_lock:
             self.runtime.connect()
@@ -403,6 +417,28 @@ class RobotBrainAgent:
                 "camera": state,
             },
         }
+
+    def _head_action_mode_error(self, units: str) -> str | None:
+        if self.config.use_degrees:
+            return None
+        if units == "normalized":
+            return None
+        return (
+            "Camera head action units are configured as "
+            f"{units!r}, but the XLeRobot interface is not in degree mode. "
+            "Restart robot_brain_agent with --use-degrees, or use --camera-pan-action-units normalized "
+            "only if the head calibration maps -100..100 to the desired physical sweep."
+        )
+
+    @staticmethod
+    def _head_action_value(*, rad: float, deg: float, units: str) -> float:
+        if units == "deg":
+            return float(deg)
+        if units == "rad":
+            return float(rad)
+        if units == "normalized":
+            return max(-100.0, min(100.0, float(rad) / math.pi * 100.0))
+        raise ValueError(f"Unsupported camera head action units: {units!r}")
 
     def close(self) -> None:
         with self._motion_lock:
@@ -688,7 +724,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--robot-kind", choices=("xlerobot", "xlerobot_2wheels"), default="xlerobot_2wheels")
     parser.add_argument("--port1", default="/dev/tty.usbmodem5B140330101")
     parser.add_argument("--port2", default="/dev/tty.usbmodem5B140332271")
-    parser.add_argument("--use-degrees", action="store_true")
+    parser.add_argument(
+        "--use-degrees",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Configure XLeRobot arm/head motors in degree mode. This is enabled by default because "
+            "camera pan scans command head_motor_1.pos in degrees."
+        ),
+    )
     parser.add_argument("--allow-motion-commands", action="store_true")
     parser.add_argument("--max-linear-m-s", type=float, default=0.05)
     parser.add_argument("--max-angular-rad-s", type=float, default=0.20)
@@ -725,14 +769,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Robot send_action key used for absolute head/camera pitch, for example a head tilt joint position key.",
     )
-    parser.add_argument("--camera-pitch-action-units", choices=("deg", "rad"), default="deg")
+    parser.add_argument("--camera-pitch-action-units", choices=("deg", "rad", "normalized"), default="deg")
     parser.add_argument("--camera-pitch-settle-s", type=float, default=2.0)
     parser.add_argument(
         "--camera-pan-action-key",
         default="head_motor_1.pos",
         help="Robot send_action key used for absolute head/camera pan; defaults to head_motor_1.pos.",
     )
-    parser.add_argument("--camera-pan-action-units", choices=("deg", "rad"), default="deg")
+    parser.add_argument("--camera-pan-action-units", choices=("deg", "rad", "normalized"), default="deg")
     parser.add_argument("--camera-pan-settle-s", type=float, default=0.5)
     return parser
 

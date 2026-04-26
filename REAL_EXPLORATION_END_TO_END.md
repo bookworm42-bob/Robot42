@@ -78,6 +78,7 @@ python -m pip install aiohttp
 python -m xlerobot_playground.robot_brain_agent \
   --allow-motion-commands \
   --debug-motion \
+  --use-degrees \
   --robot-kind xlerobot_2wheels \
   --port1 /dev/tty.usbmodem5B140330101 \
   --port2 /dev/tty.usbmodem5B140332271 \
@@ -90,6 +91,8 @@ python -m xlerobot_playground.robot_brain_agent \
 ```
 
 `head_motor_1.pos` is the default horizontal head pan motor command. Keep `--allow-motion-commands` enabled here; camera-pan exploration scans use the same safe hardware command gate as wheel motion.
+
+Keep `--use-degrees` enabled for camera-pan scans. The XLeRobot head motors use degree units only in degree mode; without it, `head_motor_1.pos` is interpreted in normalized `-100..100` units while the scan pipeline would believe the camera reached `-180..180` degrees.
 
 ### Terminal RB-2: Orbbec Sidecar
 

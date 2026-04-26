@@ -59,6 +59,7 @@ class RobotBrainAgentTests(unittest.TestCase):
         self.assertFalse(config.allow_motion_commands)
         self.assertEqual(config.port, 8765)
         self.assertFalse(config.debug_motion)
+        self.assertTrue(config.use_degrees)
         self.assertEqual(config.calibration_prompt_response, "")
         self.assertEqual(config.imu_udp_host, "127.0.0.1")
         self.assertEqual(config.imu_udp_port, 8766)
@@ -122,6 +123,42 @@ class RobotBrainAgentTests(unittest.TestCase):
         self.assertEqual(runtime.actions, [{"head_motor_1.pos": -0.5 * 180.0 / 3.141592653589793}])
         self.assertAlmostEqual(agent.camera_state()["pan_rad"], -0.5)
         self.assertAlmostEqual(agent.camera_state()["pitch_rad"], 0.0)
+
+    def test_agent_rejects_degree_pan_when_robot_is_not_in_degree_mode(self) -> None:
+        runtime = FakeRuntime()
+        agent = RobotBrainAgent(
+            RobotBrainAgentConfig(
+                use_degrees=False,
+                allow_motion_commands=True,
+                camera_pan_action_key="head_motor_1.pos",
+                camera_pan_settle_s=0.0,
+            ),
+            runtime=runtime,
+        )
+
+        response = agent.pan_camera(pan_rad=1.0)
+
+        self.assertFalse(response["succeeded"])
+        self.assertIn("--use-degrees", response["message"])
+        self.assertEqual(runtime.actions, [])
+
+    def test_agent_can_send_normalized_pan_when_degree_mode_is_disabled(self) -> None:
+        runtime = FakeRuntime()
+        agent = RobotBrainAgent(
+            RobotBrainAgentConfig(
+                use_degrees=False,
+                allow_motion_commands=True,
+                camera_pan_action_key="head_motor_1.pos",
+                camera_pan_action_units="normalized",
+                camera_pan_settle_s=0.0,
+            ),
+            runtime=runtime,
+        )
+
+        response = agent.pan_camera(pan_rad=3.141592653589793)
+
+        self.assertTrue(response["succeeded"])
+        self.assertEqual(runtime.actions, [{"head_motor_1.pos": 100.0}])
 
     def test_agent_serves_expected_orbbec_file_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
