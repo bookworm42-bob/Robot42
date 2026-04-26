@@ -295,6 +295,7 @@ class RosExplorationRuntime(Node):
         self._latest_imu_orientation_yaw_rad: float | None = None
         self._latest_imu_orientation_unwrapped_yaw_rad: float | None = None
         self._scan_sensor_yaw_offset_rad: float | None = None
+        self._use_turn_feedback_for_scan_pose = False
         self.scan_observations: list[dict[str, Any]] = []
         self.latest_image_msg: Image | None = None
         self.latest_image_data_url: str | None = None
@@ -403,6 +404,8 @@ class RosExplorationRuntime(Node):
 
     def _scan_pose_with_turn_feedback(self, sensor_pose: Pose2D) -> Pose2D:
         if not self.config.publish_internal_navigation_map:
+            return sensor_pose
+        if not self._use_turn_feedback_for_scan_pose:
             return sensor_pose
         _feedback_frame, feedback_yaw = self._current_turn_feedback()
         if feedback_yaw is None:
@@ -635,9 +638,13 @@ class RosExplorationRuntime(Node):
             )
         if mode != "robot_spin":
             raise ValueError(f"Unsupported turn scan mode: {mode!r}")
-        spin_event = self._manual_spin(should_cancel=should_cancel)
-        settle_result = self.hold_stop_until_stable(duration_s=self.config.turn_scan_settle_s)
-        raw_observations, observation_stop_index = self.drain_scan_observations(observation_start_index)
+        self._use_turn_feedback_for_scan_pose = True
+        try:
+            spin_event = self._manual_spin(should_cancel=should_cancel)
+            settle_result = self.hold_stop_until_stable(duration_s=self.config.turn_scan_settle_s)
+            raw_observations, observation_stop_index = self.drain_scan_observations(observation_start_index)
+        finally:
+            self._use_turn_feedback_for_scan_pose = False
         observations = _select_turnaround_scan_observations(raw_observations, sample_count=sample_count)
         end_pose = self.current_pose()
         event["elapsed_s"] = round(time.time() - start_time, 3)

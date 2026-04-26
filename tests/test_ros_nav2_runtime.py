@@ -103,6 +103,48 @@ class RosNav2RuntimeTests(unittest.TestCase):
         self.assertEqual(result["raw_observation_count"], 89)
         self.assertEqual(result["scan_stop_reason"], "completed")
 
+    def test_camera_pan_scan_pose_keeps_tf_head_yaw(self) -> None:
+        class FakeRuntime:
+            def __init__(self) -> None:
+                self.config = SimpleNamespace(publish_internal_navigation_map=True)
+                self._use_turn_feedback_for_scan_pose = False
+                self._scan_sensor_yaw_offset_rad = None
+
+            def _current_turn_feedback(self):
+                return "imu", math.radians(10.0)
+
+        sensor_pose = Pose2D(1.0, 2.0, math.radians(75.0))
+
+        adjusted = RosExplorationRuntime._scan_pose_with_turn_feedback(FakeRuntime(), sensor_pose)
+
+        self.assertEqual(adjusted, sensor_pose)
+
+    def test_robot_spin_scan_pose_can_use_imu_yaw_feedback(self) -> None:
+        class FakeRuntime:
+            def __init__(self) -> None:
+                self.config = SimpleNamespace(publish_internal_navigation_map=True)
+                self._use_turn_feedback_for_scan_pose = True
+                self._scan_sensor_yaw_offset_rad = None
+                self.feedback_yaw = math.radians(10.0)
+
+            def _current_turn_feedback(self):
+                return "imu", self.feedback_yaw
+
+        runtime = FakeRuntime()
+
+        first = RosExplorationRuntime._scan_pose_with_turn_feedback(
+            runtime,
+            Pose2D(1.0, 2.0, math.radians(75.0)),
+        )
+        runtime.feedback_yaw = math.radians(30.0)
+        second = RosExplorationRuntime._scan_pose_with_turn_feedback(
+            runtime,
+            Pose2D(1.0, 2.0, math.radians(75.0)),
+        )
+
+        self.assertAlmostEqual(first.yaw, math.radians(75.0))
+        self.assertAlmostEqual(second.yaw, math.radians(95.0))
+
     def test_unknown_turn_scan_mode_is_rejected(self) -> None:
         class FakeRuntime:
             config = SimpleNamespace(
