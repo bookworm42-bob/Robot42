@@ -252,7 +252,8 @@ python -m xlerobot_playground.rgbd_visual_odometry \
   --odom-topic /odom \
   --imu-frame-convention base_link \
   --imu-bias-calibration-s 0.0 \
-  --publish-rate-hz 30
+  --publish-rate-hz 30 \
+  --min-translation-update-m 0.01
 ```
 
 In another terminal:
