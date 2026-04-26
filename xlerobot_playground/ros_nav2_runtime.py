@@ -701,18 +701,18 @@ class RosExplorationRuntime(Node):
         if not effective_robot_brain_url:
             raise RuntimeError("Camera-pan scan requires robot_brain_url; use turn_scan_mode='robot_spin' for base rotation.")
         per_side = max(int(math.ceil(max(sample_count, 2) / 2.0)), 2)
-        left_angles = [
-            -math.pi * index / float(per_side - 1)
+        positive_angles = [
+            math.pi * index / float(per_side - 1)
             for index in range(per_side)
         ]
-        right_angles = [
-            math.pi * index / float(per_side - 1)
+        negative_angles = [
+            -math.pi * index / float(per_side - 1)
             for index in range(per_side)
         ]
         observations: list[dict[str, Any]] = []
         command_events: list[dict[str, Any]] = []
         try:
-            for sweep_name, angles in (("left", left_angles), ("right", right_angles)):
+            for sweep_name, angles in (("positive", positive_angles), ("negative", negative_angles)):
                 for pan_rad in angles:
                     if should_cancel is not None and should_cancel():
                         event["scan_stop_reason"] = "canceled"

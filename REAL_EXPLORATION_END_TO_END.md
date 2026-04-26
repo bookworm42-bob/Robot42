@@ -54,7 +54,7 @@ save the final map JSON
 Default scan behavior:
 
 ```text
-camera pan scan: 0 -> -180 capture, -180 -> 0 return, 0 -> 180 capture, 180 -> 0 return
+camera pan scan: 0 -> +180 capture, +180 -> 0 return, 0 -> -180 capture, -180 -> 0 return
 robot spin scan: fallback only, selected with --ros-turn-scan-mode robot_spin
 ```
 
@@ -86,10 +86,9 @@ python -m xlerobot_playground.robot_brain_agent \
   --max-angular-rad-s 0.30 \
   --camera-pan-action-key head_motor_1.pos \
   --camera-pan-action-units deg \
-  --camera-pan-action-sign 1 \
+  --camera-pan-action-sign -1 \
   --camera-pan-settle-s 0.5 \
-  --initial-camera-pan-deg 0 \
-  --camera-pan-action-sign -1
+  --initial-camera-pan-deg 0
 ```
 
 `head_motor_1.pos` is the default horizontal head pan motor command. Keep `--allow-motion-commands` enabled here; camera-pan exploration scans use the same safe hardware command gate as wheel motion.
@@ -364,7 +363,7 @@ Open the UI from your browser:
 http://OFFLOAD_IP:8770
 ```
 
-Click `Start Explore` in the UI. The robot should keep its base still, pan the head `0 -> -180 -> 0 -> 180 -> 0`, build a partial occupancy map from the outward pan sweeps, detect frontiers, preview Nav2 paths, choose a frontier, and send a Nav2 navigation goal.
+Click `Start Explore` in the UI. The robot should keep its base still, pan the head `0 -> +180 -> 0 -> -180 -> 0`, build a partial occupancy map from the outward pan sweeps, detect frontiers, preview Nav2 paths, choose a frontier, and send a Nav2 navigation goal.
 
 By default this real-exploration command waits for the UI start request before moving the robot or panning the head. Use `--no-wait-for-ui-start` only when you want the 360 degree camera-pan scan to begin immediately after the terminal command starts.
 
@@ -425,7 +424,7 @@ Expected action servers include:
 /navigate_to_pose
 ```
 
-During the initial scan, the robot base should stay still while the head pans left, returns to center, pans right, and returns to center. The UI should move from an empty/not-started map to a partial occupancy map with candidate frontiers.
+During the initial scan, the robot base should stay still while the head pans through the positive sweep first, returns to center, pans through the negative sweep second, and returns to center. The UI should move from an empty/not-started map to a partial occupancy map with candidate frontiers.
 
 If the map starts but the head does not pan, check the robot-brain head pose and motion gate:
 

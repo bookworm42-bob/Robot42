@@ -93,12 +93,12 @@ class RosNav2RuntimeTests(unittest.TestCase):
             event={"reason": "test", "mode": "camera_pan", "sample_count": 6},
         )
 
-        expected = [0.0, -math.pi / 2.0, -math.pi, 0.0, 0.0, math.pi / 2.0, math.pi, 0.0, 0.0]
+        expected = [0.0, math.pi / 2.0, math.pi, 0.0, 0.0, -math.pi / 2.0, -math.pi, 0.0, 0.0]
         self.assertEqual(len(runtime.commands), len(expected))
         for actual, expected_value in zip(runtime.commands, expected):
             self.assertAlmostEqual(actual, expected_value)
         self.assertEqual(len(result["observations"]), 6)
-        self.assertEqual([item["scan_sweep"] for item in result["observations"]], ["left"] * 3 + ["right"] * 3)
+        self.assertEqual([item["scan_sweep"] for item in result["observations"]], ["positive"] * 3 + ["negative"] * 3)
         self.assertEqual(result["observation_stop_index"], 99)
         self.assertEqual(result["raw_observation_count"], 89)
         self.assertEqual(result["scan_stop_reason"], "completed")
