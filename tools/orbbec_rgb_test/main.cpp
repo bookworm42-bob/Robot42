@@ -207,6 +207,31 @@ std::vector<uint8_t> depth_frame_to_big_endian_mm(const std::shared_ptr<ob::Dept
     return out;
 }
 
+std::string camera_intrinsics_metadata_json(const std::shared_ptr<ob::ColorFrame> &rgb_frame) {
+    try {
+        auto profile = rgb_frame->getStreamProfile();
+        if(!profile || !profile->is<ob::VideoStreamProfile>()) {
+            return "{}";
+        }
+        auto video_profile = profile->as<ob::VideoStreamProfile>();
+        const auto intrinsic = video_profile->getIntrinsic();
+        std::ostringstream out;
+        out << std::fixed << std::setprecision(9)
+            << "{\"camera_intrinsics\":{"
+            << "\"fx\":" << intrinsic.fx << ","
+            << "\"fy\":" << intrinsic.fy << ","
+            << "\"cx\":" << intrinsic.cx << ","
+            << "\"cy\":" << intrinsic.cy << ","
+            << "\"width\":" << intrinsic.width << ","
+            << "\"height\":" << intrinsic.height
+            << "}}";
+        return out.str();
+    }
+    catch(const std::exception &) {
+        return "{}";
+    }
+}
+
 std::vector<uint8_t> build_rgbd_payload(
     const std::shared_ptr<ob::ColorFrame> &rgb_frame,
     const std::shared_ptr<ob::DepthFrame> &depth_frame,
@@ -231,15 +256,16 @@ std::vector<uint8_t> build_rgbd_payload(
         depth_payload = depth_frame_to_big_endian_mm(depth_frame);
     }
 
+    const std::string metadata_json = camera_intrinsics_metadata_json(rgb_frame);
     std::vector<uint8_t> payload;
-    payload.reserve(static_cast<size_t>(60 + rgb_size + depth_payload.size()));
+    payload.reserve(static_cast<size_t>(68 + rgb_size + depth_payload.size() + metadata_json.size()));
     const char magic[8] = {'X', 'L', 'R', 'G', 'B', 'D', '1', '\0'};
     const uint64_t frame_index = rgb_frame->getIndex() > 0 ? rgb_frame->getIndex() : fallback_frame_index;
     const uint64_t timestamp_us = rgb_frame->getSystemTimeStampUs() > 0
         ? rgb_frame->getSystemTimeStampUs()
         : unix_time_us();
     payload.insert(payload.end(), magic, magic + 8);
-    append_u32_be(payload, 1);
+    append_u32_be(payload, 2);
     append_u64_be(payload, frame_index);
     append_u64_be(payload, timestamp_us);
     append_u32_be(payload, rgb_width);
@@ -248,9 +274,11 @@ std::vector<uint8_t> build_rgbd_payload(
     append_u32_be(payload, depth_height);
     append_u64_be(payload, rgb_size);
     append_u64_be(payload, static_cast<uint64_t>(depth_payload.size()));
+    append_u64_be(payload, static_cast<uint64_t>(metadata_json.size()));
     const auto *rgb_data = reinterpret_cast<const uint8_t *>(rgb_frame->getData());
     payload.insert(payload.end(), rgb_data, rgb_data + rgb_size);
     payload.insert(payload.end(), depth_payload.begin(), depth_payload.end());
+    payload.insert(payload.end(), metadata_json.begin(), metadata_json.end());
     return payload;
 }
 

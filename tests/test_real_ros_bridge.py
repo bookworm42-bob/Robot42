@@ -6,10 +6,12 @@ import tempfile
 import unittest
 from urllib.error import HTTPError
 
+import xlerobot_playground.real_ros_bridge as real_ros_bridge
 from xlerobot_playground.real_ros_bridge import (
     OrbbecFilesystemConfig,
     OrbbecFilesystemRgbdSource,
     RobotBrainRgbdSource,
+    _build_camera_info_from_metadata,
     _motion_result_error,
     build_parser,
     config_from_args,
@@ -56,6 +58,16 @@ class _FakeBrainClient:
                 depth_be=(1234).to_bytes(2, "big"),
                 depth_width=1,
                 depth_height=1,
+                metadata={
+                    "camera_intrinsics": {
+                        "fx": 500.0,
+                        "fy": 510.0,
+                        "cx": 300.0,
+                        "cy": 200.0,
+                        "width": 640,
+                        "height": 480,
+                    }
+                },
             )
 
     def get_bytes(self, path: str) -> bytes:
@@ -273,9 +285,52 @@ class RealRosBridgeTests(unittest.TestCase):
         self.assertIsNone(frame.depth_mm)
         self.assertEqual(frame.depth_be, (1234).to_bytes(2, "big"))
         self.assertEqual(frame.depth_width, 1)
+        self.assertEqual(frame.metadata["camera_intrinsics"]["fy"], 510.0)
         self.assertEqual(frame.frame_index, 7)
         self.assertAlmostEqual(frame.timestamp_s, 1.25)
         self.assertEqual(client.requested_paths, ["/rgbd"])
+
+    def test_camera_info_from_metadata_scales_intrinsics(self) -> None:
+        class _Header:
+            frame_id = ""
+
+        class _CameraInfo:
+            def __init__(self) -> None:
+                self.header = _Header()
+                self.width = 0
+                self.height = 0
+                self.distortion_model = ""
+                self.k = []
+                self.p = []
+
+        original_camera_info = real_ros_bridge.CameraInfo
+        real_ros_bridge.CameraInfo = _CameraInfo
+        try:
+            msg = _build_camera_info_from_metadata(
+                frame_id="camera",
+                width=320,
+                height=240,
+                metadata={
+                    "camera_intrinsics": {
+                        "fx": 500.0,
+                        "fy": 520.0,
+                        "cx": 300.0,
+                        "cy": 220.0,
+                        "width": 640,
+                        "height": 480,
+                    }
+                },
+            )
+        finally:
+            real_ros_bridge.CameraInfo = original_camera_info
+
+        self.assertIsNotNone(msg)
+        self.assertEqual(msg.width, 320)
+        self.assertEqual(msg.height, 240)
+        self.assertAlmostEqual(msg.k[0], 250.0)
+        self.assertAlmostEqual(msg.k[4], 260.0)
+        self.assertAlmostEqual(msg.k[2], 150.0)
+        self.assertAlmostEqual(msg.k[5], 110.0)
 
     def test_synthesize_scan_from_depth_be_matches_row_path(self) -> None:
         rows = (

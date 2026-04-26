@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
+import json
 import struct
 import time
 
 
 RGBD_MAGIC = b"XLRGBD1\0"
-RGBD_VERSION = 1
+RGBD_VERSION = 2
 RGBD_HEADER = struct.Struct("!8sIQQIIIIQQ")
+RGBD_HEADER_V2 = struct.Struct("!8sIQQIIIIQQQ")
 
 
 @dataclass(frozen=True)
@@ -20,6 +23,7 @@ class PackedRgbdFrame:
     depth_be: bytes | None
     depth_width: int | None
     depth_height: int | None
+    metadata: dict[str, Any] | None = None
 
     @property
     def timestamp_s(self) -> float:
@@ -36,6 +40,7 @@ def pack_rgbd_frame(
     depth_be: bytes | None = None,
     depth_width: int | None = None,
     depth_height: int | None = None,
+    metadata: dict[str, Any] | None = None,
 ) -> bytes:
     if timestamp_us is None:
         timestamp_us = int(time.time() * 1_000_000.0)
@@ -49,7 +54,10 @@ def pack_rgbd_frame(
         raise ValueError(
             f"Depth payload size {len(depth_payload)} does not match dimensions {depth_width}x{depth_height}."
         )
-    header = RGBD_HEADER.pack(
+    metadata_payload = b""
+    if metadata:
+        metadata_payload = json.dumps(metadata, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    header = RGBD_HEADER_V2.pack(
         RGBD_MAGIC,
         RGBD_VERSION,
         int(frame_index),
@@ -60,8 +68,9 @@ def pack_rgbd_frame(
         int(depth_height or 0),
         len(rgb),
         len(depth_payload),
+        len(metadata_payload),
     )
-    return header + rgb + depth_payload
+    return header + rgb + depth_payload + metadata_payload
 
 
 def unpack_rgbd_frame(data: bytes) -> PackedRgbdFrame:
@@ -81,7 +90,7 @@ def unpack_rgbd_frame(data: bytes) -> PackedRgbdFrame:
     ) = RGBD_HEADER.unpack_from(data)
     if magic != RGBD_MAGIC:
         raise ValueError("RGB-D payload has an unsupported magic header.")
-    if version != RGBD_VERSION:
+    if version not in (1, RGBD_VERSION):
         raise ValueError(f"Unsupported RGB-D payload version: {version}.")
     expected_rgb_size = rgb_width * rgb_height * 3
     if rgb_size != expected_rgb_size:
@@ -90,15 +99,41 @@ def unpack_rgbd_frame(data: bytes) -> PackedRgbdFrame:
         raise ValueError("Depth payload and dimensions must be provided together.")
     if depth_size and depth_size != depth_width * depth_height * 2:
         raise ValueError(f"Depth payload size {depth_size} does not match dimensions {depth_width}x{depth_height}.")
-    expected_size = RGBD_HEADER.size + rgb_size + depth_size
+    metadata_size = 0
+    header_size = RGBD_HEADER.size
+    if version == 2:
+        if len(data) < RGBD_HEADER_V2.size:
+            raise ValueError("RGB-D v2 payload is shorter than the header.")
+        (
+            magic,
+            version,
+            frame_index,
+            timestamp_us,
+            rgb_width,
+            rgb_height,
+            depth_width,
+            depth_height,
+            rgb_size,
+            depth_size,
+            metadata_size,
+        ) = RGBD_HEADER_V2.unpack_from(data)
+        header_size = RGBD_HEADER_V2.size
+    expected_size = header_size + rgb_size + depth_size + metadata_size
     if len(data) < expected_size:
         raise ValueError(f"RGB-D payload is truncated: expected {expected_size} bytes, got {len(data)}.")
     if len(data) != expected_size:
         raise ValueError(f"RGB-D payload has trailing bytes: expected {expected_size} bytes, got {len(data)}.")
-    offset = RGBD_HEADER.size
+    offset = header_size
     rgb = data[offset : offset + rgb_size]
     offset += rgb_size
     depth_be = data[offset : offset + depth_size] if depth_size else None
+    offset += depth_size
+    metadata = None
+    if metadata_size:
+        try:
+            metadata = json.loads(data[offset : offset + metadata_size].decode("utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ValueError("RGB-D metadata is not valid JSON.") from exc
     return PackedRgbdFrame(
         frame_index=int(frame_index),
         timestamp_us=int(timestamp_us),
@@ -108,6 +143,7 @@ def unpack_rgbd_frame(data: bytes) -> PackedRgbdFrame:
         depth_be=depth_be,
         depth_width=int(depth_width) if depth_size else None,
         depth_height=int(depth_height) if depth_size else None,
+        metadata=metadata,
     )
 
 

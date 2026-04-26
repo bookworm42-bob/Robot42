@@ -117,6 +117,7 @@ class RgbdFrame:
     timestamp_s: float
     frame_index: int | None = None
     depth_be: bytes | None = None
+    metadata: dict[str, Any] | None = None
 
 
 class RgbdSource(Protocol):
@@ -438,6 +439,7 @@ class RobotBrainRgbdSource:
                 timestamp_s=frame.timestamp_s,
                 frame_index=frame.frame_index,
                 depth_be=frame.depth_be,
+                metadata=frame.metadata,
             )
         except Exception:
             pass
@@ -464,6 +466,7 @@ class RobotBrainRgbdSource:
             depth_height=depth_height,
             imu_sample=None,
             timestamp_s=time.time(),
+            metadata=None,
         )
 
 
@@ -960,12 +963,21 @@ class RealXLeRobotRosBridge(Node):
         height = frame.depth_height or frame.rgb_height
         if width is None or height is None:
             return
-        camera_info = _build_camera_info(
-            frame_id=self.config.head_camera_frame,
-            width=int(width),
-            height=int(height),
-            horizontal_fov_rad=self.config.orbbec.horizontal_fov_rad,
-        )
+        camera_info = None
+        if frame.metadata:
+            camera_info = _build_camera_info_from_metadata(
+                frame_id=self.config.head_camera_frame,
+                width=int(width),
+                height=int(height),
+                metadata=frame.metadata,
+            )
+        if camera_info is None:
+            camera_info = _build_camera_info(
+                frame_id=self.config.head_camera_frame,
+                width=int(width),
+                height=int(height),
+                horizontal_fov_rad=self.config.orbbec.horizontal_fov_rad,
+            )
         camera_info.header.stamp = stamp
         self.head_camera_info_publisher.publish(camera_info)
 
@@ -1002,6 +1014,39 @@ def _build_camera_info(*, frame_id: str, width: int, height: int, horizontal_fov
     msg.header.frame_id = frame_id
     msg.width = width
     msg.height = height
+    msg.distortion_model = "plumb_bob"
+    msg.k = [fx, 0.0, cx, 0.0, fy, cy, 0.0, 0.0, 1.0]
+    msg.p = [fx, 0.0, cx, 0.0, 0.0, fy, cy, 0.0, 0.0, 0.0, 1.0, 0.0]
+    return msg
+
+
+def _build_camera_info_from_metadata(
+    *,
+    frame_id: str,
+    width: int,
+    height: int,
+    metadata: dict[str, Any],
+) -> Any | None:
+    intrinsics = metadata.get("camera_intrinsics")
+    if not isinstance(intrinsics, dict):
+        return None
+    try:
+        source_width = float(intrinsics.get("width") or width)
+        source_height = float(intrinsics.get("height") or height)
+        if source_width <= 0.0 or source_height <= 0.0:
+            return None
+        scale_x = float(width) / source_width
+        scale_y = float(height) / source_height
+        fx = float(intrinsics["fx"]) * scale_x
+        fy = float(intrinsics["fy"]) * scale_y
+        cx = float(intrinsics["cx"]) * scale_x
+        cy = float(intrinsics["cy"]) * scale_y
+    except (KeyError, TypeError, ValueError):
+        return None
+    msg = CameraInfo()
+    msg.header.frame_id = frame_id
+    msg.width = int(width)
+    msg.height = int(height)
     msg.distortion_model = "plumb_bob"
     msg.k = [fx, 0.0, cx, 0.0, fy, cy, 0.0, 0.0, 1.0]
     msg.p = [fx, 0.0, cx, 0.0, 0.0, fy, cy, 0.0, 0.0, 0.0, 1.0, 0.0]
