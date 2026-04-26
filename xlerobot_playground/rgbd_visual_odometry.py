@@ -74,6 +74,24 @@ class RgbdVoConfig:
 
 
 @dataclass(frozen=True)
+class RgbdVoDiagnostics:
+    accepted: int = 0
+    rejected: int = 0
+    total_translation_m: float = 0.0
+    total_abs_translation_m: float = 0.0
+    last_translation_m: float = 0.0
+    last_matches: int = 0
+    last_inliers: int = 0
+    missing_descriptors: int = 0
+    too_few_matches: int = 0
+    too_few_depth_points: int = 0
+    too_few_inliers: int = 0
+    translation_step_too_large: int = 0
+    yaw_step_too_large: int = 0
+    exceptions: int = 0
+
+
+@dataclass(frozen=True)
 class PlanarPose:
     x: float
     y: float
@@ -94,6 +112,14 @@ class VisualOdomEstimate:
     yaw_rad: float
     matches: int
     inliers: int
+
+
+@dataclass(frozen=True)
+class VisualOdomRejection:
+    reason: str
+    matches: int = 0
+    object_points: int = 0
+    inliers: int = 0
 
 
 def require_runtime_dependencies() -> None:
@@ -211,14 +237,14 @@ class FeatureRgbdOdometry:
         self.detector = cv2.ORB_create(nfeatures=800)
         self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
 
-    def estimate(self, previous: VisualOdomFrame, current: VisualOdomFrame) -> VisualOdomEstimate | None:
+    def estimate(self, previous: VisualOdomFrame, current: VisualOdomFrame) -> VisualOdomEstimate | VisualOdomRejection:
         prev_keypoints, prev_descriptors = self.detector.detectAndCompute(previous.gray, None)
         curr_keypoints, curr_descriptors = self.detector.detectAndCompute(current.gray, None)
         if prev_descriptors is None or curr_descriptors is None:
-            return None
+            return VisualOdomRejection("missing_descriptors")
         matches = sorted(self.matcher.match(prev_descriptors, curr_descriptors), key=lambda item: item.distance)
         if len(matches) < self.config.min_matches:
-            return None
+            return VisualOdomRejection("too_few_matches", matches=len(matches))
 
         object_points: list[list[float]] = []
         image_points: list[list[float]] = []
@@ -239,7 +265,11 @@ class FeatureRgbdOdometry:
             image_points.append([curr_u, curr_v])
 
         if len(object_points) < self.config.min_matches:
-            return None
+            return VisualOdomRejection(
+                "too_few_depth_points",
+                matches=len(matches),
+                object_points=len(object_points),
+            )
 
         camera_matrix = np.array(
             [
@@ -260,7 +290,12 @@ class FeatureRgbdOdometry:
         )
         inlier_count = 0 if inliers is None else int(len(inliers))
         if not success or inlier_count < self.config.min_inliers:
-            return None
+            return VisualOdomRejection(
+                "too_few_inliers",
+                matches=len(matches),
+                object_points=len(object_points),
+                inliers=inlier_count,
+            )
 
         rotation, _ = cv2.Rodrigues(rvec)
         # solvePnP returns previous-camera coordinates expressed in the current
@@ -270,9 +305,19 @@ class FeatureRgbdOdometry:
         camera_forward_m = float(prev_t_curr[2])
         camera_yaw_rad = float(math.atan2(prev_from_curr[0, 2], prev_from_curr[2, 2]))
         if abs(camera_forward_m) > self.config.max_translation_step_m:
-            return None
+            return VisualOdomRejection(
+                "translation_step_too_large",
+                matches=len(matches),
+                object_points=len(object_points),
+                inliers=inlier_count,
+            )
         if abs(camera_yaw_rad) > self.config.max_yaw_step_rad:
-            return None
+            return VisualOdomRejection(
+                "yaw_step_too_large",
+                matches=len(matches),
+                object_points=len(object_points),
+                inliers=inlier_count,
+            )
         return VisualOdomEstimate(
             translation_m=camera_forward_m,
             yaw_rad=camera_yaw_rad,
@@ -315,6 +360,8 @@ class RgbdVisualOdometryNode(Node):
         self._latest_imu_received_s: float | None = None
         self.accepted_updates = 0
         self.rejected_updates = 0
+        self._diagnostics = RgbdVoDiagnostics()
+        self._last_diagnostics_log_s: float | None = None
         self.create_subscription(Image, config.rgb_topic, self._on_rgb, 10)
         self.create_subscription(Image, config.depth_topic, self._on_depth, 10)
         self.create_subscription(CameraInfo, config.camera_info_topic, self._on_camera_info, 10)
@@ -324,6 +371,94 @@ class RgbdVisualOdometryNode(Node):
             "RGB-D visual odometry ready: "
             f"rgb={config.rgb_topic} depth={config.depth_topic} camera_info={config.camera_info_topic} "
             f"imu={config.imu_topic} odom={config.odom_topic}"
+        )
+
+    def _record_estimate(self, estimate: VisualOdomEstimate) -> None:
+        self._diagnostics = RgbdVoDiagnostics(
+            accepted=self._diagnostics.accepted + 1,
+            rejected=self._diagnostics.rejected,
+            total_translation_m=self._diagnostics.total_translation_m + estimate.translation_m,
+            total_abs_translation_m=self._diagnostics.total_abs_translation_m + abs(estimate.translation_m),
+            last_translation_m=estimate.translation_m,
+            last_matches=estimate.matches,
+            last_inliers=estimate.inliers,
+            missing_descriptors=self._diagnostics.missing_descriptors,
+            too_few_matches=self._diagnostics.too_few_matches,
+            too_few_depth_points=self._diagnostics.too_few_depth_points,
+            too_few_inliers=self._diagnostics.too_few_inliers,
+            translation_step_too_large=self._diagnostics.translation_step_too_large,
+            yaw_step_too_large=self._diagnostics.yaw_step_too_large,
+            exceptions=self._diagnostics.exceptions,
+        )
+
+    def _record_rejection(self, rejection: VisualOdomRejection) -> None:
+        counts = {
+            "missing_descriptors": self._diagnostics.missing_descriptors,
+            "too_few_matches": self._diagnostics.too_few_matches,
+            "too_few_depth_points": self._diagnostics.too_few_depth_points,
+            "too_few_inliers": self._diagnostics.too_few_inliers,
+            "translation_step_too_large": self._diagnostics.translation_step_too_large,
+            "yaw_step_too_large": self._diagnostics.yaw_step_too_large,
+        }
+        if rejection.reason in counts:
+            counts[rejection.reason] += 1
+        self._diagnostics = RgbdVoDiagnostics(
+            accepted=self._diagnostics.accepted,
+            rejected=self._diagnostics.rejected + 1,
+            total_translation_m=self._diagnostics.total_translation_m,
+            total_abs_translation_m=self._diagnostics.total_abs_translation_m,
+            last_translation_m=self._diagnostics.last_translation_m,
+            last_matches=rejection.matches,
+            last_inliers=rejection.inliers,
+            missing_descriptors=counts["missing_descriptors"],
+            too_few_matches=counts["too_few_matches"],
+            too_few_depth_points=counts["too_few_depth_points"],
+            too_few_inliers=counts["too_few_inliers"],
+            translation_step_too_large=counts["translation_step_too_large"],
+            yaw_step_too_large=counts["yaw_step_too_large"],
+            exceptions=self._diagnostics.exceptions,
+        )
+
+    def _record_exception(self) -> None:
+        self._diagnostics = RgbdVoDiagnostics(
+            accepted=self._diagnostics.accepted,
+            rejected=self._diagnostics.rejected + 1,
+            total_translation_m=self._diagnostics.total_translation_m,
+            total_abs_translation_m=self._diagnostics.total_abs_translation_m,
+            last_translation_m=self._diagnostics.last_translation_m,
+            last_matches=self._diagnostics.last_matches,
+            last_inliers=self._diagnostics.last_inliers,
+            missing_descriptors=self._diagnostics.missing_descriptors,
+            too_few_matches=self._diagnostics.too_few_matches,
+            too_few_depth_points=self._diagnostics.too_few_depth_points,
+            too_few_inliers=self._diagnostics.too_few_inliers,
+            translation_step_too_large=self._diagnostics.translation_step_too_large,
+            yaw_step_too_large=self._diagnostics.yaw_step_too_large,
+            exceptions=self._diagnostics.exceptions + 1,
+        )
+
+    def _log_diagnostics(self, *, now_s: float) -> None:
+        if self._last_diagnostics_log_s is not None and now_s - self._last_diagnostics_log_s < 2.0:
+            return
+        self._last_diagnostics_log_s = now_s
+        diagnostics = self._diagnostics
+        accepted = max(diagnostics.accepted, 1)
+        self.get_logger().info(
+            "RGB-D VO stats: "
+            f"accepted={diagnostics.accepted} rejected={diagnostics.rejected} "
+            f"pose_x={self.pose.x:.3f} pose_y={self.pose.y:.3f} yaw_deg={math.degrees(self.pose.yaw):.1f} "
+            f"sum_dx={diagnostics.total_translation_m:.3f} "
+            f"mean_abs_dx={diagnostics.total_abs_translation_m / accepted:.4f} "
+            f"last_dx={diagnostics.last_translation_m:.4f} "
+            f"last_matches={diagnostics.last_matches} last_inliers={diagnostics.last_inliers} "
+            "rejects="
+            f"desc:{diagnostics.missing_descriptors},"
+            f"matches:{diagnostics.too_few_matches},"
+            f"depth:{diagnostics.too_few_depth_points},"
+            f"inliers:{diagnostics.too_few_inliers},"
+            f"step:{diagnostics.translation_step_too_large},"
+            f"yaw:{diagnostics.yaw_step_too_large},"
+            f"exceptions:{diagnostics.exceptions}"
         )
 
     def _on_rgb(self, message: Any) -> None:
@@ -445,7 +580,7 @@ class RgbdVisualOdometryNode(Node):
                 absolute_imu_yaw_rad = self._relative_imu_yaw_rad()
                 if self.previous_frame is not None:
                     estimate = self.estimator.estimate(self.previous_frame, frame)
-                    if estimate is not None:
+                    if isinstance(estimate, VisualOdomEstimate):
                         if absolute_imu_yaw_rad is not None:
                             imu_yaw_rad = angle_wrap(absolute_imu_yaw_rad - self.pose.yaw)
                         elif self.latest_imu is not None:
@@ -462,12 +597,15 @@ class RgbdVisualOdometryNode(Node):
                         self.planar_velocity_x_m_s = estimate.translation_m / dt
                         self.planar_velocity_y_m_s = 0.0
                         self.accepted_updates += 1
+                        self._record_estimate(estimate)
                     else:
                         self.rejected_updates += 1
+                        self._record_rejection(estimate)
                 self.previous_frame = frame
                 stamp = frame.stamp
             except Exception as exc:
                 self.rejected_updates += 1
+                self._record_exception()
                 self.get_logger().warning(f"RGB-D VO update rejected: {exc}")
         elif (
             abs(predicted_yaw_rad) > 1e-6
@@ -486,6 +624,7 @@ class RgbdVisualOdometryNode(Node):
             )
             self.planar_velocity_x_m_s = 0.0
             self.planar_velocity_y_m_s = 0.0
+        self._log_diagnostics(now_s=self.get_clock().now().nanoseconds / 1_000_000_000.0)
         self._publish_odom(stamp)
 
     def _publish_odom(self, stamp: Any) -> None:
