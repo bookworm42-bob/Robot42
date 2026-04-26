@@ -23,6 +23,8 @@ class RealAgenticExplorationTests(unittest.TestCase):
         self.assertEqual(translated[translated.index("--ros-imu-topic") + 1], "/imu/filtered_yaw")
         self.assertEqual(translated[translated.index("--source") + 1], "real_xlerobot")
         self.assertEqual(translated[translated.index("--ros-manual-spin-angular-speed-rad-s") + 1], "0.3")
+        self.assertEqual(translated[translated.index("--ros-turn-scan-mode") + 1], "camera_pan")
+        self.assertEqual(translated[translated.index("--camera-pan-action-key") + 1], "head_motor_1.pos")
         self.assertIn("--no-pause-for-operator-approval", translated)
 
     def test_explicit_llm_and_ui_options_are_preserved(self) -> None:

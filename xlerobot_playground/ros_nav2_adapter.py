@@ -98,9 +98,24 @@ def scan_observation_from_payload(payload: Any) -> dict[str, Any] | None:
 
 
 class RemoteRosExplorationRuntime:
-    def __init__(self, base_url: str, *, timeout_s: float = 30.0) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        timeout_s: float = 30.0,
+        turn_scan_mode: str = "camera_pan",
+        robot_brain_url: str | None = "http://127.0.0.1:8765",
+        camera_pan_action_key: str = "head_motor_1.pos",
+        camera_pan_settle_s: float = 0.5,
+        camera_pan_sample_count: int = 12,
+    ) -> None:
         self.base_url = base_url.rstrip("/")
         self.timeout_s = timeout_s
+        self.turn_scan_mode = turn_scan_mode
+        self.robot_brain_url = robot_brain_url
+        self.camera_pan_action_key = camera_pan_action_key
+        self.camera_pan_settle_s = camera_pan_settle_s
+        self.camera_pan_sample_count = camera_pan_sample_count
         self.latest_map: RosOccupancyMap | None = None
         self.latest_map_stamp_s: float = 0.0
         self.latest_scan_stats: dict[str, Any] | None = None
@@ -152,7 +167,14 @@ class RemoteRosExplorationRuntime:
         del should_cancel
         payload = self._request_json(
             "/api/runtime/turnaround_scan",
-            {"reason": reason},
+            {
+                "reason": reason,
+                "turn_scan_mode": self.turn_scan_mode,
+                "robot_brain_url": self.robot_brain_url,
+                "camera_pan_action_key": self.camera_pan_action_key,
+                "camera_pan_settle_s": self.camera_pan_settle_s,
+                "camera_pan_sample_count": self.camera_pan_sample_count,
+            },
             timeout_s=max(self.timeout_s, 300.0),
         )
         event = dict(payload.get("event", {}))
@@ -337,7 +359,14 @@ class RosNav2AdapterServer:
                         )
                         return
                     if path == "/api/runtime/turnaround_scan":
-                        result = outer.runtime.perform_turnaround_scan(reason=str(payload.get("reason", "turnaround_scan")))
+                        result = outer.runtime.perform_turnaround_scan(
+                            reason=str(payload.get("reason", "turnaround_scan")),
+                            turn_scan_mode=payload.get("turn_scan_mode"),
+                            robot_brain_url=payload.get("robot_brain_url"),
+                            camera_pan_action_key=payload.get("camera_pan_action_key"),
+                            camera_pan_settle_s=payload.get("camera_pan_settle_s"),
+                            camera_pan_sample_count=payload.get("camera_pan_sample_count"),
+                        )
                         self._send_json(
                             {
                                 "event": {key: value for key, value in result.items() if key != "observations"},

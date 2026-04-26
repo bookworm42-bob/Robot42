@@ -19,6 +19,14 @@ YOUR_MODEL       LLM model name, only for LLM mode
 YOUR_API_KEY     LLM API key, only for LLM mode
 ```
 
+On the offload computer, it is convenient to export the robot brain address once:
+
+```bash
+export ROBOT_BRAIN_IP=192.168.1.133
+```
+
+On any machine where you open the UI from a browser, replace `OFFLOAD_IP` with the offload computer IP.
+
 ## What This Runs
 
 ```text
@@ -43,6 +51,15 @@ repeat scan/frontier/decision/navigation
 save the final map JSON
 ```
 
+Default scan behavior:
+
+```text
+camera pan scan: 0 -> -180 capture, -180 -> 0 return, 0 -> 180 capture, 180 -> 0 return
+robot spin scan: fallback only, selected with --ros-turn-scan-mode robot_spin
+```
+
+The default initial and arrival scans now rotate `head_motor_1` instead of rotating the robot base. This keeps `/odom` stable during scanning and lets the two outward pan sweeps form one 360 degree scan.
+
 `real_agentic_exploration` now starts from a clean in-memory map by default even when `--persist-path` points to an existing JSON. Pass `--restore-persisted-state` only when you explicitly want to resume the backend/UI snapshot from that file.
 
 ## Robot Brain
@@ -65,15 +82,21 @@ python -m xlerobot_playground.robot_brain_agent \
   --port1 /dev/tty.usbmodem5B140330101 \
   --port2 /dev/tty.usbmodem5B140332271 \
   --max-linear-m-s 0.03 \
-  --max-angular-rad-s 0.30
+  --max-angular-rad-s 0.30 \
+  --camera-pan-action-key head_motor_1.pos \
+  --camera-pan-action-units deg \
+  --camera-pan-settle-s 0.5 \
+  --initial-camera-pan-deg 0
 ```
+
+`head_motor_1.pos` is the default horizontal head pan motor command. Keep `--allow-motion-commands` enabled here; camera-pan exploration scans use the same safe hardware command gate as wheel motion.
 
 ### Terminal RB-2: Orbbec Sidecar
 
 ```bash
 cd /Users/alin/Robot42
 
-cmake -S tools/orbbec_rgb_test -B build/orbbec_rgb_test
+cmake -S tools/orbbec_rgb_test -B build/orbbec_rgb_test -DORBBEC_SDK_ROOT="$HOME/orbbec/sdk"
 cmake --build build/orbbec_rgb_test
 
 sudo ./build/orbbec_rgb_test/orbbec_rgb_test --list-profiles
@@ -89,7 +112,10 @@ sudo ./build/orbbec_rgb_test/orbbec_rgb_test \
   --camera-http-enable \
   --camera-http-host 127.0.0.1 \
   --camera-http-port 8765 \
-  --camera-http-path /camera/rgbd
+  --camera-http-path /camera/rgbd \
+  --camera-http-timeout-ms 100 \
+  --log-every 30 \
+  --imu-log-every 200
 ```
 
 If the Orbbec default aligned depth profile is too heavy, use the listed Gemini 2 `Y16 640x400@30` depth source profile:
@@ -109,13 +135,17 @@ sudo ./build/orbbec_rgb_test/orbbec_rgb_test \
   --camera-http-enable \
   --camera-http-host 127.0.0.1 \
   --camera-http-port 8765 \
-  --camera-http-path /camera/rgbd
+  --camera-http-path /camera/rgbd \
+  --camera-http-timeout-ms 100 \
+  --log-every 30 \
+  --imu-log-every 200
 ```
 
 Quick health checks from the robot brain:
 
 ```bash
 curl http://127.0.0.1:8765/health
+curl http://127.0.0.1:8765/camera/head/pose
 curl http://127.0.0.1:8765/rgb --output /tmp/brain_rgb.ppm
 curl http://127.0.0.1:8765/depth --output /tmp/brain_depth.pgm
 curl http://127.0.0.1:8765/imu
@@ -148,7 +178,7 @@ source /home/alin/Robot42/.venv-maniskill/bin/activate
 python -m pip install aiohttp
 
 python -m xlerobot_playground.real_ros_bridge \
-  --robot-brain-url http://192.168.1.133:8765 \
+  --robot-brain-url "http://${ROBOT_BRAIN_IP}:8765" \
   --publish-rate-hz 30 \
   --cmd-vel-timeout-s 0.5 \
   --max-linear-m-s 0.03 \
@@ -157,10 +187,12 @@ python -m xlerobot_playground.real_ros_bridge \
   --camera-y-m 0.0 \
   --camera-z-m 0.35 \
   --camera-yaw-rad 0.0 \
+  --camera-pitch-topic /camera/head/pitch_rad \
+  --camera-pan-topic /camera/head/pan_rad \
   --allow-motion-commands
 ```
 
-This publishes camera images, depth-derived `/scan`, `/imu`, camera transforms, and forwards ROS `/cmd_vel` to the robot brain.
+This publishes camera images, depth-derived `/scan`, `/imu`, camera pan/pitch topics, camera transforms, and forwards ROS `/cmd_vel` to the robot brain.
 
 `/imu` is a raw `sensor_msgs/Imu` stream carrying both angular velocity and linear acceleration. In robot-brain mode it is now pushed over a persistent websocket, so `/imu` is no longer capped by the old poll timer.
 
@@ -170,8 +202,9 @@ Quick checks:
 ros2 topic echo /camera/head/camera_info --once
 ros2 topic echo /scan --once
 ros2 topic echo /imu --once
+ros2 topic echo /camera/head/pan_rad --once
 ros2 topic hz /imu
-curl http://ROBOT_BRAIN_IP:8765/health
+curl "http://${ROBOT_BRAIN_IP}:8765/health"
 ```
 
 Migration note:
@@ -228,10 +261,11 @@ python -m xlerobot_playground.rgbd_visual_odometry \
   --odom-topic /odom \
   --imu-frame-convention base_link \
   --imu-bias-calibration-s 0.0 \
-  --publish-rate-hz 30
+  --publish-rate-hz 30 \
+  --min-translation-update-m 0.01
 ```
 
-This consumes the filtered yaw IMU topic, which is already bias-corrected and expressed in `base_link`.
+This consumes RGB-D for translation and the filtered yaw IMU topic for authoritative yaw. Accelerometer double integration is not used for odometry position. The `--min-translation-update-m 0.01` threshold accumulates tiny RGB-D frame-to-frame motion until there is at least 1 cm of accepted translation, which prevents sub-millimeter noisy updates from dominating the pose.
 
 Quick checks:
 
@@ -303,6 +337,11 @@ python -m xlerobot_playground.real_agentic_exploration \
   --ros-navigation-map-source fused_scan \
   --ros-ready-timeout-s 30 \
   --ros-turn-scan-timeout-s 75 \
+  --ros-turn-scan-mode camera_pan \
+  --robot-brain-url "http://${ROBOT_BRAIN_IP}:8765" \
+  --camera-pan-action-key head_motor_1.pos \
+  --camera-pan-settle-s 0.5 \
+  --camera-pan-sample-count 12 \
   --ros-manual-spin-angular-speed-rad-s 0.30 \
   --max-decisions 8 \
   --ros-imu-topic /imu/filtered_yaw \
@@ -315,9 +354,18 @@ Open the UI from your browser:
 http://OFFLOAD_IP:8770
 ```
 
-Click `Start Explore` in the UI. The robot should begin with a faster right-turn 360 degree scan, build a partial occupancy map, detect frontiers, preview Nav2 paths, choose a frontier, and send a Nav2 navigation goal.
+Click `Start Explore` in the UI. The robot should keep its base still, pan the head `0 -> -180 -> 0 -> 180 -> 0`, build a partial occupancy map from the outward pan sweeps, detect frontiers, preview Nav2 paths, choose a frontier, and send a Nav2 navigation goal.
 
-By default this real-exploration command waits for the UI start request before moving the robot. Use `--no-wait-for-ui-start` only when you want the 360 degree scan to begin immediately after the terminal command starts.
+By default this real-exploration command waits for the UI start request before moving the robot or panning the head. Use `--no-wait-for-ui-start` only when you want the 360 degree camera-pan scan to begin immediately after the terminal command starts.
+
+Robot-spin fallback:
+
+```bash
+python -m xlerobot_playground.real_agentic_exploration ... \
+  --ros-turn-scan-mode robot_spin
+```
+
+Use this only if the head pan motor path is unavailable. In fallback mode the 360 scan uses `/cmd_vel` and rotates the robot base.
 
 Once heuristic exploration is sane, switch to LLM policy:
 
@@ -335,6 +383,11 @@ python -m xlerobot_playground.real_agentic_exploration \
   --ros-navigation-map-source fused_scan \
   --ros-ready-timeout-s 30 \
   --ros-turn-scan-timeout-s 75 \
+  --ros-turn-scan-mode camera_pan \
+  --robot-brain-url "http://${ROBOT_BRAIN_IP}:8765" \
+  --camera-pan-action-key head_motor_1.pos \
+  --camera-pan-settle-s 0.5 \
+  --camera-pan-sample-count 12 \
   --ros-manual-spin-angular-speed-rad-s 0.30 \
   --max-decisions 8
 ```
@@ -347,6 +400,7 @@ Run these on the offload computer before starting exploration:
 ros2 topic echo /camera/head/camera_info --once
 ros2 topic echo /camera/head/image_raw --once
 ros2 topic echo /camera/head/depth/image_raw --once
+ros2 topic echo /camera/head/pan_rad --once
 ros2 topic echo /scan --once
 ros2 topic echo /odom --once
 ros2 run tf2_ros tf2_echo odom base_link
@@ -361,21 +415,24 @@ Expected action servers include:
 /navigate_to_pose
 ```
 
-During the initial scan, the robot should rotate to the right in place and the UI should move from an empty/not-started map to a partial occupancy map with candidate frontiers.
+During the initial scan, the robot base should stay still while the head pans left, returns to center, pans right, and returns to center. The UI should move from an empty/not-started map to a partial occupancy map with candidate frontiers.
 
-If the map starts but the robot does not rotate, check whether the scan command is being published and forwarded:
+If the map starts but the head does not pan, check the robot-brain head pose and motion gate:
 
 ```bash
-ros2 topic echo /cmd_vel --once
-curl http://ROBOT_BRAIN_IP:8765/health
+curl "http://${ROBOT_BRAIN_IP}:8765/health"
+curl "http://${ROBOT_BRAIN_IP}:8765/camera/head/pose"
+curl -X POST "http://${ROBOT_BRAIN_IP}:8765/camera/head/pan" \
+  -H 'Content-Type: application/json' \
+  -d '{"pan_deg": 0, "action_key": "head_motor_1.pos", "settle_s": 0.5}'
 ```
 
-The `real_ros_bridge` terminal should log motion forwarding errors if the robot brain rejects `/cmd_vel`.
+The `robot_brain_agent` terminal should log motion/action errors if it rejects the pan command. In `robot_spin` fallback mode, the `real_ros_bridge` terminal should log motion forwarding errors if the robot brain rejects `/cmd_vel`.
 
 ## What You Should See
 
-- Robot brain logs showing `/rgb`, `/depth`, and `/cmd_vel` requests.
-- `real_ros_bridge` publishing `/camera/head/*`, `/scan`, and forwarding `/cmd_vel`.
+- Robot brain logs showing RGB-D/IMU receive rates and pan commands during 360 scans.
+- `real_ros_bridge` publishing `/camera/head/*`, `/scan`, camera pan/pitch topics, and forwarding `/cmd_vel` during Nav2 navigation.
 - RGB-D visual odometry publishing `/odom` and `odom -> base_link`.
 - Nav2 accepting `compute_path_to_pose` and `navigate_to_pose`.
 - UI showing:
@@ -392,8 +449,8 @@ The `real_ros_bridge` terminal should log motion forwarding errors if the robot 
 
 ## Current Limitations
 
-- RGB-D visual odometry is experimental and may drift, especially during rotation.
-- The initial 360 scan uses ROS `/cmd_vel` through `real_ros_bridge`; the robot brain executes the velocity commands.
+- RGB-D visual odometry is experimental and may drift, especially if RGB-D alignment, intrinsics, or feature texture are poor.
+- The default initial and arrival 360 scans use camera pan through robot brain `head_motor_1.pos`; robot base rotation is fallback only with `--ros-turn-scan-mode robot_spin`.
 - Frontier navigation uses Nav2 `navigate_to_pose`; this is the existing ROS exploration execution path.
 - Exact region naming and semantic waypoint quality depend on good RGB keyframes and LLM/VLM configuration.
 - Saving the final map JSON works through `--persist-path`; saving directly into persistent robot memory is still a separate integration step.

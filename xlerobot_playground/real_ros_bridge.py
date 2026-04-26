@@ -95,6 +95,7 @@ class RealRosBridgeConfig:
     camera_yaw_rad: float = 0.0
     camera_pitch_rad: float = 0.0
     camera_pitch_topic: str = "/camera/head/pitch_rad"
+    camera_pan_topic: str = "/camera/head/pan_rad"
     camera_pose_poll_period_s: float = 0.2
     publish_head_camera: bool = True
     publish_rate_hz: float = 30.0
@@ -611,7 +612,9 @@ class RealXLeRobotRosBridge(Node):
         self.head_depth_publisher = None
         self.head_camera_info_publisher = None
         self.camera_pitch_publisher = self.create_publisher(Float32, config.camera_pitch_topic, 10)
+        self.camera_pan_publisher = self.create_publisher(Float32, config.camera_pan_topic, 10)
         self._camera_pitch_rad = float(config.camera_pitch_rad)
+        self._camera_pan_rad = 0.0
         self._last_camera_pose_poll_s = 0.0
         if config.publish_head_camera:
             self.head_rgb_publisher = self.create_publisher(Image, "/camera/head/image_raw", 10)
@@ -673,11 +676,16 @@ class RealXLeRobotRosBridge(Node):
                 state = self.brain_client.get_json("/camera/head/pose")
                 if "pitch_rad" in state:
                     self._camera_pitch_rad = float(state["pitch_rad"])
+                if "pan_rad" in state:
+                    self._camera_pan_rad = float(state["pan_rad"])
             except Exception as exc:
                 self.get_logger().warning(f"Failed to fetch camera head pose: {_format_runtime_error(exc)}")
-        msg = Float32()
-        msg.data = float(self._camera_pitch_rad)
-        self.camera_pitch_publisher.publish(msg)
+        pitch_msg = Float32()
+        pitch_msg.data = float(self._camera_pitch_rad)
+        self.camera_pitch_publisher.publish(pitch_msg)
+        pan_msg = Float32()
+        pan_msg.data = float(self._camera_pan_rad)
+        self.camera_pan_publisher.publish(pan_msg)
 
     def _start_imu_stream_thread(self, websocket_url: str) -> None:
         self._imu_stream_thread = threading.Thread(
@@ -868,7 +876,11 @@ class RealXLeRobotRosBridge(Node):
         camera_tf.transform.translation.x = self.config.camera_x_m
         camera_tf.transform.translation.y = self.config.camera_y_m
         camera_tf.transform.translation.z = self.config.camera_z_m
-        cx, cy, cz, cw = rpy_to_quaternion_xyzw(0.0, self._camera_pitch_rad, self.config.camera_yaw_rad)
+        cx, cy, cz, cw = rpy_to_quaternion_xyzw(
+            0.0,
+            self._camera_pitch_rad,
+            self.config.camera_yaw_rad + self._camera_pan_rad,
+        )
         camera_tf.transform.rotation = _quaternion_msg(cx, cy, cz, cw)
 
         laser_tf = TransformStamped()
@@ -1147,6 +1159,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--camera-yaw-rad", type=float, default=0.0)
     parser.add_argument("--camera-pitch-rad", type=float, default=0.0)
     parser.add_argument("--camera-pitch-topic", default="/camera/head/pitch_rad")
+    parser.add_argument("--camera-pan-topic", default="/camera/head/pan_rad")
     parser.add_argument("--camera-pose-poll-period-s", type=float, default=0.2)
     parser.add_argument("--publish-head-camera", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--publish-rate-hz", type=float, default=30.0)
@@ -1209,6 +1222,7 @@ def config_from_args(args: argparse.Namespace) -> RealRosBridgeConfig:
         camera_yaw_rad=args.camera_yaw_rad,
         camera_pitch_rad=args.camera_pitch_rad,
         camera_pitch_topic=args.camera_pitch_topic,
+        camera_pan_topic=args.camera_pan_topic,
         camera_pose_poll_period_s=args.camera_pose_poll_period_s,
         publish_head_camera=args.publish_head_camera,
         publish_rate_hz=args.publish_rate_hz,

@@ -88,6 +88,7 @@ class RealRosBridgeTests(unittest.TestCase):
         self.assertEqual(config.max_linear_m_s, 0.05)
         self.assertEqual(config.max_angular_rad_s, 0.20)
         self.assertEqual(config.camera_z_m, 0.35)
+        self.assertEqual(config.camera_pan_topic, "/camera/head/pan_rad")
 
     def test_camera_mount_arguments_are_configurable(self) -> None:
         args = build_parser().parse_args(

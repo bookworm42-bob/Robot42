@@ -58,9 +58,13 @@ class RobotBrainAgentConfig:
     camera_max_frame_bytes: int = 16 * 1024 * 1024
     camera_log_every: int = 30
     initial_camera_pitch_rad: float = 0.0
+    initial_camera_pan_rad: float = 0.0
     camera_pitch_action_key: str | None = None
     camera_pitch_action_units: str = "deg"
     camera_pitch_settle_s: float = 2.0
+    camera_pan_action_key: str | None = "head_motor_1.pos"
+    camera_pan_action_units: str = "deg"
+    camera_pan_settle_s: float = 0.5
 
 
 class ImuStreamState:
@@ -246,7 +250,8 @@ class RobotBrainAgent:
         self.rgbd_stream = RgbdStreamState(log_every=config.camera_log_every)
         self._camera_state_lock = threading.Lock()
         self._camera_pitch_rad = float(config.initial_camera_pitch_rad)
-        self._camera_pitch_updated_s = time.time()
+        self._camera_pan_rad = float(config.initial_camera_pan_rad)
+        self._camera_pose_updated_s = time.time()
 
     def velocity(self, *, linear_m_s: float, angular_rad_s: float) -> dict[str, Any]:
         if self.config.debug_motion:
@@ -295,17 +300,29 @@ class RobotBrainAgent:
             return {
                 "pitch_rad": self._camera_pitch_rad,
                 "pitch_deg": self._camera_pitch_rad * 180.0 / math.pi,
-                "updated_s": self._camera_pitch_updated_s,
+                "pan_rad": self._camera_pan_rad,
+                "pan_deg": self._camera_pan_rad * 180.0 / math.pi,
+                "updated_s": self._camera_pose_updated_s,
             }
 
-    def update_camera_state(self, *, pitch_rad: float) -> dict[str, Any]:
+    def update_camera_state(
+        self,
+        *,
+        pitch_rad: float | None = None,
+        pan_rad: float | None = None,
+    ) -> dict[str, Any]:
         with self._camera_state_lock:
-            self._camera_pitch_rad = float(pitch_rad)
-            self._camera_pitch_updated_s = time.time()
+            if pitch_rad is not None:
+                self._camera_pitch_rad = float(pitch_rad)
+            if pan_rad is not None:
+                self._camera_pan_rad = float(pan_rad)
+            self._camera_pose_updated_s = time.time()
             return {
                 "pitch_rad": self._camera_pitch_rad,
                 "pitch_deg": self._camera_pitch_rad * 180.0 / math.pi,
-                "updated_s": self._camera_pitch_updated_s,
+                "pan_rad": self._camera_pan_rad,
+                "pan_deg": self._camera_pan_rad * 180.0 / math.pi,
+                "updated_s": self._camera_pose_updated_s,
             }
 
     def pitch_camera(
@@ -340,6 +357,46 @@ class RobotBrainAgent:
         return {
             "succeeded": True,
             "message": "Camera pitch command sent and state updated.",
+            "metadata": {
+                "requested_action": action,
+                "sent_action": sent,
+                "camera": state,
+            },
+        }
+
+    def pan_camera(
+        self,
+        *,
+        pan_rad: float,
+        action_key: str | None = None,
+        settle_s: float | None = None,
+    ) -> dict[str, Any]:
+        if not self.config.allow_motion_commands:
+            return {
+                "succeeded": False,
+                "message": "Real camera pan commands are disabled. Set --allow-motion-commands after hardware checks.",
+                "metadata": {"requested_pan_rad": float(pan_rad)},
+            }
+        resolved_action_key = action_key or self.config.camera_pan_action_key
+        if not resolved_action_key:
+            return {
+                "succeeded": False,
+                "message": "No camera pan action key configured. Set --camera-pan-action-key or pass action_key.",
+                "metadata": {"requested_pan_rad": float(pan_rad)},
+            }
+        pan_rad = max(-math.pi, min(math.pi, float(pan_rad)))
+        pan_deg = pan_rad * 180.0 / math.pi
+        units = str(self.config.camera_pan_action_units).strip().lower()
+        action_value = pan_deg if units == "deg" else pan_rad
+        action = {resolved_action_key: action_value}
+        with self._motion_lock:
+            self.runtime.connect()
+            sent = self.runtime.robot.send_action(action)
+            time.sleep(max(0.0, self.config.camera_pan_settle_s if settle_s is None else float(settle_s)))
+        state = self.update_camera_state(pan_rad=pan_rad)
+        return {
+            "succeeded": True,
+            "message": "Camera pan command sent and state updated.",
             "metadata": {
                 "requested_action": action,
                 "sent_action": sent,
@@ -472,13 +529,19 @@ async def _handle_camera_head_pose_post(request: web.Request) -> web.Response:
     agent: RobotBrainAgent = request.app["agent"]
     raw = await request.read() if request.can_read_body else b""
     payload = json.loads(raw.decode("utf-8")) if raw else {}
+    pitch_rad = None
+    pan_rad = None
     if "pitch_rad" in payload:
         pitch_rad = float(payload["pitch_rad"])
     elif "pitch_deg" in payload:
         pitch_rad = float(payload["pitch_deg"]) * math.pi / 180.0
-    else:
-        raise web.HTTPBadRequest(text="Expected pitch_rad or pitch_deg.")
-    return web.json_response(agent.update_camera_state(pitch_rad=pitch_rad))
+    if "pan_rad" in payload:
+        pan_rad = float(payload["pan_rad"])
+    elif "pan_deg" in payload:
+        pan_rad = float(payload["pan_deg"]) * math.pi / 180.0
+    if pitch_rad is None and pan_rad is None:
+        raise web.HTTPBadRequest(text="Expected pitch_rad, pitch_deg, pan_rad, or pan_deg.")
+    return web.json_response(agent.update_camera_state(pitch_rad=pitch_rad, pan_rad=pan_rad))
 
 
 async def _handle_camera_head_pitch(request: web.Request) -> web.Response:
@@ -494,6 +557,26 @@ async def _handle_camera_head_pitch(request: web.Request) -> web.Response:
     response = await asyncio.to_thread(
         agent.pitch_camera,
         pitch_rad=pitch_rad,
+        action_key=payload.get("action_key"),
+        settle_s=payload.get("settle_s"),
+    )
+    status = 200 if response.get("succeeded") else 400
+    return web.json_response(response, status=status)
+
+
+async def _handle_camera_head_pan(request: web.Request) -> web.Response:
+    agent: RobotBrainAgent = request.app["agent"]
+    raw = await request.read() if request.can_read_body else b""
+    payload = json.loads(raw.decode("utf-8")) if raw else {}
+    if "pan_rad" in payload:
+        pan_rad = float(payload["pan_rad"])
+    elif "pan_deg" in payload:
+        pan_rad = float(payload["pan_deg"]) * math.pi / 180.0
+    else:
+        raise web.HTTPBadRequest(text="Expected pan_rad or pan_deg.")
+    response = await asyncio.to_thread(
+        agent.pan_camera,
+        pan_rad=pan_rad,
         action_key=payload.get("action_key"),
         settle_s=payload.get("settle_s"),
     )
@@ -590,6 +673,7 @@ def build_app(agent: RobotBrainAgent) -> web.Application:
     app.router.add_get("/camera/head/pose", _handle_camera_head_pose_get)
     app.router.add_post("/camera/head/pose", _handle_camera_head_pose_post)
     app.router.add_post("/camera/head/pitch", _handle_camera_head_pitch)
+    app.router.add_post("/camera/head/pan", _handle_camera_head_pan)
     app.router.add_get("/ws/imu", _handle_imu_websocket)
     app.router.add_post("/cmd_vel", _handle_cmd_vel)
     app.router.add_post("/stop", _handle_stop)
@@ -634,6 +718,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--camera-log-every", type=int, default=30)
     parser.add_argument("--initial-camera-pitch-rad", type=float, default=0.0)
     parser.add_argument("--initial-camera-pitch-deg", type=float, default=None)
+    parser.add_argument("--initial-camera-pan-rad", type=float, default=0.0)
+    parser.add_argument("--initial-camera-pan-deg", type=float, default=None)
     parser.add_argument(
         "--camera-pitch-action-key",
         default=None,
@@ -641,6 +727,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--camera-pitch-action-units", choices=("deg", "rad"), default="deg")
     parser.add_argument("--camera-pitch-settle-s", type=float, default=2.0)
+    parser.add_argument(
+        "--camera-pan-action-key",
+        default="head_motor_1.pos",
+        help="Robot send_action key used for absolute head/camera pan; defaults to head_motor_1.pos.",
+    )
+    parser.add_argument("--camera-pan-action-units", choices=("deg", "rad"), default="deg")
+    parser.add_argument("--camera-pan-settle-s", type=float, default=0.5)
     return parser
 
 
@@ -673,9 +766,17 @@ def config_from_args(args: argparse.Namespace) -> RobotBrainAgentConfig:
             if args.initial_camera_pitch_deg is None
             else args.initial_camera_pitch_deg * math.pi / 180.0
         ),
+        initial_camera_pan_rad=(
+            args.initial_camera_pan_rad
+            if args.initial_camera_pan_deg is None
+            else args.initial_camera_pan_deg * math.pi / 180.0
+        ),
         camera_pitch_action_key=args.camera_pitch_action_key,
         camera_pitch_action_units=args.camera_pitch_action_units,
         camera_pitch_settle_s=args.camera_pitch_settle_s,
+        camera_pan_action_key=args.camera_pan_action_key,
+        camera_pan_action_units=args.camera_pan_action_units,
+        camera_pan_settle_s=args.camera_pan_settle_s,
     )
 
 

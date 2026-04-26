@@ -3,10 +3,12 @@ from __future__ import annotations
 import base64
 from dataclasses import dataclass
 from io import BytesIO
+import json
 import math
 import subprocess
 import time
 from typing import Any, Callable, Iterable
+from urllib import error, request
 
 import numpy as np
 
@@ -219,6 +221,11 @@ class RosRuntimeConfig:
     manual_spin_angular_speed_rad_s: float = 0.25
     manual_spin_publish_hz: float = 20.0
     manual_spin_direction_sign: float = -1.0
+    turn_scan_mode: str = "camera_pan"
+    robot_brain_url: str | None = "http://127.0.0.1:8765"
+    camera_pan_action_key: str = "head_motor_1.pos"
+    camera_pan_settle_s: float = 0.5
+    camera_pan_sample_count: int = 12
     allow_multiple_action_servers: bool = False
     publish_internal_navigation_map: bool = True
 
@@ -596,17 +603,38 @@ class RosExplorationRuntime(Node):
         *,
         reason: str,
         should_cancel: Callable[[], bool] | None = None,
+        turn_scan_mode: str | None = None,
+        robot_brain_url: str | None = None,
+        camera_pan_action_key: str | None = None,
+        camera_pan_settle_s: float | None = None,
+        camera_pan_sample_count: int | None = None,
     ) -> dict[str, Any]:
         start_time = time.time()
         start_pose = self.current_pose()
         observation_start_index = len(self.scan_observations)
-        sample_count = 12
+        mode = str(turn_scan_mode or self.config.turn_scan_mode)
+        sample_count = max(int(camera_pan_sample_count or self.config.camera_pan_sample_count), 2)
         event = {
             "reason": reason,
-            "mode": "continuous_spin",
+            "mode": mode,
             "target_yaw_rad": round(self.config.turn_scan_radians, 3),
             "sample_count": sample_count,
         }
+        if mode == "camera_pan":
+            return self._perform_camera_pan_scan(
+                reason=reason,
+                should_cancel=should_cancel,
+                start_time=start_time,
+                start_pose=start_pose,
+                observation_start_index=observation_start_index,
+                sample_count=sample_count,
+                event=event,
+                robot_brain_url=robot_brain_url,
+                camera_pan_action_key=camera_pan_action_key,
+                camera_pan_settle_s=camera_pan_settle_s,
+            )
+        if mode != "robot_spin":
+            raise ValueError(f"Unsupported turn scan mode: {mode!r}")
         spin_event = self._manual_spin(should_cancel=should_cancel)
         settle_result = self.hold_stop_until_stable(duration_s=self.config.turn_scan_settle_s)
         raw_observations, observation_stop_index = self.drain_scan_observations(observation_start_index)
@@ -647,6 +675,132 @@ class RosExplorationRuntime(Node):
         response["observation_stop_index"] = observation_stop_index
         self._nav_scan_history.append(event)
         return response
+
+    def _perform_camera_pan_scan(
+        self,
+        *,
+        reason: str,
+        should_cancel: Callable[[], bool] | None,
+        start_time: float,
+        start_pose: Pose2D | None,
+        observation_start_index: int,
+        sample_count: int,
+        event: dict[str, Any],
+        robot_brain_url: str | None = None,
+        camera_pan_action_key: str | None = None,
+        camera_pan_settle_s: float | None = None,
+    ) -> dict[str, Any]:
+        effective_robot_brain_url = robot_brain_url or self.config.robot_brain_url
+        if not effective_robot_brain_url:
+            raise RuntimeError("Camera-pan scan requires robot_brain_url; use turn_scan_mode='robot_spin' for base rotation.")
+        per_side = max(int(math.ceil(max(sample_count, 2) / 2.0)), 2)
+        left_angles = [
+            -math.pi * index / float(per_side - 1)
+            for index in range(per_side)
+        ]
+        right_angles = [
+            math.pi * index / float(per_side - 1)
+            for index in range(per_side)
+        ]
+        observations: list[dict[str, Any]] = []
+        command_events: list[dict[str, Any]] = []
+        try:
+            for sweep_name, angles in (("left", left_angles), ("right", right_angles)):
+                for pan_rad in angles:
+                    if should_cancel is not None and should_cancel():
+                        event["scan_stop_reason"] = "canceled"
+                        break
+                    command_events.append(
+                        self._command_camera_pan(
+                            pan_rad,
+                            robot_brain_url=effective_robot_brain_url,
+                            action_key=camera_pan_action_key,
+                            settle_s=camera_pan_settle_s,
+                        )
+                    )
+                    observation = self._capture_settled_scan_observation()
+                    if observation is not None:
+                        observation["scan_sweep"] = sweep_name
+                        observation["camera_pan_rad"] = pan_rad
+                        observations.append(observation)
+                if event.get("scan_stop_reason") == "canceled":
+                    break
+                command_events.append(
+                    self._command_camera_pan(
+                        0.0,
+                        robot_brain_url=effective_robot_brain_url,
+                        action_key=camera_pan_action_key,
+                        settle_s=camera_pan_settle_s,
+                    )
+                )
+                self.hold_stop_until_stable(duration_s=max(float(self.config.turn_scan_settle_s), 0.1))
+        finally:
+            try:
+                command_events.append(
+                    self._command_camera_pan(
+                        0.0,
+                        robot_brain_url=effective_robot_brain_url,
+                        action_key=camera_pan_action_key,
+                        settle_s=camera_pan_settle_s,
+                    )
+                )
+            except Exception as exc:
+                event["restore_error"] = str(exc)
+
+        raw_observations, observation_stop_index = self.drain_scan_observations(observation_start_index)
+        end_pose = self.current_pose()
+        event["elapsed_s"] = round(time.time() - start_time, 3)
+        event["captured_observation_count"] = len(observations)
+        event["raw_observation_count"] = len(raw_observations)
+        event["camera_pan_command_count"] = len(command_events)
+        event["camera_pan_action_key"] = camera_pan_action_key or self.config.camera_pan_action_key
+        event["scan_stop_reason"] = event.get("scan_stop_reason", "completed")
+        if start_pose is not None:
+            event["start_pose"] = start_pose.to_dict()
+        if end_pose is not None:
+            event["end_pose"] = end_pose.to_dict()
+        if start_pose is not None and end_pose is not None:
+            yaw_delta = math.atan2(
+                math.sin(end_pose.yaw - start_pose.yaw),
+                math.cos(end_pose.yaw - start_pose.yaw),
+            )
+            event["wrapped_yaw_delta_rad"] = round(yaw_delta, 3)
+            event["note"] = "Camera-pan scan keeps the robot base fixed; yaw change should remain near 0."
+        response = dict(event)
+        response["observations"] = observations
+        response["observation_stop_index"] = observation_stop_index
+        self._nav_scan_history.append(event)
+        return response
+
+    def _command_camera_pan(
+        self,
+        pan_rad: float,
+        *,
+        robot_brain_url: str | None = None,
+        action_key: str | None = None,
+        settle_s: float | None = None,
+    ) -> dict[str, Any]:
+        payload = {
+            "pan_rad": float(pan_rad),
+            "action_key": action_key or self.config.camera_pan_action_key,
+            "settle_s": float(self.config.camera_pan_settle_s if settle_s is None else settle_s),
+        }
+        url = f"{str(robot_brain_url or self.config.robot_brain_url).rstrip('/')}/camera/head/pan"
+        data = json.dumps(payload).encode("utf-8")
+        req = request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            with request.urlopen(req, timeout=max(float(self.config.server_timeout_s), 1.0)) as response:
+                body = response.read().decode("utf-8")
+        except error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"Camera pan command failed: HTTP {exc.code}: {detail}") from exc
+        result = json.loads(body or "{}")
+        if not bool(result.get("succeeded", False)):
+            raise RuntimeError(f"Camera pan command failed: {result.get('message', 'unknown error')}")
+        return {
+            "pan_rad": float(pan_rad),
+            "response": result,
+        }
 
     def snapshot(self) -> dict[str, Any]:
         return {

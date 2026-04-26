@@ -57,6 +57,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ros-turn-scan-settle-s", type=float, default=1.0)
     parser.add_argument("--ros-manual-spin-angular-speed-rad-s", type=float, default=0.30)
     parser.add_argument("--ros-manual-spin-publish-hz", type=float, default=10.0)
+    parser.add_argument("--ros-turn-scan-mode", choices=("camera_pan", "robot_spin"), default="camera_pan")
+    parser.add_argument("--robot-brain-url", default="http://127.0.0.1:8765")
+    parser.add_argument("--camera-pan-action-key", default="head_motor_1.pos")
+    parser.add_argument("--camera-pan-settle-s", type=float, default=0.5)
+    parser.add_argument("--camera-pan-sample-count", type=int, default=12)
     parser.add_argument("--pause-for-operator-approval", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--stop-after-initial-scan", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--nav2-planner-id", default="GridBased")
@@ -138,6 +143,16 @@ def translated_args(args: argparse.Namespace) -> list[str]:
         str(args.ros_manual_spin_angular_speed_rad_s),
         "--ros-manual-spin-publish-hz",
         str(args.ros_manual_spin_publish_hz),
+        "--ros-turn-scan-mode",
+        args.ros_turn_scan_mode,
+        "--robot-brain-url",
+        args.robot_brain_url,
+        "--camera-pan-action-key",
+        args.camera_pan_action_key,
+        "--camera-pan-settle-s",
+        str(args.camera_pan_settle_s),
+        "--camera-pan-sample-count",
+        str(args.camera_pan_sample_count),
         "--explorer-policy",
         args.explorer_policy,
         "--llm-provider",

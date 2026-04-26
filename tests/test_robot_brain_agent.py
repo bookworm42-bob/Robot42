@@ -64,6 +64,7 @@ class RobotBrainAgentTests(unittest.TestCase):
         self.assertEqual(config.imu_udp_port, 8766)
         self.assertEqual(config.camera_max_frame_bytes, 16 * 1024 * 1024)
         self.assertEqual(config.camera_log_every, 30)
+        self.assertEqual(config.camera_pan_action_key, "head_motor_1.pos")
 
     def test_parser_accepts_debug_motion(self) -> None:
         args = build_parser().parse_args(["--debug-motion"])
@@ -103,6 +104,24 @@ class RobotBrainAgentTests(unittest.TestCase):
         self.assertTrue(response["succeeded"])
         self.assertEqual(runtime.actions, [{"head_tilt.pos": 0.5 * 180.0 / 3.141592653589793}])
         self.assertAlmostEqual(agent.camera_state()["pitch_rad"], 0.5)
+
+    def test_agent_commands_camera_pan_and_updates_state(self) -> None:
+        runtime = FakeRuntime()
+        agent = RobotBrainAgent(
+            RobotBrainAgentConfig(
+                allow_motion_commands=True,
+                camera_pan_action_key="head_motor_1.pos",
+                camera_pan_settle_s=0.0,
+            ),
+            runtime=runtime,
+        )
+
+        response = agent.pan_camera(pan_rad=-0.5)
+
+        self.assertTrue(response["succeeded"])
+        self.assertEqual(runtime.actions, [{"head_motor_1.pos": -0.5 * 180.0 / 3.141592653589793}])
+        self.assertAlmostEqual(agent.camera_state()["pan_rad"], -0.5)
+        self.assertAlmostEqual(agent.camera_state()["pitch_rad"], 0.0)
 
     def test_agent_serves_expected_orbbec_file_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
