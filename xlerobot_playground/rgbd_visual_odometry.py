@@ -81,6 +81,8 @@ class RgbdVoDiagnostics:
     total_translation_m: float = 0.0
     total_abs_translation_m: float = 0.0
     last_translation_m: float = 0.0
+    min_abs_translation_m: float | None = None
+    max_abs_translation_m: float = 0.0
     last_matches: int = 0
     last_inliers: int = 0
     missing_descriptors: int = 0
@@ -389,6 +391,12 @@ class RgbdVisualOdometryNode(Node):
             total_translation_m=self._diagnostics.total_translation_m + estimate.translation_m,
             total_abs_translation_m=self._diagnostics.total_abs_translation_m + abs(estimate.translation_m),
             last_translation_m=estimate.translation_m,
+            min_abs_translation_m=(
+                abs(estimate.translation_m)
+                if self._diagnostics.min_abs_translation_m is None
+                else min(self._diagnostics.min_abs_translation_m, abs(estimate.translation_m))
+            ),
+            max_abs_translation_m=max(self._diagnostics.max_abs_translation_m, abs(estimate.translation_m)),
             last_matches=estimate.matches,
             last_inliers=estimate.inliers,
             missing_descriptors=self._diagnostics.missing_descriptors,
@@ -419,6 +427,8 @@ class RgbdVisualOdometryNode(Node):
             total_translation_m=self._diagnostics.total_translation_m,
             total_abs_translation_m=self._diagnostics.total_abs_translation_m,
             last_translation_m=self._diagnostics.last_translation_m,
+            min_abs_translation_m=self._diagnostics.min_abs_translation_m,
+            max_abs_translation_m=self._diagnostics.max_abs_translation_m,
             last_matches=rejection.matches,
             last_inliers=rejection.inliers,
             missing_descriptors=counts["missing_descriptors"],
@@ -438,6 +448,8 @@ class RgbdVisualOdometryNode(Node):
             total_translation_m=self._diagnostics.total_translation_m,
             total_abs_translation_m=self._diagnostics.total_abs_translation_m,
             last_translation_m=self._diagnostics.last_translation_m,
+            min_abs_translation_m=self._diagnostics.min_abs_translation_m,
+            max_abs_translation_m=self._diagnostics.max_abs_translation_m,
             last_matches=self._diagnostics.last_matches,
             last_inliers=self._diagnostics.last_inliers,
             missing_descriptors=self._diagnostics.missing_descriptors,
@@ -456,12 +468,14 @@ class RgbdVisualOdometryNode(Node):
         self._last_diagnostics_log_s = now_s
         diagnostics = self._diagnostics
         accepted = max(diagnostics.accepted, 1)
+        min_abs_dx = 0.0 if diagnostics.min_abs_translation_m is None else diagnostics.min_abs_translation_m
         self.get_logger().info(
             "RGB-D VO stats: "
             f"accepted={diagnostics.accepted} rejected={diagnostics.rejected} "
             f"pose_x={self.pose.x:.3f} pose_y={self.pose.y:.3f} yaw_deg={math.degrees(self.pose.yaw):.1f} "
             f"sum_dx={diagnostics.total_translation_m:.3f} "
             f"mean_abs_dx={diagnostics.total_abs_translation_m / accepted:.4f} "
+            f"min_abs_dx={min_abs_dx:.4f} max_abs_dx={diagnostics.max_abs_translation_m:.4f} "
             f"last_dx={diagnostics.last_translation_m:.4f} "
             f"last_matches={diagnostics.last_matches} last_inliers={diagnostics.last_inliers} "
             "rejects="
