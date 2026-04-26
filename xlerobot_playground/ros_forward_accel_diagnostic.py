@@ -687,6 +687,8 @@ class ForwardAccelDiagnosticNode(Node):
         odom_start_pose: dict[str, float] | None = None
         stop_reason = "duration_timeout"
         next_sample_s = start
+        command_integrated_distance_m = 0.0
+        last_command_integral_s = start_monotonic
         target_direction_sign = 1.0 if (target_distance_m is None or float(target_distance_m) >= 0.0) else -1.0
         while time.time() < deadline:
             rclpy.spin_once(self, timeout_sec=0.001)
@@ -808,7 +810,11 @@ class ForwardAccelDiagnosticNode(Node):
                                 command_linear_m_s = 0.0
                                 target_reached = True
                 self.publish_forward(command_linear_m_s)
+            command_dt_s = max(0.0, now_monotonic - last_command_integral_s)
+            last_command_integral_s = now_monotonic
+            command_integrated_distance_m += command_linear_m_s * command_dt_s
             sample["cmd_linear_m_s"] = command_linear_m_s
+            sample["cmd_integrated_forward_distance_m"] = command_integrated_distance_m
             if now >= next_progress_log_s:
                 print(
                     format_progress_log_line(
@@ -913,10 +919,23 @@ def _summarize_accel(samples: list[dict[str, Any]]) -> dict[str, Any]:
     return result
 
 
+def _summarize_command(samples: list[dict[str, Any]]) -> dict[str, Any]:
+    valid = [sample for sample in samples if "cmd_integrated_forward_distance_m" in sample]
+    if not valid:
+        return {"reported_distance_m": 0.0, "valid_sample_count": 0}
+    moving = [sample for sample in valid if abs(float(sample.get("cmd_linear_m_s", 0.0))) > 1e-9]
+    return {
+        "reported_distance_m": round(float(valid[-1]["cmd_integrated_forward_distance_m"]), 4),
+        "valid_sample_count": len(valid),
+        "moving_sample_count": len(moving),
+    }
+
+
 def summarize(samples: list[dict[str, Any]]) -> dict[str, Any]:
     summary = {
         "sample_count": len(samples),
         "stop_reason": samples[-1].get("stop_reason") if samples else "no_samples",
+        "command": _summarize_command(samples),
         "accelerometer": _summarize_accel(samples),
         "tf": _summarize_pose_source(samples, prefix="tf"),
         "odom_topic": _summarize_pose_source(samples, prefix="odom"),
