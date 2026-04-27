@@ -3,6 +3,7 @@ from __future__ import annotations
 from io import BytesIO
 import math
 from pathlib import Path
+import struct
 import tempfile
 import unittest
 from urllib.error import HTTPError
@@ -15,6 +16,7 @@ from xlerobot_playground.real_ros_bridge import (
     RobotBrainRgbdSource,
     _build_camera_info_from_metadata,
     _motion_result_error,
+    _point_field,
     build_parser,
     config_from_args,
     _format_runtime_error,
@@ -29,6 +31,7 @@ from xlerobot_playground.real_ros_bridge import (
     yaw_to_quaternion_xyzw,
 )
 from xlerobot_playground.rgbd_transport import pack_rgbd_frame
+from xlerobot_playground.rgbd_transport import POINT_CLOUD_FORMAT_XYZ_FLOAT32
 
 
 class _Vector:
@@ -70,6 +73,10 @@ class _FakeBrainClient:
                         "height": 480,
                     }
                 },
+                point_cloud_format=POINT_CLOUD_FORMAT_XYZ_FLOAT32,
+                point_cloud_points=struct.pack("<fff", 0.1, 0.2, 0.3),
+                point_cloud_count=1,
+                point_cloud_stride=12,
             )
 
     def get_bytes(self, path: str) -> bytes:
@@ -313,9 +320,35 @@ class RealRosBridgeTests(unittest.TestCase):
         self.assertEqual(frame.depth_be, (1234).to_bytes(2, "big"))
         self.assertEqual(frame.depth_width, 1)
         self.assertEqual(frame.metadata["camera_intrinsics"]["fy"], 510.0)
+        self.assertEqual(frame.point_cloud_format, POINT_CLOUD_FORMAT_XYZ_FLOAT32)
+        self.assertEqual(frame.point_cloud_count, 1)
+        self.assertEqual(frame.point_cloud_stride, 12)
+        self.assertEqual(frame.point_cloud_points, struct.pack("<fff", 0.1, 0.2, 0.3))
         self.assertEqual(frame.frame_index, 7)
         self.assertAlmostEqual(frame.timestamp_s, 1.25)
         self.assertEqual(client.requested_paths, ["/rgbd"])
+
+    def test_point_field_uses_ros_float32_layout(self) -> None:
+        class _PointField:
+            FLOAT32 = 7
+
+            def __init__(self) -> None:
+                self.name = ""
+                self.offset = 0
+                self.datatype = 0
+                self.count = 0
+
+        original_point_field = real_ros_bridge.PointField
+        real_ros_bridge.PointField = _PointField
+        try:
+            field = _point_field("z", 8)
+        finally:
+            real_ros_bridge.PointField = original_point_field
+
+        self.assertEqual(field.name, "z")
+        self.assertEqual(field.offset, 8)
+        self.assertEqual(field.datatype, _PointField.FLOAT32)
+        self.assertEqual(field.count, 1)
 
     def test_camera_info_from_metadata_scales_intrinsics(self) -> None:
         class _Header:

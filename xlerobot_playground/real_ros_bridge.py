@@ -18,7 +18,7 @@ from xlerobot_playground.real_exploration_runtime import (
     RealXLeRobotDirectRuntime,
     RealXLeRobotRuntimeConfig,
 )
-from xlerobot_playground.rgbd_transport import unpack_rgbd_frame
+from xlerobot_playground.rgbd_transport import POINT_CLOUD_FORMAT_XYZ_FLOAT32, unpack_rgbd_frame
 
 try:
     import aiohttp
@@ -36,7 +36,7 @@ try:
     from geometry_msgs.msg import Quaternion, TransformStamped, Twist
     from nav_msgs.msg import Odometry
     from rclpy.node import Node
-    from sensor_msgs.msg import CameraInfo, Image, Imu, LaserScan
+    from sensor_msgs.msg import CameraInfo, Image, Imu, LaserScan, PointCloud2, PointField
     from std_msgs.msg import Float32
     from tf2_ros import TransformBroadcaster
 except Exception as exc:  # pragma: no cover - exercised as a runtime guard.
@@ -53,6 +53,8 @@ except Exception as exc:  # pragma: no cover - exercised as a runtime guard.
     Image = None
     Imu = None
     LaserScan = None
+    PointCloud2 = None
+    PointField = None
     Float32 = None
     TransformBroadcaster = None
 
@@ -88,6 +90,7 @@ class RealRosBridgeConfig:
     base_frame: str = "base_link"
     odom_frame: str = "odom"
     head_camera_frame: str = "head_camera_link"
+    head_points_topic: str = "/camera/head/points"
     head_laser_frame: str = "head_laser"
     camera_x_m: float = 0.0
     camera_y_m: float = 0.0
@@ -124,6 +127,11 @@ class RgbdFrame:
     frame_index: int | None = None
     depth_be: bytes | None = None
     metadata: dict[str, Any] | None = None
+    point_cloud_format: int = 0
+    point_cloud_points: bytes | None = None
+    point_cloud_count: int = 0
+    point_cloud_stride: int = 0
+    point_cloud_units: str | None = None
 
 
 class RgbdSource(Protocol):
@@ -467,6 +475,11 @@ class RobotBrainRgbdSource:
                 frame_index=frame.frame_index,
                 depth_be=frame.depth_be,
                 metadata=frame.metadata,
+                point_cloud_format=frame.point_cloud_format,
+                point_cloud_points=frame.point_cloud_points,
+                point_cloud_count=frame.point_cloud_count,
+                point_cloud_stride=frame.point_cloud_stride,
+                point_cloud_units=frame.point_cloud_units,
             )
         except Exception:
             pass
@@ -611,6 +624,7 @@ class RealXLeRobotRosBridge(Node):
         self.head_rgb_publisher = None
         self.head_depth_publisher = None
         self.head_camera_info_publisher = None
+        self.head_points_publisher = None
         self.camera_pitch_publisher = self.create_publisher(Float32, config.camera_pitch_topic, 10)
         self.camera_pan_publisher = self.create_publisher(Float32, config.camera_pan_topic, 10)
         self._camera_pitch_rad = float(config.camera_pitch_rad)
@@ -620,6 +634,7 @@ class RealXLeRobotRosBridge(Node):
             self.head_rgb_publisher = self.create_publisher(Image, "/camera/head/image_raw", 10)
             self.head_depth_publisher = self.create_publisher(Image, "/camera/head/depth/image_raw", 10)
             self.head_camera_info_publisher = self.create_publisher(CameraInfo, "/camera/head/camera_info", 10)
+            self.head_points_publisher = self.create_publisher(PointCloud2, config.head_points_topic, 10)
         self.timer = self.create_timer(
             1.0 / max(config.publish_rate_hz, 1e-6),
             self.step,
@@ -668,6 +683,7 @@ class RealXLeRobotRosBridge(Node):
         self._publish_transforms(stamp=stamp, linear=linear, angular=angular)
         self._publish_scan(frame=frame, stamp=stamp)
         self._publish_head_images(frame=frame, stamp=stamp)
+        self._publish_head_points(frame=frame, stamp=stamp)
 
     def _poll_camera_pose(self, *, now_s: float) -> None:
         if self.brain_client is not None and now_s - self._last_camera_pose_poll_s >= self.config.camera_pose_poll_period_s:
@@ -1036,6 +1052,33 @@ class RealXLeRobotRosBridge(Node):
         camera_info.header.stamp = stamp
         self.head_camera_info_publisher.publish(camera_info)
 
+    def _publish_head_points(self, *, frame: RgbdFrame, stamp: Any) -> None:
+        if self.head_points_publisher is None:
+            return
+        if (
+            frame.point_cloud_format != POINT_CLOUD_FORMAT_XYZ_FLOAT32
+            or frame.point_cloud_points is None
+            or frame.point_cloud_count <= 0
+            or frame.point_cloud_stride != 12
+        ):
+            return
+        msg = PointCloud2()
+        msg.header.stamp = stamp
+        msg.header.frame_id = self.config.head_camera_frame
+        msg.height = 1
+        msg.width = int(frame.point_cloud_count)
+        msg.fields = [
+            _point_field("x", 0),
+            _point_field("y", 4),
+            _point_field("z", 8),
+        ]
+        msg.is_bigendian = False
+        msg.point_step = int(frame.point_cloud_stride)
+        msg.row_step = msg.point_step * msg.width
+        msg.data = frame.point_cloud_points
+        msg.is_dense = False
+        self.head_points_publisher.publish(msg)
+
     def close(self) -> None:
         try:
             self._imu_stream_stop.set()
@@ -1073,6 +1116,15 @@ def _build_camera_info(*, frame_id: str, width: int, height: int, horizontal_fov
     msg.k = [fx, 0.0, cx, 0.0, fy, cy, 0.0, 0.0, 1.0]
     msg.p = [fx, 0.0, cx, 0.0, 0.0, fy, cy, 0.0, 0.0, 0.0, 1.0, 0.0]
     return msg
+
+
+def _point_field(name: str, offset: int) -> Any:
+    field = PointField()
+    field.name = name
+    field.offset = int(offset)
+    field.datatype = PointField.FLOAT32
+    field.count = 1
+    return field
 
 
 def _build_camera_info_from_metadata(
@@ -1152,6 +1204,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--base-frame", default="base_link")
     parser.add_argument("--odom-frame", default="odom")
     parser.add_argument("--head-camera-frame", default="head_camera_link")
+    parser.add_argument("--head-points-topic", default="/camera/head/points")
     parser.add_argument("--head-laser-frame", default="head_laser")
     parser.add_argument("--camera-x-m", type=float, default=0.0)
     parser.add_argument("--camera-y-m", type=float, default=0.0)
@@ -1215,6 +1268,7 @@ def config_from_args(args: argparse.Namespace) -> RealRosBridgeConfig:
         base_frame=args.base_frame,
         odom_frame=args.odom_frame,
         head_camera_frame=args.head_camera_frame,
+        head_points_topic=args.head_points_topic,
         head_laser_frame=args.head_laser_frame,
         camera_x_m=args.camera_x_m,
         camera_y_m=args.camera_y_m,

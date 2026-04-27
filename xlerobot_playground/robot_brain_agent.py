@@ -182,7 +182,8 @@ class RgbdStreamState:
                 "[robot_brain_agent] RGB-D rx "
                 f"rate~={delta / dt:.1f}Hz total={self._received_count} "
                 f"rgb={frame.rgb_width}x{frame.rgb_height} "
-                f"depth={frame.depth_width or 0}x{frame.depth_height or 0}",
+                f"depth={frame.depth_width or 0}x{frame.depth_height or 0} "
+                f"points={frame.point_cloud_count}",
                 flush=True,
             )
             self._last_rx_log_at = now
@@ -222,6 +223,14 @@ class RgbdStreamState:
             "depth": None
             if frame is None or frame.depth_width is None or frame.depth_height is None
             else {"width": frame.depth_width, "height": frame.depth_height},
+            "point_cloud": None
+            if frame is None or frame.point_cloud_count <= 0
+            else {
+                "format": frame.point_cloud_format,
+                "count": frame.point_cloud_count,
+                "stride": frame.point_cloud_stride,
+                "units": frame.point_cloud_units,
+            },
         }
 
 
@@ -552,6 +561,14 @@ async def _handle_rgbd_ingest(request: web.Request) -> web.Response:
             "depth": None
             if frame.depth_width is None or frame.depth_height is None
             else {"width": frame.depth_width, "height": frame.depth_height},
+            "point_cloud": None
+            if frame.point_cloud_count <= 0
+            else {
+                "format": frame.point_cloud_format,
+                "count": frame.point_cloud_count,
+                "stride": frame.point_cloud_stride,
+                "units": frame.point_cloud_units,
+            },
         }
     )
 
