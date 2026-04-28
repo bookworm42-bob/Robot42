@@ -33,6 +33,11 @@ class PointCloudFusionConfig:
     min_points_per_occupied_cell: int = 2
     obstacle_inflation_radius_m: float = 0.10
     max_rays: int = 2400
+    estimate_floor_plane: bool = True
+    floor_plane_min_points: int = 24
+    floor_plane_low_percentile: float = 35.0
+    floor_plane_candidate_margin_m: float = 0.18
+    floor_plane_max_tilt_deg: float = 45.0
     evidence: OccupancyFusionConfig = POINT_CLOUD_OCCUPANCY_FUSION_CONFIG
 
 
@@ -100,16 +105,18 @@ def integrate_transformed_point_cloud_observation(
             config=config.evidence,
         )
 
+    heights_above_floor = _heights_above_floor(valid_points, config)
     floor_mask = (
-        (valid_points[:, 2] >= float(config.floor_free_min_z_m))
-        & (valid_points[:, 2] <= float(config.floor_free_max_z_m))
+        (heights_above_floor >= float(config.floor_free_min_z_m))
+        & (heights_above_floor <= float(config.floor_free_max_z_m))
     )
+    obstacle_ceiling_m = min(float(config.obstacle_max_z_m), float(config.robot_clearance_height_m))
     obstacle_mask = (
-        (valid_points[:, 2] >= float(config.obstacle_min_z_m))
-        & (valid_points[:, 2] <= min(float(config.obstacle_max_z_m), float(config.robot_clearance_height_m)))
+        (heights_above_floor >= float(config.obstacle_min_z_m))
+        & (heights_above_floor <= obstacle_ceiling_m)
     )
-    free_targets = valid_points[floor_mask | obstacle_mask]
-    free_ranges = valid_ranges[floor_mask | obstacle_mask]
+    free_targets = valid_points[floor_mask]
+    free_ranges = valid_ranges[floor_mask]
     obstacle_points = valid_points[obstacle_mask]
 
     occupied_observation_counts: dict[Any, int] = {}
@@ -124,17 +131,6 @@ def integrate_transformed_point_cloud_observation(
         for cell, count in occupied_observation_counts.items()
         if count >= max(int(config.min_points_per_occupied_cell), 1)
     }
-    if known_cells is not None:
-        for cell in occupied_cells:
-            for _ in range(max(occupied_observation_counts.get(cell, 1), 1)):
-                merge_occupancy_observation(
-                    known_cells,
-                    cell,
-                    "occupied",
-                    evidence_scores=evidence_scores,
-                    config=config.evidence,
-                )
-
     free_cells: set[Any] = set()
     integrated_rays = 0
     if free_targets.size:
@@ -145,8 +141,6 @@ def integrate_transformed_point_cloud_observation(
             ray_range = min(float(free_ranges[index]), float(config.free_ray_max_m))
             if ray_range <= float(config.range_min_m):
                 continue
-            target_cell = cell_from_world(float(target[0]), float(target[1]))
-            is_obstacle_endpoint = target_cell in occupied_cells
             ray_cells = _ray_cells(
                 origin=origin,
                 target=target,
@@ -154,8 +148,6 @@ def integrate_transformed_point_cloud_observation(
                 step_m=step_m,
                 cell_from_world=cell_from_world,
             )
-            if is_obstacle_endpoint and ray_cells and ray_cells[-1] == target_cell:
-                ray_cells = ray_cells[:-1]
             for cell in ray_cells:
                 if visited_cells is not None:
                     visited_cells.add(cell)
@@ -165,7 +157,6 @@ def integrate_transformed_point_cloud_observation(
             range_edge_threshold = min(float(config.range_max_m), float(config.free_ray_max_m)) * 0.98
             if (
                 range_edge_cells is not None
-                and not is_obstacle_endpoint
                 and ray_cells
                 and float(free_ranges[index]) >= range_edge_threshold
             ):
@@ -174,6 +165,8 @@ def integrate_transformed_point_cloud_observation(
 
     if known_cells is not None:
         for cell in free_cells:
+            if cell in occupied_cells:
+                continue
             merge_occupancy_observation(
                 known_cells,
                 cell,
@@ -181,6 +174,15 @@ def integrate_transformed_point_cloud_observation(
                 evidence_scores=evidence_scores,
                 config=config.evidence,
             )
+        for cell in occupied_cells:
+            for _ in range(max(occupied_observation_counts.get(cell, 1), 1)):
+                merge_occupancy_observation(
+                    known_cells,
+                    cell,
+                    "occupied",
+                    evidence_scores=evidence_scores,
+                    config=config.evidence,
+                )
 
     return PointCloudIntegrationSummary(
         raw_point_count=raw_count,
@@ -208,6 +210,47 @@ def _voxel_downsample(points: np.ndarray, ranges: np.ndarray, voxel_size_m: floa
             selected[item] = index
     indices = np.fromiter(selected.values(), dtype=np.int64)
     return points[indices], ranges[indices]
+
+
+def _heights_above_floor(points: np.ndarray, config: PointCloudFusionConfig) -> np.ndarray:
+    if (
+        not bool(config.estimate_floor_plane)
+        or points.shape[0] < max(int(config.floor_plane_min_points), 3)
+    ):
+        return points[:, 2]
+    floor_z = _estimate_floor_z(points, config)
+    if floor_z is None:
+        return points[:, 2]
+    return points[:, 2] - floor_z
+
+
+def _estimate_floor_z(points: np.ndarray, config: PointCloudFusionConfig) -> np.ndarray | None:
+    finite = np.isfinite(points).all(axis=1)
+    if not np.any(finite):
+        return None
+    finite_points = points[finite]
+    low_percentile = min(max(float(config.floor_plane_low_percentile), 5.0), 80.0)
+    low_z = float(np.percentile(finite_points[:, 2], low_percentile))
+    candidate_margin = max(float(config.floor_plane_candidate_margin_m), 0.02)
+    candidates = finite_points[finite_points[:, 2] <= low_z + candidate_margin]
+    if candidates.shape[0] < max(int(config.floor_plane_min_points), 3):
+        return None
+    design = np.column_stack(
+        [
+            candidates[:, 0].astype(np.float64),
+            candidates[:, 1].astype(np.float64),
+            np.ones((candidates.shape[0],), dtype=np.float64),
+        ]
+    )
+    target = candidates[:, 2].astype(np.float64)
+    try:
+        a, b, c = np.linalg.lstsq(design, target, rcond=None)[0]
+    except np.linalg.LinAlgError:
+        return None
+    tilt_rad = math.atan(math.sqrt(float(a) * float(a) + float(b) * float(b)))
+    if tilt_rad > math.radians(max(float(config.floor_plane_max_tilt_deg), 0.0)):
+        return None
+    return (float(a) * points[:, 0] + float(b) * points[:, 1] + float(c)).astype(np.float32)
 
 
 def _inflated_cells(cell: Any, radius_cells: int) -> list[Any]:
