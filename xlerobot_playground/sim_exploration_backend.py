@@ -61,6 +61,10 @@ from xlerobot_playground.map_editing import (
     overlay_occupancy_payload,
 )
 from xlerobot_playground.nav2_defaults import default_nav2_behavior_tree
+from xlerobot_playground.point_cloud_fusion import (
+    PointCloudFusionConfig,
+    integrate_transformed_point_cloud_observation,
+)
 from xlerobot_playground.scan_fusion import integrate_planar_scan
 
 
@@ -118,6 +122,7 @@ class SimExplorationConfig:
     ros_navigation_map_source: str = "fused_scan"
     ros_map_topic: str = "/map"
     ros_scan_topic: str = "/scan"
+    ros_point_cloud_topic: str = "/camera/head/points"
     ros_rgb_topic: str = "/camera/head/image_raw"
     ros_imu_topic: str = "/imu/filtered_yaw"
     ros_cmd_vel_topic: str = "/cmd_vel"
@@ -137,6 +142,13 @@ class SimExplorationConfig:
     camera_pan_action_key: str = "head_motor_1.pos"
     camera_pan_settle_s: float = 0.5
     camera_pan_sample_count: int = 12
+    point_cloud_range_min_m: float = 0.25
+    point_cloud_range_max_m: float = 4.0
+    point_cloud_floor_free_max_z_m: float = 0.08
+    point_cloud_obstacle_min_z_m: float = 0.08
+    point_cloud_robot_clearance_height_m: float = 1.50
+    point_cloud_obstacle_max_z_m: float = 1.80
+    point_cloud_max_rays: int = 2400
     sim_motion_speed: str = "normal"
     ros_allow_multiple_action_servers: bool = False
     experimental_free_space_semantic_waypoints: bool = False
@@ -2877,6 +2889,12 @@ class RosExplorationSession:
         self._lock = threading.RLock()
         self._last_pose: Pose2D | None = None
         self._owns_rclpy = False
+        if config.ros_adapter_url and config.ros_navigation_map_source == "fused_point_cloud":
+            raise RuntimeError(
+                "`fused_point_cloud` requires the local ROS runtime because the HTTP ROS adapter "
+                "does not serialize large PointCloud2 observations. Run real_agentic_exploration without "
+                "--ros-adapter-url, or use --ros-navigation-map-source fused_scan with the adapter."
+            )
         if config.ros_adapter_url:
             self.runtime = RemoteRosExplorationRuntime(
                 config.ros_adapter_url,
@@ -2896,6 +2914,7 @@ class RosExplorationSession:
                 RosRuntimeConfig(
                     map_topic=config.ros_map_topic,
                     scan_topic=config.ros_scan_topic,
+                    point_cloud_topic=config.ros_point_cloud_topic,
                     rgb_topic=config.ros_rgb_topic,
                     imu_topic=config.ros_imu_topic,
                     cmd_vel_topic=config.ros_cmd_vel_topic,
@@ -2915,17 +2934,34 @@ class RosExplorationSession:
                     camera_pan_settle_s=config.camera_pan_settle_s,
                     camera_pan_sample_count=config.camera_pan_sample_count,
                     allow_multiple_action_servers=config.ros_allow_multiple_action_servers,
-                    publish_internal_navigation_map=config.ros_navigation_map_source == "fused_scan",
+                    publish_internal_navigation_map=config.ros_navigation_map_source
+                    in ("fused_scan", "fused_point_cloud"),
+                    navigation_map_source=config.ros_navigation_map_source,
                 )
             )
         self.scan_known_cells: dict[GridCell, str] = {}
         self.scan_occupancy_evidence: dict[GridCell, float] = {}
         self.scan_range_edge_cells: set[GridCell] = set()
+        self.point_cloud_integration_summaries: list[dict[str, Any]] = []
+        self.point_cloud_fusion_config = PointCloudFusionConfig(
+            range_min_m=float(config.point_cloud_range_min_m),
+            range_max_m=float(config.point_cloud_range_max_m),
+            floor_free_max_z_m=float(config.point_cloud_floor_free_max_z_m),
+            obstacle_min_z_m=float(config.point_cloud_obstacle_min_z_m),
+            robot_clearance_height_m=float(config.point_cloud_robot_clearance_height_m),
+            obstacle_max_z_m=float(config.point_cloud_obstacle_max_z_m),
+            max_rays=int(config.point_cloud_max_rays),
+        )
         if self.runtime.latest_map is not None:
             self.scan_map_resolution = float(self.runtime.latest_map.resolution)
         else:
             self.scan_map_resolution = config.occupancy_resolution
         self.scan_observation_index = self.runtime.scan_observation_count()
+        self.point_cloud_observation_index = (
+            self.runtime.point_cloud_observation_count()
+            if hasattr(self.runtime, "point_cloud_observation_count")
+            else 0
+        )
         self.nav2 = RosNav2NavigationModule(
             config,
             self.runtime,
@@ -3096,7 +3132,13 @@ class RosExplorationSession:
             self.scan_known_cells = {}
             self.scan_occupancy_evidence = {}
             self.scan_range_edge_cells = set()
+            self.point_cloud_integration_summaries = []
             self.scan_observation_index = self.runtime.scan_observation_count()
+            self.point_cloud_observation_index = (
+                self.runtime.point_cloud_observation_count()
+                if hasattr(self.runtime, "point_cloud_observation_count")
+                else 0
+            )
             if self.runtime.latest_map is not None:
                 self.scan_map_resolution = float(self.runtime.latest_map.resolution)
             else:
@@ -3369,7 +3411,7 @@ class RosExplorationSession:
 
     def _current_map(self) -> RosOccupancyMap | None:
         self._consume_runtime_scan_observations()
-        if self.config.ros_navigation_map_source == "fused_scan":
+        if self.config.ros_navigation_map_source in ("fused_scan", "fused_point_cloud"):
             return self._current_scan_fused_map() or self._current_ros_map()
         return self._current_ros_map() or self._current_scan_fused_map()
 
@@ -3400,12 +3442,23 @@ class RosExplorationSession:
         if self.runtime.latest_map is not None:
             self.scan_map_resolution = float(self.runtime.latest_map.resolution)
         observations, stop_index = self.runtime.drain_scan_observations(self.scan_observation_index)
-        if not observations:
-            return
-        for observation in observations:
-            self._integrate_scan_observation(observation)
+        point_observations, point_stop_index = self._drain_point_cloud_observations()
+        if self.config.ros_navigation_map_source != "fused_point_cloud":
+            for observation in observations:
+                self._integrate_scan_observation(observation)
+        if self.config.ros_navigation_map_source == "fused_point_cloud":
+            for observation in point_observations:
+                self._integrate_point_cloud_observation(observation)
         self.scan_observation_index = stop_index
-        self._publish_navigation_map()
+        self.point_cloud_observation_index = point_stop_index
+        if observations or point_observations:
+            self._publish_navigation_map()
+
+    def _drain_point_cloud_observations(self) -> tuple[list[dict[str, Any]], int]:
+        drain = getattr(self.runtime, "drain_point_cloud_observations", None)
+        if drain is None:
+            return [], getattr(self, "point_cloud_observation_index", 0)
+        return drain(getattr(self, "point_cloud_observation_index", 0))
 
     def _integrate_scan_observation(self, observation: dict[str, Any]) -> None:
         pose = observation.get("pose")
@@ -3429,6 +3482,38 @@ class RosExplorationSession:
             beam_stride=2,
             config=ACTIVE_RGBD_SCAN_FUSION_CONFIG,
         )
+
+    def _integrate_point_cloud_observation(self, observation: dict[str, Any]) -> None:
+        points = observation.get("points_xyz")
+        origin = observation.get("sensor_origin_xyz")
+        if points is None or origin is None:
+            return
+        summary = integrate_transformed_point_cloud_observation(
+            sensor_origin_xyz=origin,
+            points_xyz_map=points,
+            map_resolution_m=self.scan_map_resolution,
+            cell_from_world=lambda x, y: self._scan_world_cell(x, y),
+            known_cells=self.scan_known_cells,
+            evidence_scores=self.scan_occupancy_evidence,
+            range_edge_cells=self.scan_range_edge_cells,
+            config=self.point_cloud_fusion_config,
+        )
+        self.point_cloud_integration_summaries.append(
+            {
+                "raw_point_count": summary.raw_point_count,
+                "valid_point_count": summary.valid_point_count,
+                "voxel_point_count": summary.voxel_point_count,
+                "floor_point_count": summary.floor_point_count,
+                "obstacle_point_count": summary.obstacle_point_count,
+                "occupied_cell_count": summary.occupied_cell_count,
+                "free_cell_count": summary.free_cell_count,
+                "invalid_point_count": summary.invalid_point_count,
+                "integrated_rays": summary.integrated_rays,
+                "frame_id": str(observation.get("frame_id", "")),
+            }
+        )
+        if len(self.point_cloud_integration_summaries) > 64:
+            self.point_cloud_integration_summaries = self.point_cloud_integration_summaries[-64:]
 
     def _current_scan_fused_map(self) -> RosOccupancyMap | None:
         if not self.scan_known_cells:
@@ -3478,7 +3563,7 @@ class RosExplorationSession:
         )
 
     def _publish_navigation_map(self) -> None:
-        if self.config.ros_navigation_map_source != "fused_scan":
+        if self.config.ros_navigation_map_source not in ("fused_scan", "fused_point_cloud"):
             return
         raw_map = self._current_scan_fused_map() or self._current_ros_map()
         if raw_map is None:
@@ -3538,13 +3623,13 @@ class RosExplorationSession:
 
     def _require_pose(self) -> Pose2D:
         pose = self.runtime.current_pose()
-        if pose is None and self.config.ros_navigation_map_source == "fused_scan":
+        if pose is None and self.config.ros_navigation_map_source in ("fused_scan", "fused_point_cloud"):
             pose = self.runtime.current_pose_in_frame(self.config.ros_odom_frame)
         if pose is None:
             raise RuntimeError(
                 (
                     f"Robot pose in `{self.config.ros_map_frame}` is not available from TF yet"
-                    if self.config.ros_navigation_map_source != "fused_scan"
+                    if self.config.ros_navigation_map_source not in ("fused_scan", "fused_point_cloud")
                     else (
                         f"Robot pose is not available from TF yet in either `{self.config.ros_map_frame}` "
                         f"or `{self.config.ros_odom_frame}`."
@@ -3568,11 +3653,18 @@ class RosExplorationSession:
         observations = list(event.pop("observations", []))
         self.guardrail_events.append({"type": "turnaround_scan", "event": event})
         self.runtime.spin_for(0.25)
-        for observation in observations:
-            self._integrate_scan_observation(observation)
+        if self.config.ros_navigation_map_source != "fused_point_cloud":
+            for observation in observations:
+                self._integrate_scan_observation(observation)
+        point_observations, point_stop_index = self._drain_point_cloud_observations()
+        if self.config.ros_navigation_map_source == "fused_point_cloud":
+            for observation in point_observations:
+                self._integrate_point_cloud_observation(observation)
         self.scan_observation_index = int(event.get("observation_stop_index", self.scan_observation_index))
+        self.point_cloud_observation_index = point_stop_index
         event["selected_count"] = len(observations)
         event["raw_count"] = len(observations)
+        event["point_cloud_observation_count"] = len(point_observations)
         self._publish_navigation_map()
         self._capture_keyframe(reason=reason)
         pose = self.runtime.current_pose()
@@ -3584,13 +3676,19 @@ class RosExplorationSession:
         if pose is None:
             return
         scan = self.runtime.latest_scan
+        latest_point_cloud = getattr(self.runtime, "latest_point_cloud_stats", None)
+        point_count = (
+            int(latest_point_cloud.get("point_count", 0))
+            if isinstance(latest_point_cloud, dict) and self.config.ros_navigation_map_source == "fused_point_cloud"
+            else len(getattr(scan, "ranges", []) or [])
+        )
         frame_id = f"kf_{len(self.keyframes) + 1:03d}"
         frame = {
             "frame_id": frame_id,
             "pose": pose.to_dict(),
             "region_id": "unknown",
             "visible_objects": [],
-            "point_count": len(getattr(scan, "ranges", []) or []),
+            "point_count": point_count,
             "depth_min_m": float(getattr(scan, "range_min", 0.0) or 0.0),
             "depth_max_m": float(getattr(scan, "range_max", self.config.sensor_range_m) or self.config.sensor_range_m),
             "description": (
@@ -3599,6 +3697,12 @@ class RosExplorationSession:
             ),
             "thumbnail_data_url": self.runtime.latest_image_data_url or "",
         }
+        if isinstance(latest_point_cloud, dict):
+            frame["rgbd_summary"] = {
+                "source": "orbbec_gemini2_point_cloud",
+                "latest_point_cloud": latest_point_cloud,
+                "recent_fusion": list(self.point_cloud_integration_summaries[-4:]),
+            }
         self.keyframes.append(frame)
         if self.config.automatic_semantic_waypoints:
             self.semantic_observer.observe_keyframe(
@@ -4315,12 +4419,16 @@ class RosExplorationSession:
                 "ros_runtime": {
                     "map_topic": self.config.ros_map_topic,
                     "scan_topic": self.config.ros_scan_topic,
+                    "point_cloud_topic": self.config.ros_point_cloud_topic,
                     "rgb_topic": self.config.ros_rgb_topic,
                     "imu_topic": self.config.ros_imu_topic,
                     "navigation_map_source": self.config.ros_navigation_map_source,
                     "base_frame": self.config.ros_base_frame,
                     "odom_frame": self.config.ros_odom_frame,
                     "map_frame": self.config.ros_map_frame,
+                    "point_cloud_fusion": {
+                        "recent_summaries": list(self.point_cloud_integration_summaries[-8:]),
+                    },
                 },
                 "llm_policy": {
                     "explorer_policy": self.config.explorer_policy,
@@ -4517,9 +4625,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--nav2-controller-id", default="FollowPath")
     parser.add_argument("--nav2-behavior-tree", default=default_nav2_behavior_tree())
     parser.add_argument("--nav2-recovery-enabled", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--ros-navigation-map-source", choices=("fused_scan", "external"), default="fused_scan")
+    parser.add_argument(
+        "--ros-navigation-map-source",
+        choices=("fused_scan", "fused_point_cloud", "external"),
+        default="fused_scan",
+    )
     parser.add_argument("--ros-map-topic", default="/map")
     parser.add_argument("--ros-scan-topic", default="/scan")
+    parser.add_argument("--ros-point-cloud-topic", default="/camera/head/points")
     parser.add_argument("--ros-rgb-topic", default="/camera/head/image_raw")
     parser.add_argument("--ros-imu-topic", default="/imu/filtered_yaw")
     parser.add_argument("--ros-cmd-vel-topic", default="/cmd_vel")
@@ -4539,6 +4652,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--camera-pan-action-key", default="head_motor_1.pos")
     parser.add_argument("--camera-pan-settle-s", type=float, default=0.5)
     parser.add_argument("--camera-pan-sample-count", type=int, default=12)
+    parser.add_argument("--point-cloud-range-min-m", type=float, default=0.25)
+    parser.add_argument("--point-cloud-range-max-m", type=float, default=4.0)
+    parser.add_argument("--point-cloud-floor-free-max-z-m", type=float, default=0.08)
+    parser.add_argument("--point-cloud-obstacle-min-z-m", type=float, default=0.08)
+    parser.add_argument("--point-cloud-robot-clearance-height-m", type=float, default=1.50)
+    parser.add_argument("--point-cloud-obstacle-max-z-m", type=float, default=1.80)
+    parser.add_argument("--point-cloud-max-rays", type=int, default=2400)
     parser.add_argument("--sim-motion-speed", choices=("normal", "faster", "fastest"), default="normal")
     parser.add_argument("--ros-allow-multiple-action-servers", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--semantic-waypoints-enabled", action=argparse.BooleanOptionalAction, default=True)
@@ -4638,6 +4758,7 @@ def main(argv: list[str] | None = None) -> int:
             ros_navigation_map_source=args.ros_navigation_map_source,
             ros_map_topic=args.ros_map_topic,
             ros_scan_topic=args.ros_scan_topic,
+            ros_point_cloud_topic=args.ros_point_cloud_topic,
             ros_rgb_topic=args.ros_rgb_topic,
             ros_imu_topic=args.ros_imu_topic,
             ros_cmd_vel_topic=args.ros_cmd_vel_topic,
@@ -4657,6 +4778,13 @@ def main(argv: list[str] | None = None) -> int:
             camera_pan_action_key=args.camera_pan_action_key,
             camera_pan_settle_s=args.camera_pan_settle_s,
             camera_pan_sample_count=args.camera_pan_sample_count,
+            point_cloud_range_min_m=args.point_cloud_range_min_m,
+            point_cloud_range_max_m=args.point_cloud_range_max_m,
+            point_cloud_floor_free_max_z_m=args.point_cloud_floor_free_max_z_m,
+            point_cloud_obstacle_min_z_m=args.point_cloud_obstacle_min_z_m,
+            point_cloud_robot_clearance_height_m=args.point_cloud_robot_clearance_height_m,
+            point_cloud_obstacle_max_z_m=args.point_cloud_obstacle_max_z_m,
+            point_cloud_max_rays=args.point_cloud_max_rays,
             sim_motion_speed=args.sim_motion_speed,
             ros_allow_multiple_action_servers=args.ros_allow_multiple_action_servers,
             experimental_free_space_semantic_waypoints=args.experimental_free_space_semantic_waypoints,

@@ -4797,7 +4797,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--nav2-controller-id", default="FollowPath")
     parser.add_argument("--nav2-behavior-tree", default=default_nav2_behavior_tree())
     parser.add_argument("--nav2-recovery-enabled", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--ros-navigation-map-source", choices=("fused_scan", "external"), default="fused_scan")
+    parser.add_argument(
+        "--ros-navigation-map-source",
+        choices=("fused_scan", "fused_point_cloud", "external"),
+        default="fused_scan",
+    )
     parser.add_argument("--ros-map-topic", default="/map")
     parser.add_argument("--ros-scan-topic", default="/scan")
     parser.add_argument("--ros-rgb-topic", default="/camera/head/image_raw")

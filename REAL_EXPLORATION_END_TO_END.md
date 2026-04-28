@@ -343,7 +343,8 @@ python -m xlerobot_playground.real_agentic_exploration \
   --serve-review-ui \
   --review-host 0.0.0.0 \
   --review-port 8770 \
-  --ros-navigation-map-source fused_scan \
+  --ros-navigation-map-source fused_point_cloud \
+  --ros-point-cloud-topic /camera/head/points \
   --ros-ready-timeout-s 30 \
   --ros-turn-scan-timeout-s 75 \
   --ros-turn-scan-mode camera_pan \
@@ -363,7 +364,7 @@ Open the UI from your browser:
 http://OFFLOAD_IP:8770
 ```
 
-Click `Start Explore` in the UI. The robot should keep its base still, pan the head `0 -> +180 -> 0 -> -180 -> 0`, build a partial occupancy map from the outward pan sweeps, detect frontiers, preview Nav2 paths, choose a frontier, and send a Nav2 navigation goal.
+Click `Start Explore` in the UI. The robot should keep its base still, pan the head `0 -> +180 -> 0 -> -180 -> 0`, build a partial occupancy map from the Orbbec point cloud sweeps, detect frontiers, preview Nav2 paths, choose a frontier, and send a Nav2 navigation goal.
 
 By default this real-exploration command waits for the UI start request before moving the robot or panning the head. Use `--no-wait-for-ui-start` only when you want the 360 degree camera-pan scan to begin immediately after the terminal command starts.
 
@@ -389,7 +390,8 @@ python -m xlerobot_playground.real_agentic_exploration \
   --serve-review-ui \
   --review-host 0.0.0.0 \
   --review-port 8770 \
-  --ros-navigation-map-source fused_scan \
+  --ros-navigation-map-source fused_point_cloud \
+  --ros-point-cloud-topic /camera/head/points \
   --ros-ready-timeout-s 30 \
   --ros-turn-scan-timeout-s 75 \
   --ros-turn-scan-mode camera_pan \

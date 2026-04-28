@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import json
 import math
 from pathlib import Path
+import struct
 import threading
 import time
 from typing import Any, Protocol, Sequence
@@ -1075,7 +1076,7 @@ class RealXLeRobotRosBridge(Node):
         msg.is_bigendian = False
         msg.point_step = int(frame.point_cloud_stride)
         msg.row_step = msg.point_step * msg.width
-        msg.data = frame.point_cloud_points
+        msg.data = _orbbec_optical_xyz_to_ros_camera_link(frame.point_cloud_points, count=msg.width)
         msg.is_dense = False
         self.head_points_publisher.publish(msg)
 
@@ -1125,6 +1126,18 @@ def _point_field(name: str, offset: int) -> Any:
     field.datatype = PointField.FLOAT32
     field.count = 1
     return field
+
+
+def _orbbec_optical_xyz_to_ros_camera_link(data: bytes, *, count: int) -> bytes:
+    expected = int(count) * 12
+    if len(data) < expected:
+        raise ValueError(f"Point cloud payload is truncated: expected {expected} bytes, got {len(data)}.")
+    converted = bytearray(expected)
+    for index in range(int(count)):
+        offset = index * 12
+        optical_x, optical_y, optical_z = struct.unpack_from("<fff", data, offset)
+        struct.pack_into("<fff", converted, offset, optical_z, -optical_x, -optical_y)
+    return bytes(converted)
 
 
 def _build_camera_info_from_metadata(

@@ -39,7 +39,7 @@ try:
         qos_profile_sensor_data,
     )
     from rclpy.time import Time as RosTime
-    from sensor_msgs.msg import Image, Imu, LaserScan
+    from sensor_msgs.msg import Image, Imu, LaserScan, PointCloud2
     from tf2_ros import Buffer, TransformBroadcaster, TransformListener
     from tf2_ros import ConnectivityException, ExtrapolationException, LookupException
 except Exception as exc:  # pragma: no cover - runtime guard.
@@ -65,6 +65,7 @@ except Exception as exc:  # pragma: no cover - runtime guard.
     Image = None
     Imu = None
     LaserScan = None
+    PointCloud2 = None
     Buffer = None
     TransformBroadcaster = None
     TransformListener = None
@@ -94,6 +95,52 @@ def yaw_from_quaternion_xyzw(x: float, y: float, z: float, w: float) -> float:
     siny_cosp = 2.0 * (w * z + x * y)
     cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
     return math.atan2(siny_cosp, cosy_cosp)
+
+
+def _quaternion_rotation_matrix(x: float, y: float, z: float, w: float) -> np.ndarray:
+    norm = math.sqrt(x * x + y * y + z * z + w * w)
+    if norm <= 1e-9:
+        return np.eye(3, dtype=np.float32)
+    x /= norm
+    y /= norm
+    z /= norm
+    w /= norm
+    return np.asarray(
+        [
+            [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
+            [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
+            [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
+        ],
+        dtype=np.float32,
+    )
+
+
+def _point_cloud2_xyz_array(message: Any) -> np.ndarray:
+    fields = {str(field.name): field for field in getattr(message, "fields", [])}
+    if not all(name in fields for name in ("x", "y", "z")):
+        return np.empty((0, 3), dtype=np.float32)
+    point_step = int(getattr(message, "point_step", 0) or 0)
+    if point_step <= 0:
+        return np.empty((0, 3), dtype=np.float32)
+    data = bytes(getattr(message, "data", b""))
+    point_count = int(getattr(message, "width", 0) or 0) * int(getattr(message, "height", 0) or 0)
+    if point_count <= 0 or len(data) < point_count * point_step:
+        return np.empty((0, 3), dtype=np.float32)
+    endian = ">" if bool(getattr(message, "is_bigendian", False)) else "<"
+    dtype = np.dtype(
+        {
+            "names": ["x", "y", "z"],
+            "formats": [f"{endian}f4", f"{endian}f4", f"{endian}f4"],
+            "offsets": [
+                int(fields["x"].offset),
+                int(fields["y"].offset),
+                int(fields["z"].offset),
+            ],
+            "itemsize": point_step,
+        }
+    )
+    structured = np.frombuffer(data, dtype=dtype, count=point_count)
+    return np.column_stack((structured["x"], structured["y"], structured["z"])).astype(np.float32, copy=False)
 
 
 def ros_goal_status_label(status: int | None) -> str:
@@ -207,6 +254,7 @@ def _select_turnaround_scan_observations(
 class RosRuntimeConfig:
     map_topic: str = "/map"
     scan_topic: str = "/scan"
+    point_cloud_topic: str = "/camera/head/points"
     rgb_topic: str = "/camera/head/image_raw"
     imu_topic: str = "/imu/filtered_yaw"
     cmd_vel_topic: str = "/cmd_vel"
@@ -228,6 +276,7 @@ class RosRuntimeConfig:
     camera_pan_sample_count: int = 12
     allow_multiple_action_servers: bool = False
     publish_internal_navigation_map: bool = True
+    navigation_map_source: str = "fused_scan"
 
 
 @dataclass(frozen=True)
@@ -291,12 +340,14 @@ class RosExplorationRuntime(Node):
         self.latest_map_stamp_s: float = 0.0
         self.latest_scan: LaserScan | None = None
         self.latest_scan_stats: dict[str, Any] | None = None
+        self.latest_point_cloud_stats: dict[str, Any] | None = None
         self.latest_imu_msg: Imu | None = None
         self._latest_imu_orientation_yaw_rad: float | None = None
         self._latest_imu_orientation_unwrapped_yaw_rad: float | None = None
         self._scan_sensor_yaw_offset_rad: float | None = None
         self._use_turn_feedback_for_scan_pose = False
         self.scan_observations: list[dict[str, Any]] = []
+        self.point_cloud_observations: list[dict[str, Any]] = []
         self.latest_image_msg: Image | None = None
         self.latest_image_data_url: str | None = None
         self._nav_goal_history: list[dict[str, Any]] = []
@@ -312,6 +363,7 @@ class RosExplorationRuntime(Node):
         self._spin_client = ActionClient(self, Spin, "spin")
         self.create_subscription(OccupancyGrid, config.map_topic, self._on_map, map_qos)
         self.create_subscription(LaserScan, config.scan_topic, self._on_scan, qos_profile_sensor_data)
+        self.create_subscription(PointCloud2, config.point_cloud_topic, self._on_point_cloud, qos_profile_sensor_data)
         self.create_subscription(Image, config.rgb_topic, self._on_rgb, qos_profile_sensor_data)
         self.create_subscription(Imu, config.imu_topic, self._on_imu, qos_profile_sensor_data)
         self._published_navigation_map: RosOccupancyMap | None = None
@@ -365,6 +417,45 @@ class RosExplorationRuntime(Node):
             )
             if len(self.scan_observations) > 4096:
                 self.scan_observations = self.scan_observations[-2048:]
+
+    def _on_point_cloud(self, message: PointCloud2) -> None:
+        points = _point_cloud2_xyz_array(message)
+        finite = np.isfinite(points).all(axis=1) if points.size else np.zeros((0,), dtype=bool)
+        reference_frame = self.config.odom_frame if self.config.publish_internal_navigation_map else self.config.map_frame
+        transform = self._lookup_transform_xyz_quat(reference_frame, message.header.frame_id)
+        transformed_points = np.empty((0, 3), dtype=np.float32)
+        sensor_origin = None
+        if transform is not None and points.size:
+            translation, quaternion = transform
+            rotation = _quaternion_rotation_matrix(*quaternion)
+            transformed_points = (points @ rotation.T + translation.reshape(1, 3)).astype(np.float32, copy=False)
+            sensor_origin = translation
+        elif transform is not None:
+            translation, _quaternion = transform
+            sensor_origin = translation
+        self.latest_point_cloud_stats = {
+            "frame_id": message.header.frame_id,
+            "point_count": int(points.shape[0]),
+            "finite_point_count": int(np.count_nonzero(finite)),
+            "width": int(message.width),
+            "height": int(message.height),
+            "point_step": int(message.point_step),
+            "reference_frame": reference_frame,
+            "tf_ready": transform is not None,
+        }
+        if transform is None or sensor_origin is None:
+            return
+        self.point_cloud_observations.append(
+            {
+                "frame_id": str(message.header.frame_id),
+                "reference_frame": reference_frame,
+                "sensor_origin_xyz": tuple(float(item) for item in sensor_origin),
+                "points_xyz": transformed_points,
+                "point_count": int(transformed_points.shape[0]),
+            }
+        )
+        if len(self.point_cloud_observations) > 1024:
+            self.point_cloud_observations = self.point_cloud_observations[-512:]
 
     def _on_rgb(self, message: Image) -> None:
         self.latest_image_msg = message
@@ -443,6 +534,17 @@ class RosExplorationRuntime(Node):
         return self.lookup_pose(frame_id, self.config.base_frame)
 
     def lookup_pose(self, target_frame: str, source_frame: str) -> Pose2D | None:
+        transform = self._lookup_transform_xyz_quat(target_frame, source_frame)
+        if transform is None:
+            return None
+        translation, rotation = transform
+        return Pose2D(
+            float(translation[0]),
+            float(translation[1]),
+            yaw_from_quaternion_xyzw(rotation[0], rotation[1], rotation[2], rotation[3]),
+        )
+
+    def _lookup_transform_xyz_quat(self, target_frame: str, source_frame: str) -> tuple[np.ndarray, tuple[float, float, float, float]] | None:
         try:
             transform = self.tf_buffer.lookup_transform(
                 target_frame,
@@ -453,10 +555,9 @@ class RosExplorationRuntime(Node):
             return None
         translation = transform.transform.translation
         rotation = transform.transform.rotation
-        return Pose2D(
-            float(translation.x),
-            float(translation.y),
-            yaw_from_quaternion_xyzw(rotation.x, rotation.y, rotation.z, rotation.w),
+        return (
+            np.asarray([float(translation.x), float(translation.y), float(translation.z)], dtype=np.float32),
+            (float(rotation.x), float(rotation.y), float(rotation.z), float(rotation.w)),
         )
 
     def spin_for(self, duration_s: float) -> None:
@@ -504,6 +605,9 @@ class RosExplorationRuntime(Node):
     def scan_observation_count(self) -> int:
         return len(self.scan_observations)
 
+    def point_cloud_observation_count(self) -> int:
+        return len(self.point_cloud_observations)
+
     def drain_scan_observations(self, since_index: int) -> tuple[list[dict[str, Any]], int]:
         self.spin_for(0.05)
         stop_index = len(self.scan_observations)
@@ -512,6 +616,15 @@ class RosExplorationRuntime(Node):
         if since_index >= stop_index:
             return [], stop_index
         return list(self.scan_observations[since_index:stop_index]), stop_index
+
+    def drain_point_cloud_observations(self, since_index: int) -> tuple[list[dict[str, Any]], int]:
+        self.spin_for(0.05)
+        stop_index = len(self.point_cloud_observations)
+        if since_index < 0:
+            since_index = 0
+        if since_index >= stop_index:
+            return [], stop_index
+        return list(self.point_cloud_observations[since_index:stop_index]), stop_index
 
     def compute_path(
         self,
@@ -824,12 +937,16 @@ class RosExplorationRuntime(Node):
             "module": "ros_nav2",
             "map_topic": self.config.map_topic,
             "scan_topic": self.config.scan_topic,
+            "point_cloud_topic": self.config.point_cloud_topic,
             "rgb_topic": self.config.rgb_topic,
-            "navigation_map_source": "fused_scan" if self.config.publish_internal_navigation_map else "external",
+            "navigation_map_source": self.config.navigation_map_source
+            if self.config.publish_internal_navigation_map
+            else "external",
             "goals": list(self._nav_goal_history),
             "plans": list(self._nav_plan_history),
             "turn_scans": list(self._nav_scan_history),
             "latest_scan": self.latest_scan_stats,
+            "latest_point_cloud": self.latest_point_cloud_stats,
         }
 
     def record_goal(self, payload: dict[str, Any]) -> None:

@@ -67,6 +67,24 @@ class RealAgenticExplorationTests(unittest.TestCase):
 
         self.assertIn("--stop-after-initial-scan", translated)
 
+    def test_fused_point_cloud_map_source_is_translated(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "--ros-navigation-map-source",
+                "fused_point_cloud",
+                "--ros-point-cloud-topic",
+                "/camera/head/points",
+                "--point-cloud-robot-clearance-height-m",
+                "1.5",
+            ]
+        )
+
+        translated = translated_args(args)
+
+        self.assertEqual(translated[translated.index("--ros-navigation-map-source") + 1], "fused_point_cloud")
+        self.assertEqual(translated[translated.index("--ros-point-cloud-topic") + 1], "/camera/head/points")
+        self.assertEqual(translated[translated.index("--point-cloud-robot-clearance-height-m") + 1], "1.5")
+
     def test_ros_session_initializes_scan_fusion_state_before_first_scan(self) -> None:
         class FakeRuntime:
             latest_map = None
@@ -92,6 +110,18 @@ class RealAgenticExplorationTests(unittest.TestCase):
         self.assertEqual(session.scan_range_edge_cells, set())
         self.assertEqual(session.scan_map_resolution, config.occupancy_resolution)
         self.assertEqual(session.scan_observation_index, 3)
+
+    def test_fused_point_cloud_rejects_remote_ros_adapter(self) -> None:
+        config = SimExplorationConfig(
+            repo_root=".",
+            persist_path="/tmp/robot42-test-map.json",
+            ros_adapter_url="http://127.0.0.1:8891",
+            ros_navigation_map_source="fused_point_cloud",
+        )
+        backend = ExplorationBackend(ExplorationBackendConfig(mode="sim"))
+
+        with self.assertRaisesRegex(RuntimeError, "requires the local ROS runtime"):
+            RosExplorationSession(config, backend, "task_1")
 
 
 if __name__ == "__main__":

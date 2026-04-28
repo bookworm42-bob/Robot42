@@ -16,6 +16,7 @@ from xlerobot_playground.real_ros_bridge import (
     RobotBrainRgbdSource,
     _build_camera_info_from_metadata,
     _motion_result_error,
+    _orbbec_optical_xyz_to_ros_camera_link,
     _point_field,
     build_parser,
     config_from_args,
@@ -349,6 +350,14 @@ class RealRosBridgeTests(unittest.TestCase):
         self.assertEqual(field.offset, 8)
         self.assertEqual(field.datatype, _PointField.FLOAT32)
         self.assertEqual(field.count, 1)
+
+    def test_orbbec_optical_points_convert_to_ros_camera_link_axes(self) -> None:
+        converted = _orbbec_optical_xyz_to_ros_camera_link(
+            struct.pack("<fff", 1.0, 2.0, 3.0),
+            count=1,
+        )
+
+        self.assertEqual(struct.unpack("<fff", converted), (3.0, -1.0, -2.0))
 
     def test_camera_info_from_metadata_scales_intrinsics(self) -> None:
         class _Header:

@@ -42,9 +42,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--review-ui-flavor", choices=("user", "developer"), default="user")
     parser.add_argument("--open-browser", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--wait-for-ui-start", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--ros-navigation-map-source", choices=("fused_scan", "external"), default="fused_scan")
+    parser.add_argument(
+        "--ros-navigation-map-source",
+        choices=("fused_scan", "fused_point_cloud", "external"),
+        default="fused_scan",
+    )
     parser.add_argument("--ros-map-topic", default="/map")
     parser.add_argument("--ros-scan-topic", default="/scan")
+    parser.add_argument("--ros-point-cloud-topic", default="/camera/head/points")
     parser.add_argument("--ros-rgb-topic", default="/camera/head/image_raw")
     parser.add_argument("--ros-imu-topic", default="/imu/filtered_yaw")
     parser.add_argument("--ros-cmd-vel-topic", default="/cmd_vel")
@@ -62,6 +67,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--camera-pan-action-key", default="head_motor_1.pos")
     parser.add_argument("--camera-pan-settle-s", type=float, default=0.5)
     parser.add_argument("--camera-pan-sample-count", type=int, default=12)
+    parser.add_argument("--point-cloud-range-min-m", type=float, default=0.25)
+    parser.add_argument("--point-cloud-range-max-m", type=float, default=4.0)
+    parser.add_argument("--point-cloud-floor-free-max-z-m", type=float, default=0.08)
+    parser.add_argument("--point-cloud-obstacle-min-z-m", type=float, default=0.08)
+    parser.add_argument("--point-cloud-robot-clearance-height-m", type=float, default=1.50)
+    parser.add_argument("--point-cloud-obstacle-max-z-m", type=float, default=1.80)
+    parser.add_argument("--point-cloud-max-rays", type=int, default=2400)
     parser.add_argument("--pause-for-operator-approval", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--stop-after-initial-scan", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--nav2-planner-id", default="GridBased")
@@ -119,6 +131,8 @@ def translated_args(args: argparse.Namespace) -> list[str]:
         args.ros_map_topic,
         "--ros-scan-topic",
         args.ros_scan_topic,
+        "--ros-point-cloud-topic",
+        args.ros_point_cloud_topic,
         "--ros-rgb-topic",
         args.ros_rgb_topic,
         "--ros-imu-topic",
@@ -153,6 +167,20 @@ def translated_args(args: argparse.Namespace) -> list[str]:
         str(args.camera_pan_settle_s),
         "--camera-pan-sample-count",
         str(args.camera_pan_sample_count),
+        "--point-cloud-range-min-m",
+        str(args.point_cloud_range_min_m),
+        "--point-cloud-range-max-m",
+        str(args.point_cloud_range_max_m),
+        "--point-cloud-floor-free-max-z-m",
+        str(args.point_cloud_floor_free_max_z_m),
+        "--point-cloud-obstacle-min-z-m",
+        str(args.point_cloud_obstacle_min_z_m),
+        "--point-cloud-robot-clearance-height-m",
+        str(args.point_cloud_robot_clearance_height_m),
+        "--point-cloud-obstacle-max-z-m",
+        str(args.point_cloud_obstacle_max_z_m),
+        "--point-cloud-max-rays",
+        str(args.point_cloud_max_rays),
         "--explorer-policy",
         args.explorer_policy,
         "--llm-provider",

@@ -119,6 +119,7 @@ class RemoteRosExplorationRuntime:
         self.latest_map: RosOccupancyMap | None = None
         self.latest_map_stamp_s: float = 0.0
         self.latest_scan_stats: dict[str, Any] | None = None
+        self.latest_point_cloud_stats: dict[str, Any] | None = None
         self.latest_image_data_url: str | None = None
 
     def spin_until_ready(self, *, timeout_s: float | None = None) -> None:
@@ -261,6 +262,8 @@ class RemoteRosExplorationRuntime:
         self.latest_map_stamp_s = float(payload.get("latest_map_stamp_s", self.latest_map_stamp_s) or 0.0)
         latest_scan = payload.get("latest_scan")
         self.latest_scan_stats = dict(latest_scan) if isinstance(latest_scan, dict) else None
+        latest_point_cloud = payload.get("latest_point_cloud")
+        self.latest_point_cloud_stats = dict(latest_point_cloud) if isinstance(latest_point_cloud, dict) else None
         image_data = payload.get("latest_image_data_url")
         self.latest_image_data_url = str(image_data) if isinstance(image_data, str) and image_data else None
 
@@ -430,6 +433,7 @@ class RosNav2AdapterServer:
             "latest_map": serialize_map(self.runtime.latest_map),
             "latest_map_stamp_s": float(self.runtime.latest_map_stamp_s),
             "latest_scan": self.runtime.latest_scan_stats,
+            "latest_point_cloud": self.runtime.latest_point_cloud_stats,
             "latest_image_data_url": self.runtime.latest_image_data_url,
         }
 
