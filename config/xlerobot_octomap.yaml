@@ -1,0 +1,33 @@
+octomap_server:
+  ros__parameters:
+    frame_id: odom
+    base_frame_id: base_link
+    resolution: 0.08
+
+    # Keep this near the reliable Gemini 2 indoor range while validating.
+    sensor_model.max_range: 4.0
+
+    # Input cloud crop before insertion. Use z in the fixed frame.
+    pointcloud_min_z: -0.20
+    pointcloud_max_z: 1.80
+
+    # Height band used for the projected 2D map. The 3D octree still stores
+    # occupied/free evidence; this controls what becomes navigation-relevant.
+    occupancy_min_z: 0.05
+    occupancy_max_z: 1.50
+
+    filter_ground_plane: true
+    ground_filter.distance: 0.08
+    ground_filter.angle: 0.20
+    ground_filter.plane_distance: 0.12
+
+    filter_speckles: true
+    publish_free_space: false
+    latch: true
+    incremental_2D_projection: true
+    compress_map: true
+
+    sensor_model.hit: 0.70
+    sensor_model.miss: 0.40
+    sensor_model.min: 0.12
+    sensor_model.max: 0.97
