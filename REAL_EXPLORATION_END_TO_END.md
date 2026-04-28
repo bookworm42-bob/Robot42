@@ -1,6 +1,6 @@
 # Real XLeRobot Agentic Exploration Commands
 
-This is the standalone command runbook for real exploration. It runs the same frontier/LLM exploration loop as the ManiSkill/ROS path, but with the real robot providing RGB-D, `/scan`, `/odom`, and motor execution through the robot brain bridge.
+This is the standalone command runbook for real exploration. It runs the same frontier/LLM exploration loop as the ManiSkill/ROS path, but with the real robot providing RGB-D, `/camera/head/points`, `/scan`, `/odom`, and motor execution through the robot brain bridge.
 
 This full exploration path does **not** use the HTTP Nav2 router from the smoke tests. In this mode:
 
@@ -32,7 +32,7 @@ On any machine where you open the UI from a browser, replace `OFFLOAD_IP` with t
 ```text
 robot brain Orbbec sidecar
 robot brain HTTP agent
-offload real_ros_bridge
+offload real_ros_bridge image/depth/point-cloud publisher
 offload RGB-D visual odometry
 offload Nav2
 offload real_agentic_exploration + web UI
@@ -42,7 +42,7 @@ The exploration session does:
 
 ```text
 initial 360 degree scan
-scan fusion into an occupancy map when using fused_scan
+point-cloud fusion into an occupancy map when using fused_point_cloud
 frontier detection
 Nav2 path preview for frontier candidates
 LLM or heuristic frontier choice
@@ -50,6 +50,8 @@ Nav2 navigate_to_pose for the selected frontier
 repeat scan/frontier/decision/navigation
 save the final map JSON
 ```
+
+`/scan` is still published for diagnostics and Nav2 local costmap compatibility, but the default exploration map source in this runbook is now `fused_point_cloud`.
 
 Default scan behavior:
 
@@ -112,6 +114,12 @@ sudo ./build/orbbec_rgb_test/orbbec_rgb_test \
   --no-file-output \
   --enable-depth \
   --enable-depth-registration \
+  --enable-point-cloud \
+  --point-cloud-format xyz \
+  --point-cloud-stride 2 \
+  --point-cloud-max-points 200000 \
+  --point-cloud-min-z-m 0.25 \
+  --point-cloud-max-z-m 4.0 \
   --enable-imu \
   --imu-udp-host 127.0.0.1 \
   --imu-udp-port 8766 \
@@ -132,6 +140,12 @@ sudo ./build/orbbec_rgb_test/orbbec_rgb_test \
   --no-file-output \
   --enable-depth \
   --enable-depth-registration \
+  --enable-point-cloud \
+  --point-cloud-format xyz \
+  --point-cloud-stride 2 \
+  --point-cloud-max-points 200000 \
+  --point-cloud-min-z-m 0.25 \
+  --point-cloud-max-z-m 4.0 \
   --enable-imu \
   --depth-width 640 \
   --depth-height 400 \
@@ -169,6 +183,8 @@ asyncio.run(main())
 PY
 ```
 
+The health response should include point-cloud stats after the first RGB-D frame. If `/camera/head/points` is empty on the offload computer, first confirm this sidecar command includes `--enable-point-cloud` and that the sidecar log reports nonzero point counts.
+
 `/imu` is now an in-memory debug snapshot. The high-rate IMU path is `Orbbec callback -> UDP datagram -> robot_brain_agent memory -> /ws/imu websocket`. `latest_imu.json` is no longer used in the high-rate path.
 
 ## Offload Computer
@@ -186,6 +202,7 @@ python -m pip install aiohttp
 python -m xlerobot_playground.real_ros_bridge \
   --robot-brain-url "http://${ROBOT_BRAIN_IP}:8765" \
   --publish-rate-hz 30 \
+  --head-points-topic /camera/head/points \
   --cmd-vel-timeout-s 0.5 \
   --max-linear-m-s 0.03 \
   --max-angular-rad-s 0.30 \
@@ -199,9 +216,9 @@ python -m xlerobot_playground.real_ros_bridge \
   --allow-motion-commands
 ```
 
-This publishes camera images, depth-derived `/scan`, `/imu`, camera pan/pitch topics, camera transforms, and forwards ROS `/cmd_vel` to the robot brain.
+This publishes camera images, `/camera/head/points`, depth-derived `/scan`, `/imu`, camera pan/pitch topics, camera transforms, and forwards ROS `/cmd_vel` to the robot brain.
 
-Keep `--no-laser-fill-no-return` for real Orbbec mapping. Missing/invalid depth should stay unknown; treating it as max-range free space creates false fan-shaped clear areas in the fused map.
+Keep `--no-laser-fill-no-return` for real Orbbec mapping. Missing/invalid depth should stay unknown; treating it as max-range free space creates false fan-shaped clear areas. The point-cloud occupancy mapper is intentionally conservative: it adds free space only along rays to valid points and does not clear through missing depth.
 
 `/imu` is a raw `sensor_msgs/Imu` stream carrying both angular velocity and linear acceleration. In robot-brain mode it is now pushed over a persistent websocket, so `/imu` is no longer capped by the old poll timer.
 
@@ -209,6 +226,8 @@ Quick checks:
 
 ```bash
 ros2 topic echo /camera/head/camera_info --once
+ros2 topic echo /camera/head/points --once
+ros2 topic hz /camera/head/points
 ros2 topic echo /scan --once
 ros2 topic echo /imu --once
 ros2 topic echo /camera/head/pan_rad --once
@@ -227,6 +246,7 @@ Verification plan:
 - On the robot brain, watch `orbbec_rgb_test` for `IMU callback rate ~= ... Hz`.
 - On the robot brain, watch `robot_brain_agent` for `IMU rx rate~=...Hz` and `IMU ws send rate~=...Hz`.
 - On the offload computer, watch `real_ros_bridge` for `IMU websocket connected` and `IMU stream rx~=...Hz publish~=...Hz`.
+- On the offload computer, watch `real_ros_bridge` for point-cloud receive/publish logs, then confirm `ros2 topic hz /camera/head/points`.
 - Run `ros2 topic hz /imu` and confirm the rate is no longer limited to the old tens-of-Hz poll ceiling.
 - If the callback rate is still low, audit the current Orbbec aggregate mode `OB_FRAME_AGGREGATE_OUTPUT_ALL_TYPE_FRAME_REQUIRE` first. The transport bottleneck is removed, but that SDK aggregation setting can still quantize the upstream callback cadence.
 
@@ -344,7 +364,16 @@ python -m xlerobot_playground.real_agentic_exploration \
   --review-host 0.0.0.0 \
   --review-port 8770 \
   --ros-navigation-map-source fused_point_cloud \
+  --ros-map-topic /map \
+  --ros-scan-topic /scan \
   --ros-point-cloud-topic /camera/head/points \
+  --point-cloud-range-min-m 0.25 \
+  --point-cloud-range-max-m 4.0 \
+  --point-cloud-floor-free-max-z-m 0.08 \
+  --point-cloud-obstacle-min-z-m 0.08 \
+  --point-cloud-robot-clearance-height-m 1.50 \
+  --point-cloud-obstacle-max-z-m 1.80 \
+  --point-cloud-max-rays 2400 \
   --ros-ready-timeout-s 30 \
   --ros-turn-scan-timeout-s 75 \
   --ros-turn-scan-mode camera_pan \
@@ -391,7 +420,16 @@ python -m xlerobot_playground.real_agentic_exploration \
   --review-host 0.0.0.0 \
   --review-port 8770 \
   --ros-navigation-map-source fused_point_cloud \
+  --ros-map-topic /map \
+  --ros-scan-topic /scan \
   --ros-point-cloud-topic /camera/head/points \
+  --point-cloud-range-min-m 0.25 \
+  --point-cloud-range-max-m 4.0 \
+  --point-cloud-floor-free-max-z-m 0.08 \
+  --point-cloud-obstacle-min-z-m 0.08 \
+  --point-cloud-robot-clearance-height-m 1.50 \
+  --point-cloud-obstacle-max-z-m 1.80 \
+  --point-cloud-max-rays 2400 \
   --ros-ready-timeout-s 30 \
   --ros-turn-scan-timeout-s 75 \
   --ros-turn-scan-mode camera_pan \
@@ -411,10 +449,13 @@ Run these on the offload computer before starting exploration:
 ros2 topic echo /camera/head/camera_info --once
 ros2 topic echo /camera/head/image_raw --once
 ros2 topic echo /camera/head/depth/image_raw --once
+ros2 topic echo /camera/head/points --once
+ros2 topic hz /camera/head/points
 ros2 topic echo /camera/head/pan_rad --once
 ros2 topic echo /scan --once
 ros2 topic echo /odom --once
 ros2 run tf2_ros tf2_echo odom base_link
+ros2 run tf2_ros tf2_echo odom head_camera_link
 ros2 run tf2_ros tf2_echo map odom
 ros2 action list
 ```
@@ -426,7 +467,22 @@ Expected action servers include:
 /navigate_to_pose
 ```
 
-During the initial scan, the robot base should stay still while the head pans through the positive sweep first, returns to center, pans through the negative sweep second, and returns to center. The UI should move from an empty/not-started map to a partial occupancy map with candidate frontiers.
+After `real_agentic_exploration` starts and the first scan begins, verify the fused occupancy map:
+
+```bash
+ros2 topic echo /map --once
+ros2 topic hz /map
+```
+
+During the initial scan, the robot base should stay still while the head pans through the positive sweep first, returns to center, pans through the negative sweep second, and returns to center. The UI should move from an empty/not-started map to a partial occupancy map with candidate frontiers. The `/map` topic should update from the point-cloud fusion path, while `/scan` remains available for Nav2 local obstacle checks and debugging.
+
+Optional RViz validation:
+
+```bash
+rviz2
+```
+
+In RViz, set `Fixed Frame` to `odom` or `map`, then add `PointCloud2` on `/camera/head/points`, `Map` on `/map`, `TF`, `Odometry` on `/odom`, and optionally `LaserScan` on `/scan`. You should see the point cloud rotate with `head_camera_link` during head pan sweeps, and the occupancy grid should fill in after the exploration loop integrates those observations.
 
 If the map starts but the head does not pan, check the robot-brain head pose and motion gate:
 
@@ -446,9 +502,10 @@ The `robot_brain_agent` terminal should log motion/action errors if it rejects t
 ## What You Should See
 
 - Robot brain logs showing RGB-D/IMU receive rates and pan commands during 360 scans.
-- `real_ros_bridge` publishing `/camera/head/*`, `/scan`, camera pan/pitch topics, and forwarding `/cmd_vel` during Nav2 navigation.
+- `real_ros_bridge` publishing `/camera/head/*`, `/camera/head/points`, `/scan`, camera pan/pitch topics, and forwarding `/cmd_vel` during Nav2 navigation.
 - RGB-D visual odometry publishing `/odom` and `odom -> base_link`.
 - Nav2 accepting `compute_path_to_pose` and `navigate_to_pose`.
+- `/map` receiving the fused point-cloud occupancy grid from the exploration runtime.
 - UI showing:
   - current robot pose
   - partial occupancy map
