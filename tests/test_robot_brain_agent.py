@@ -107,6 +107,24 @@ class RobotBrainAgentTests(unittest.TestCase):
         self.assertEqual(runtime.actions, [{"head_tilt.pos": 0.5 * 180.0 / 3.141592653589793}])
         self.assertAlmostEqual(agent.camera_state()["pitch_rad"], 0.5)
 
+    def test_agent_applies_camera_pitch_motor_offset_without_changing_state(self) -> None:
+        runtime = FakeRuntime()
+        agent = RobotBrainAgent(
+            RobotBrainAgentConfig(
+                allow_motion_commands=True,
+                camera_pitch_action_key="head_motor_2.pos",
+                camera_pitch_action_offset_deg=-25.0,
+                camera_pitch_settle_s=0.0,
+            ),
+            runtime=runtime,
+        )
+
+        response = agent.pitch_camera(pitch_rad=0.0)
+
+        self.assertTrue(response["succeeded"])
+        self.assertEqual(runtime.actions, [{"head_motor_2.pos": -25.0}])
+        self.assertAlmostEqual(agent.camera_state()["pitch_rad"], 0.0)
+
     def test_agent_commands_camera_pan_and_updates_state(self) -> None:
         runtime = FakeRuntime()
         agent = RobotBrainAgent(

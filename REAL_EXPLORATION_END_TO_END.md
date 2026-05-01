@@ -42,7 +42,7 @@ The exploration session does:
 
 ```text
 initial 360 degree scan
-point-cloud fusion into an occupancy map when using fused_point_cloud
+OctoMap projection into /projected_map for the first validation run
 frontier detection
 Nav2 path preview for frontier candidates
 LLM or heuristic frontier choice
@@ -51,7 +51,7 @@ repeat scan/frontier/decision/navigation
 save the final map JSON
 ```
 
-`/scan` is still published for diagnostics and Nav2 local costmap compatibility, but the default exploration map source in this runbook is now `fused_point_cloud`.
+`/scan` is still published for diagnostics and Nav2 local costmap compatibility, but the default exploration map source in this runbook is now OctoMap's `/projected_map` through `--ros-navigation-map-source external`.
 
 Default scan behavior:
 
@@ -90,7 +90,13 @@ python -m xlerobot_playground.robot_brain_agent \
   --camera-pan-action-units deg \
   --camera-pan-action-sign -1 \
   --camera-pan-settle-s 0.5 \
-  --initial-camera-pan-deg 0
+  --initial-camera-pan-deg 0 \
+  --camera-pitch-action-key head_motor_2.pos \
+  --camera-pitch-action-units deg \
+  --camera-pitch-action-sign 1 \
+  --camera-pitch-action-offset-deg -25 \
+  --camera-pitch-settle-s 0.5 \
+  --initial-camera-pitch-deg 0
 ```
 
 `head_motor_1.pos` is the default horizontal head pan motor command. Keep `--allow-motion-commands` enabled here; camera-pan exploration scans use the same safe hardware command gate as wheel motion.
@@ -98,6 +104,10 @@ python -m xlerobot_playground.robot_brain_agent \
 Keep `--use-degrees` enabled for camera-pan scans. The XLeRobot head motors use degree units only in degree mode; without it, `head_motor_1.pos` is interpreted in normalized `-100..100` units while the scan pipeline would believe the camera reached `-180..180` degrees.
 
 Check the physical pan sign before trusting the 360 map. In ROS convention, positive pan/yaw is left/counter-clockwise viewed from above. If `+30 deg` turns the head right, restart `robot_brain_agent` with `--camera-pan-action-sign -1` so the motor command is inverted while the published camera pose remains correct.
+
+`head_motor_2.pos` is the pitch motor. For mapping, logical `pitch_deg: 0` means the camera optical axis is parallel to the floor, not necessarily raw motor command `0`. On this robot, the physically level camera position currently reads about `head_motor_2.pos = -25`, so `--camera-pitch-action-offset-deg -25` makes logical pitch `0 deg` send raw motor `-25 deg` while ROS TF still publishes pitch `0`.
+
+If you recalibrate and the level camera position changes, update only `--camera-pitch-action-offset-deg`. For example, if the camera is level at `head_motor_2.pos = -18`, use `--camera-pitch-action-offset-deg -18`.
 
 ### Terminal RB-2: Orbbec Sidecar
 
@@ -189,7 +199,7 @@ The health response should include point-cloud stats after the first RGB-D frame
 
 ## Offload Computer
 
-Run these on the ROS/Nav2 offload computer. Keep terminals OC-1, OC-2, OC-4, and OC-5 running. OC-3 only needs to be run when generating/updating the Nav2 params.
+Run these on the ROS/Nav2 offload computer. For the OctoMap first run, keep OC-1, OC-1A, and OC-6 running. Keep OC-2, OC-4, and OC-5 running when you want the full Nav2 exploration stack. OC-3 only needs to be run when generating/updating the Nav2 params.
 
 ### Terminal OC-1: Real ROS Bridge
 
@@ -208,7 +218,7 @@ python -m xlerobot_playground.real_ros_bridge \
   --max-angular-rad-s 0.30 \
   --camera-x-m 0.0 \
   --camera-y-m 0.0 \
-  --camera-z-m 0.35 \
+  --camera-z-m 1.05 \
   --camera-yaw-rad 0.0 \
   --camera-pitch-topic /camera/head/pitch_rad \
   --camera-pan-topic /camera/head/pan_rad \
@@ -218,9 +228,37 @@ python -m xlerobot_playground.real_ros_bridge \
 
 This publishes camera images, `/camera/head/points`, depth-derived `/scan`, `/imu`, camera pan/pitch topics, camera transforms, and forwards ROS `/cmd_vel` to the robot brain.
 
+`--camera-z-m 1.05` is the current effective camera height relative to `base_link`, validated in RViz by checking that the PointCloud2 floor remains flat against the ground grid at both `pitch_deg: 0` and `pitch_deg: 30`.
+
 Keep `--no-laser-fill-no-return` for real Orbbec mapping. Missing/invalid depth should stay unknown; treating it as max-range free space creates false fan-shaped clear areas. The point-cloud occupancy mapper is intentionally conservative: it adds free space only along rays to valid points and does not clear through missing depth.
 
 `/imu` is a raw `sensor_msgs/Imu` stream carrying both angular velocity and linear acceleration. In robot-brain mode it is now pushed over a persistent websocket, so `/imu` is no longer capped by the old poll timer.
+
+### Camera Pitch Alignment Check
+
+Before trusting point-cloud occupancy or OctoMap projection, confirm the physical camera pitch matches ROS TF.
+
+In RViz:
+
+- set `Fixed Frame` to `base_link`
+- add `TF`
+- add `PointCloud2` on `/camera/head/points`
+- look from the side
+
+When logical pitch is `0 deg`, floor points should lie roughly parallel to the RViz ground grid. If the floor cloud slopes upward or downward with distance, adjust `--camera-pitch-action-offset-deg` in the robot brain command and restart `robot_brain_agent`.
+
+Useful commands:
+
+```bash
+curl -s -X POST "http://${ROBOT_BRAIN_IP}:8765/camera/head/pitch" \
+  -H 'Content-Type: application/json' \
+  -d '{"pitch_deg": 0, "settle_s": 0.5}' | python -m json.tool
+
+ros2 topic echo /camera/head/pitch_rad --once
+ros2 run tf2_ros tf2_echo base_link head_camera_link
+```
+
+With `--camera-pitch-action-offset-deg -25`, the first command publishes camera pitch `0 deg` but sends raw `head_motor_2.pos = -25`. This is expected.
 
 Quick checks:
 
@@ -249,6 +287,58 @@ Verification plan:
 - On the offload computer, watch `real_ros_bridge` for point-cloud receive/publish logs, then confirm `ros2 topic hz /camera/head/points`.
 - Run `ros2 topic hz /imu` and confirm the rate is no longer limited to the old tens-of-Hz poll ceiling.
 - If the callback rate is still low, audit the current Orbbec aggregate mode `OB_FRAME_AGGREGATE_OUTPUT_ALL_TYPE_FRAME_REQUIRE` first. The transport bottleneck is removed, but that SDK aggregation setting can still quantize the upstream callback cadence.
+
+### Terminal OC-1A: OctoMap From Orbbec Point Cloud
+
+Use this terminal for the OctoMap first run. Keep `robot_brain_agent`, the Orbbec sidecar, and `real_ros_bridge` running first.
+
+```bash
+cd /home/alin/Robot42
+source /opt/ros/humble/setup.bash
+source /home/alin/Robot42/.venv-maniskill/bin/activate
+
+ros2 launch /home/alin/Robot42/launch/xlerobot_octomap.launch.py
+```
+
+The default `config/xlerobot_octomap.yaml` is set up for the first stationary validation pass:
+
+```text
+frame_id: base_link
+base_frame_id: base_link
+resolution: 0.08
+```
+
+Use `base_link` while the robot base is staying still for the initial 360 degree camera-pan scan. Later, once the robot is moving through the map, switch OctoMap to a stable world frame such as `odom` or `map`.
+
+Expected topics:
+
+```bash
+ros2 topic list | grep -E 'octomap|projected|occupied'
+ros2 topic echo /projected_map --once
+ros2 topic hz /projected_map
+```
+
+Expected output topics include:
+
+```text
+/occupied_cells_vis_array
+/octomap_binary
+/octomap_full
+/octomap_point_cloud_centers
+/projected_map
+```
+
+In RViz:
+
+- set `Fixed Frame` to `base_link` for stationary validation
+- add `TF`
+- add `PointCloud2` on `/camera/head/points`
+- add `MarkerArray` on `/occupied_cells_vis_array`
+- add `Map` on `/projected_map`
+
+Do not tune OctoMap until the camera pitch alignment check above passes. If the floor cloud is tilted relative to the RViz grid, `/projected_map` will appear cut or will mark free/occupied cells in the wrong places.
+
+Restarting OctoMap clears its in-memory map. RViz does not need to be restarted; toggle the `Map` and `MarkerArray` displays off/on if stale latched visuals remain.
 
 ### Terminal OC-2: IMU Yaw Filter
 
@@ -349,7 +439,15 @@ ros2 action list | grep navigate_to_pose
 
 ### Terminal OC-6: Real Exploration UI And Loop
 
-Start with heuristic policy first. This tests mapping, frontiers, path previews, Nav2 goal execution, and UI without spending LLM calls.
+Start with heuristic policy first. This OctoMap first run tests the 360 degree camera-pan scan, `/projected_map` ingestion, frontier generation, and UI display without spending LLM calls or starting navigation.
+
+Set the camera to the validated single pitch before starting the UI loop:
+
+```bash
+curl -s -X POST "http://${ROBOT_BRAIN_IP}:8765/camera/head/pitch" \
+  -H 'Content-Type: application/json' \
+  -d '{"pitch_deg": 30, "settle_s": 0.5}' | python -m json.tool
+```
 
 ```bash
 cd /home/alin/Robot42
@@ -363,17 +461,11 @@ python -m xlerobot_playground.real_agentic_exploration \
   --serve-review-ui \
   --review-host 0.0.0.0 \
   --review-port 8770 \
-  --ros-navigation-map-source fused_point_cloud \
-  --ros-map-topic /map \
+  --ros-navigation-map-source external \
+  --ros-map-topic /projected_map \
+  --ros-map-frame base_link \
   --ros-scan-topic /scan \
   --ros-point-cloud-topic /camera/head/points \
-  --point-cloud-range-min-m 0.25 \
-  --point-cloud-range-max-m 4.0 \
-  --point-cloud-floor-free-max-z-m 0.08 \
-  --point-cloud-obstacle-min-z-m 0.08 \
-  --point-cloud-robot-clearance-height-m 1.50 \
-  --point-cloud-obstacle-max-z-m 1.80 \
-  --point-cloud-max-rays 2400 \
   --ros-ready-timeout-s 30 \
   --ros-turn-scan-timeout-s 75 \
   --ros-turn-scan-mode camera_pan \
@@ -393,9 +485,11 @@ Open the UI from your browser:
 http://OFFLOAD_IP:8770
 ```
 
-Click `Start Explore` in the UI. The robot should keep its base still, pan the head `0 -> +180 -> 0 -> -180 -> 0`, build a partial occupancy map from the Orbbec point cloud sweeps, detect frontiers, preview Nav2 paths, choose a frontier, and send a Nav2 navigation goal.
+Click `Start Explore` in the UI. The robot should keep its base still, keep pitch at `30 deg`, pan the head `0 -> +180 -> 0 -> -180 -> 0`, let OctoMap integrate `/camera/head/points`, and then show `/projected_map` as the occupancy map in the UI. Because `--stop-after-initial-scan` is enabled, it should stop after the initial scan instead of sending a Nav2 navigation goal.
 
 By default this real-exploration command waits for the UI start request before moving the robot or panning the head. Use `--no-wait-for-ui-start` only when you want the 360 degree camera-pan scan to begin immediately after the terminal command starts.
+
+For this first OctoMap validation run, keep `--ros-navigation-map-source external` and `--ros-map-topic /projected_map`. Do not use `fused_point_cloud`; that path uses the custom Python point-cloud fusion instead of OctoMap.
 
 Robot-spin fallback:
 
@@ -419,17 +513,11 @@ python -m xlerobot_playground.real_agentic_exploration \
   --serve-review-ui \
   --review-host 0.0.0.0 \
   --review-port 8770 \
-  --ros-navigation-map-source fused_point_cloud \
-  --ros-map-topic /map \
+  --ros-navigation-map-source external \
+  --ros-map-topic /projected_map \
+  --ros-map-frame base_link \
   --ros-scan-topic /scan \
   --ros-point-cloud-topic /camera/head/points \
-  --point-cloud-range-min-m 0.25 \
-  --point-cloud-range-max-m 4.0 \
-  --point-cloud-floor-free-max-z-m 0.08 \
-  --point-cloud-obstacle-min-z-m 0.08 \
-  --point-cloud-robot-clearance-height-m 1.50 \
-  --point-cloud-obstacle-max-z-m 1.80 \
-  --point-cloud-max-rays 2400 \
   --ros-ready-timeout-s 30 \
   --ros-turn-scan-timeout-s 75 \
   --ros-turn-scan-mode camera_pan \
@@ -452,11 +540,10 @@ ros2 topic echo /camera/head/depth/image_raw --once
 ros2 topic echo /camera/head/points --once
 ros2 topic hz /camera/head/points
 ros2 topic echo /camera/head/pan_rad --once
+ros2 topic echo /projected_map --once
+ros2 topic hz /projected_map
 ros2 topic echo /scan --once
-ros2 topic echo /odom --once
-ros2 run tf2_ros tf2_echo odom base_link
-ros2 run tf2_ros tf2_echo odom head_camera_link
-ros2 run tf2_ros tf2_echo map odom
+ros2 run tf2_ros tf2_echo base_link head_camera_link
 ros2 action list
 ```
 
@@ -467,14 +554,14 @@ Expected action servers include:
 /navigate_to_pose
 ```
 
-After `real_agentic_exploration` starts and the first scan begins, verify the fused occupancy map:
+After `real_agentic_exploration` starts and the first scan begins, verify the OctoMap projected occupancy map:
 
 ```bash
-ros2 topic echo /map --once
-ros2 topic hz /map
+ros2 topic echo /projected_map --once
+ros2 topic hz /projected_map
 ```
 
-During the initial scan, the robot base should stay still while the head pans through the positive sweep first, returns to center, pans through the negative sweep second, and returns to center. The UI should move from an empty/not-started map to a partial occupancy map with candidate frontiers. The `/map` topic should update from the point-cloud fusion path, while `/scan` remains available for Nav2 local obstacle checks and debugging.
+During the initial scan, the robot base should stay still while the head pans through the positive sweep first, returns to center, pans through the negative sweep second, and returns to center. The UI should move from an empty/not-started map to the OctoMap `/projected_map` occupancy view with candidate frontiers. `/scan` remains available for Nav2 local obstacle checks and debugging, but the UI map for this run comes from `/projected_map`.
 
 Optional RViz validation:
 
@@ -482,7 +569,7 @@ Optional RViz validation:
 rviz2
 ```
 
-In RViz, set `Fixed Frame` to `odom` or `map`, then add `PointCloud2` on `/camera/head/points`, `Map` on `/map`, `TF`, `Odometry` on `/odom`, and optionally `LaserScan` on `/scan`. You should see the point cloud rotate with `head_camera_link` during head pan sweeps, and the occupancy grid should fill in after the exploration loop integrates those observations.
+For the OctoMap first run in this document, set `Fixed Frame` to `base_link`, then add `PointCloud2` on `/camera/head/points`, `Map` on `/projected_map`, `MarkerArray` on `/occupied_cells_vis_array`, and `TF`. You should see the point cloud rotate with `head_camera_link` during head pan sweeps, while `/projected_map` grows from OctoMap's accumulated 3D evidence.
 
 If the map starts but the head does not pan, check the robot-brain head pose and motion gate:
 
@@ -495,9 +582,15 @@ curl -X POST "http://${ROBOT_BRAIN_IP}:8765/camera/head/pan" \
 curl -X POST "http://${ROBOT_BRAIN_IP}:8765/camera/head/pan" \
   -H 'Content-Type: application/json' \
   -d '{"pan_deg": 0, "action_key": "head_motor_1.pos", "settle_s": 0.5}'
+curl -X POST "http://${ROBOT_BRAIN_IP}:8765/camera/head/pitch" \
+  -H 'Content-Type: application/json' \
+  -d '{"pitch_deg": 0, "settle_s": 0.5}'
+curl -X POST "http://${ROBOT_BRAIN_IP}:8765/camera/head/pitch" \
+  -H 'Content-Type: application/json' \
+  -d '{"pitch_deg": 30, "settle_s": 0.5}'
 ```
 
-The `robot_brain_agent` terminal should log motion/action errors if it rejects the pan command. In `robot_spin` fallback mode, the `real_ros_bridge` terminal should log motion forwarding errors if the robot brain rejects `/cmd_vel`.
+The `robot_brain_agent` terminal should log motion/action errors if it rejects a pan or pitch command. In `robot_spin` fallback mode, the `real_ros_bridge` terminal should log motion forwarding errors if the robot brain rejects `/cmd_vel`.
 
 ## What You Should See
 
@@ -505,7 +598,7 @@ The `robot_brain_agent` terminal should log motion/action errors if it rejects t
 - `real_ros_bridge` publishing `/camera/head/*`, `/camera/head/points`, `/scan`, camera pan/pitch topics, and forwarding `/cmd_vel` during Nav2 navigation.
 - RGB-D visual odometry publishing `/odom` and `odom -> base_link`.
 - Nav2 accepting `compute_path_to_pose` and `navigate_to_pose`.
-- `/map` receiving the fused point-cloud occupancy grid from the exploration runtime.
+- `/projected_map` receiving the OctoMap 2D projection and the UI using it as the occupancy map.
 - UI showing:
   - current robot pose
   - partial occupancy map

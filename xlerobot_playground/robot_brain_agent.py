@@ -61,6 +61,8 @@ class RobotBrainAgentConfig:
     initial_camera_pan_rad: float = 0.0
     camera_pitch_action_key: str | None = None
     camera_pitch_action_units: str = "deg"
+    camera_pitch_action_sign: float = 1.0
+    camera_pitch_action_offset_deg: float = 0.0
     camera_pitch_settle_s: float = 2.0
     camera_pan_action_key: str | None = "head_motor_1.pos"
     camera_pan_action_units: str = "deg"
@@ -364,7 +366,14 @@ class RobotBrainAgent:
                 "message": compatibility_error,
                 "metadata": {"requested_pitch_rad": float(pitch_rad), "action_units": units},
             }
-        action_value = self._head_action_value(rad=float(pitch_rad), deg=pitch_deg, units=units)
+        action_value = (
+            self._head_action_value(rad=float(pitch_rad), deg=pitch_deg, units=units)
+            * self._head_action_sign(self.config.camera_pitch_action_sign)
+            + self._head_action_offset_value(
+                offset_deg=self.config.camera_pitch_action_offset_deg,
+                units=units,
+            )
+        )
         action = {resolved_action_key: action_value}
         with self._motion_lock:
             self.runtime.connect()
@@ -450,6 +459,16 @@ class RobotBrainAgent:
             return float(rad)
         if units == "normalized":
             return max(-100.0, min(100.0, float(rad) / math.pi * 100.0))
+        raise ValueError(f"Unsupported camera head action units: {units!r}")
+
+    @staticmethod
+    def _head_action_offset_value(*, offset_deg: float, units: str) -> float:
+        if units == "deg":
+            return float(offset_deg)
+        if units == "rad":
+            return math.radians(float(offset_deg))
+        if units == "normalized":
+            return max(-100.0, min(100.0, float(offset_deg) / 180.0 * 100.0))
         raise ValueError(f"Unsupported camera head action units: {units!r}")
 
     @staticmethod
@@ -794,6 +813,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Robot send_action key used for absolute head/camera pitch, for example a head tilt joint position key.",
     )
     parser.add_argument("--camera-pitch-action-units", choices=("deg", "rad", "normalized"), default="deg")
+    parser.add_argument(
+        "--camera-pitch-action-sign",
+        type=float,
+        default=1.0,
+        help=(
+            "Set to -1 if positive ROS/head pitch commands physically tilt the camera down instead of up. "
+            "The published camera pose keeps the requested ROS sign; only the motor action is inverted."
+        ),
+    )
+    parser.add_argument(
+        "--camera-pitch-action-offset-deg",
+        type=float,
+        default=0.0,
+        help=(
+            "Raw motor offset, in degrees, added after pitch sign conversion. "
+            "Use this when geometric pitch 0 deg does not equal motor command 0 deg."
+        ),
+    )
     parser.add_argument("--camera-pitch-settle-s", type=float, default=2.0)
     parser.add_argument(
         "--camera-pan-action-key",
@@ -850,6 +887,8 @@ def config_from_args(args: argparse.Namespace) -> RobotBrainAgentConfig:
         ),
         camera_pitch_action_key=args.camera_pitch_action_key,
         camera_pitch_action_units=args.camera_pitch_action_units,
+        camera_pitch_action_sign=args.camera_pitch_action_sign,
+        camera_pitch_action_offset_deg=args.camera_pitch_action_offset_deg,
         camera_pitch_settle_s=args.camera_pitch_settle_s,
         camera_pan_action_key=args.camera_pan_action_key,
         camera_pan_action_units=args.camera_pan_action_units,
