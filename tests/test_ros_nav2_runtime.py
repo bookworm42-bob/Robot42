@@ -8,7 +8,9 @@ from xlerobot_agent.exploration import Pose2D
 from xlerobot_playground.ros_nav2_runtime import (
     RosExplorationRuntime,
     RosOccupancyMap,
+    apply_occupancy_grid_update,
     compute_turn_command,
+    default_map_updates_topic,
     fuse_projected_maps,
     remaining_turn_delta_rad,
 )
@@ -166,6 +168,46 @@ class RosNav2RuntimeTests(unittest.TestCase):
         self.assertIsNotNone(fused)
         assert fused is not None
         self.assertEqual(fused.data, (0,))
+
+    def test_apply_occupancy_grid_update_patches_existing_map(self) -> None:
+        occupancy_map = RosOccupancyMap(
+            resolution=1.0,
+            width=4,
+            height=3,
+            origin_x=0.0,
+            origin_y=0.0,
+            data=(-1,) * 12,
+        )
+
+        updated = apply_occupancy_grid_update(
+            occupancy_map,
+            update_x=1,
+            update_y=1,
+            update_width=2,
+            update_height=2,
+            update_data=(0, 100, 100, 0),
+        )
+
+        self.assertEqual(
+            updated.data,
+            (
+                -1,
+                -1,
+                -1,
+                -1,
+                -1,
+                0,
+                100,
+                -1,
+                -1,
+                100,
+                0,
+                -1,
+            ),
+        )
+
+    def test_default_map_updates_topic_matches_rviz_projected_map_convention(self) -> None:
+        self.assertEqual(default_map_updates_topic("/projected_map"), "/projected_map_updates")
 
     def test_camera_pan_scan_pose_keeps_tf_head_yaw(self) -> None:
         class FakeRuntime:

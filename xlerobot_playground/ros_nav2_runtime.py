@@ -16,6 +16,7 @@ from xlerobot_agent.exploration import Pose2D
 
 IMPORT_ERROR: Exception | None = None
 PIL_IMPORT_ERROR: Exception | None = None
+MAP_UPDATE_IMPORT_ERROR: Exception | None = None
 try:
     from PIL import Image as PILImage
 except Exception as exc:  # pragma: no cover - optional runtime dependency.
@@ -72,6 +73,12 @@ except Exception as exc:  # pragma: no cover - runtime guard.
     ConnectivityException = Exception
     ExtrapolationException = Exception
     LookupException = Exception
+
+try:
+    from map_msgs.msg import OccupancyGridUpdate
+except Exception as exc:  # pragma: no cover - optional ROS runtime dependency.
+    MAP_UPDATE_IMPORT_ERROR = exc
+    OccupancyGridUpdate = None
 
 
 def require_runtime_dependencies() -> None:
@@ -253,6 +260,7 @@ def _select_turnaround_scan_observations(
 @dataclass(frozen=True)
 class RosRuntimeConfig:
     map_topic: str = "/map"
+    map_updates_topic: str | None = None
     scan_topic: str = "/scan"
     point_cloud_topic: str = "/camera/head/points"
     rgb_topic: str = "/camera/head/image_raw"
@@ -328,6 +336,51 @@ class RosOccupancyMap:
         }
 
 
+def default_map_updates_topic(map_topic: str) -> str:
+    topic = str(map_topic or "/map").rstrip("/")
+    if not topic:
+        topic = "/map"
+    return f"{topic}_updates"
+
+
+def apply_occupancy_grid_update(
+    occupancy_map: RosOccupancyMap,
+    *,
+    update_x: int,
+    update_y: int,
+    update_width: int,
+    update_height: int,
+    update_data: Iterable[int],
+) -> RosOccupancyMap:
+    width = int(update_width)
+    height = int(update_height)
+    if width <= 0 or height <= 0:
+        return occupancy_map
+    patch = tuple(int(item) for item in update_data)
+    if len(patch) < width * height:
+        return occupancy_map
+    data = list(occupancy_map.data)
+    for patch_y in range(height):
+        dst_y = int(update_y) + patch_y
+        if not (0 <= dst_y < int(occupancy_map.height)):
+            continue
+        for patch_x in range(width):
+            dst_x = int(update_x) + patch_x
+            if not (0 <= dst_x < int(occupancy_map.width)):
+                continue
+            src_index = patch_y * width + patch_x
+            dst_index = dst_y * int(occupancy_map.width) + dst_x
+            data[dst_index] = int(patch[src_index])
+    return RosOccupancyMap(
+        resolution=float(occupancy_map.resolution),
+        width=int(occupancy_map.width),
+        height=int(occupancy_map.height),
+        origin_x=float(occupancy_map.origin_x),
+        origin_y=float(occupancy_map.origin_y),
+        data=tuple(data),
+    )
+
+
 def fuse_projected_maps(
     maps: Iterable[RosOccupancyMap],
     *,
@@ -394,6 +447,7 @@ class RosExplorationRuntime(Node):
         self.latest_map_stamp_s: float = 0.0
         self.latest_map_header_frame_id: str = ""
         self._last_map_log_s: float = 0.0
+        self._last_map_update_log_s: float = 0.0
         self.latest_scan: LaserScan | None = None
         self.latest_scan_stats: dict[str, Any] | None = None
         self.latest_point_cloud_stats: dict[str, Any] | None = None
@@ -418,6 +472,16 @@ class RosExplorationRuntime(Node):
         self._navigate_to_pose_client = ActionClient(self, NavigateToPose, "navigate_to_pose")
         self._spin_client = ActionClient(self, Spin, "spin")
         self.create_subscription(OccupancyGrid, config.map_topic, self._on_map, map_qos)
+        self._map_updates_topic = config.map_updates_topic or default_map_updates_topic(config.map_topic)
+        if OccupancyGridUpdate is not None:
+            map_update_qos = QoSProfile(depth=20)
+            map_update_qos.reliability = ReliabilityPolicy.RELIABLE
+            self.create_subscription(OccupancyGridUpdate, self._map_updates_topic, self._on_map_update, map_update_qos)
+        elif MAP_UPDATE_IMPORT_ERROR is not None:
+            self.get_logger().warning(
+                f"map_msgs OccupancyGridUpdate is unavailable; `{self._map_updates_topic}` will not be consumed. "
+                f"Only full maps from `{config.map_topic}` will update the UI map."
+            )
         self.create_subscription(LaserScan, config.scan_topic, self._on_scan, qos_profile_sensor_data)
         self.create_subscription(PointCloud2, config.point_cloud_topic, self._on_point_cloud, qos_profile_sensor_data)
         self.create_subscription(Image, config.rgb_topic, self._on_rgb, qos_profile_sensor_data)
@@ -441,6 +505,31 @@ class RosExplorationRuntime(Node):
         if now - self._last_map_log_s >= 2.0:
             self._last_map_log_s = now
             print(f"[ros_nav2_runtime] received map topic={self.config.map_topic} summary={self.latest_map_summary()}")
+
+    def _on_map_update(self, message: Any) -> None:
+        if self.latest_map is None:
+            return
+        self.latest_map = apply_occupancy_grid_update(
+            self.latest_map,
+            update_x=int(message.x),
+            update_y=int(message.y),
+            update_width=int(message.width),
+            update_height=int(message.height),
+            update_data=message.data,
+        )
+        self.latest_map_stamp_s = time.time()
+        header_frame_id = str(getattr(message.header, "frame_id", "") or "")
+        if header_frame_id:
+            self.latest_map_header_frame_id = header_frame_id
+        now = time.time()
+        if now - self._last_map_update_log_s >= 2.0:
+            self._last_map_update_log_s = now
+            print(
+                "[ros_nav2_runtime] applied map update "
+                f"topic={self._map_updates_topic} "
+                f"rect=({int(message.x)},{int(message.y)},{int(message.width)},{int(message.height)}) "
+                f"summary={self.latest_map_summary()}"
+            )
 
     def _on_scan(self, message: LaserScan) -> None:
         self.latest_scan = message
@@ -1068,6 +1157,7 @@ class RosExplorationRuntime(Node):
         return {
             "module": "ros_nav2",
             "map_topic": self.config.map_topic,
+            "map_updates_topic": self._map_updates_topic,
             "scan_topic": self.config.scan_topic,
             "point_cloud_topic": self.config.point_cloud_topic,
             "rgb_topic": self.config.rgb_topic,

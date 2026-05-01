@@ -315,6 +315,7 @@ Expected topics:
 ```bash
 ros2 topic list | grep -E 'octomap|projected|occupied'
 ros2 topic echo /projected_map --once
+ros2 topic echo /projected_map_updates --once
 ros2 topic hz /projected_map
 ```
 
@@ -326,6 +327,7 @@ Expected output topics include:
 /octomap_full
 /octomap_point_cloud_centers
 /projected_map
+/projected_map_updates
 ```
 
 In RViz:
@@ -334,7 +336,7 @@ In RViz:
 - add `TF`
 - add `PointCloud2` on `/camera/head/points`
 - add `MarkerArray` on `/occupied_cells_vis_array`
-- add `Map` on `/projected_map`
+- add `Map` on `/projected_map` with update topic `/projected_map_updates`
 
 Do not tune OctoMap until the camera pitch alignment check above passes. If the floor cloud is tilted relative to the RViz grid, `/projected_map` will appear cut or will mark free/occupied cells in the wrong places.
 
@@ -463,6 +465,7 @@ python -m xlerobot_playground.real_agentic_exploration \
   --review-port 8770 \
   --ros-navigation-map-source external \
   --ros-map-topic /projected_map \
+  --ros-map-updates-topic /projected_map_updates \
   --ros-map-frame base_link \
   --ros-scan-topic /scan \
   --ros-point-cloud-topic /camera/head/points \
@@ -485,11 +488,11 @@ Open the UI from your browser:
 http://OFFLOAD_IP:8770
 ```
 
-Click `Start Explore` in the UI. The robot should keep its base still, keep pitch at `30 deg`, pan the head `0 -> +180 -> 0 -> -180 -> 0`, let OctoMap integrate `/camera/head/points`, and then show `/projected_map` as the occupancy map in the UI. Because `--stop-after-initial-scan` is enabled, it should stop after the initial scan instead of sending a Nav2 navigation goal.
+Click `Start Explore` in the UI. The robot should keep its base still, keep pitch at `30 deg`, pan the head `0 -> +180 -> 0 -> -180 -> 0`, let OctoMap integrate `/camera/head/points`, and then show `/projected_map` plus `/projected_map_updates` as the occupancy map in the UI. Because `--stop-after-initial-scan` is enabled, it should stop after the initial scan instead of sending a Nav2 navigation goal.
 
 By default this real-exploration command waits for the UI start request before moving the robot or panning the head. Use `--no-wait-for-ui-start` only when you want the 360 degree camera-pan scan to begin immediately after the terminal command starts.
 
-For this first OctoMap validation run, keep `--ros-navigation-map-source external` and `--ros-map-topic /projected_map`. Do not use `fused_point_cloud`; that path uses the custom Python point-cloud fusion instead of OctoMap.
+For this first OctoMap validation run, keep `--ros-navigation-map-source external`, `--ros-map-topic /projected_map`, and `--ros-map-updates-topic /projected_map_updates`. Do not use `fused_point_cloud`; that path uses the custom Python point-cloud fusion instead of OctoMap.
 
 Robot-spin fallback:
 
@@ -515,6 +518,7 @@ python -m xlerobot_playground.real_agentic_exploration \
   --review-port 8770 \
   --ros-navigation-map-source external \
   --ros-map-topic /projected_map \
+  --ros-map-updates-topic /projected_map_updates \
   --ros-map-frame base_link \
   --ros-scan-topic /scan \
   --ros-point-cloud-topic /camera/head/points \
@@ -541,6 +545,7 @@ ros2 topic echo /camera/head/points --once
 ros2 topic hz /camera/head/points
 ros2 topic echo /camera/head/pan_rad --once
 ros2 topic echo /projected_map --once
+ros2 topic echo /projected_map_updates --once
 ros2 topic hz /projected_map
 ros2 topic echo /scan --once
 ros2 run tf2_ros tf2_echo base_link head_camera_link
@@ -558,10 +563,11 @@ After `real_agentic_exploration` starts and the first scan begins, verify the Oc
 
 ```bash
 ros2 topic echo /projected_map --once
+ros2 topic echo /projected_map_updates --once
 ros2 topic hz /projected_map
 ```
 
-During the initial scan, the robot base should stay still while the head pans through the positive sweep first, returns to center, pans through the negative sweep second, and returns to center. The UI should move from an empty/not-started map to the OctoMap `/projected_map` occupancy view with candidate frontiers. `/scan` remains available for Nav2 local obstacle checks and debugging, but the UI map for this run comes from `/projected_map`.
+During the initial scan, the robot base should stay still while the head pans through the positive sweep first, returns to center, pans through the negative sweep second, and returns to center. The UI should move from an empty/not-started map to the OctoMap `/projected_map` occupancy view with candidate frontiers. `/scan` remains available for Nav2 local obstacle checks and debugging, but the UI map for this run comes from `/projected_map` plus `/projected_map_updates`.
 
 If RViz shows the map rotating with the camera, or only the last camera direction appears to stick, first check the map frame:
 
@@ -577,7 +583,7 @@ Optional RViz validation:
 rviz2
 ```
 
-For the OctoMap first run in this document, set `Fixed Frame` to `base_link`, then add `PointCloud2` on `/camera/head/points`, `Map` on `/projected_map`, `MarkerArray` on `/occupied_cells_vis_array`, and `TF`. You should see the point cloud rotate with `head_camera_link` during head pan sweeps, while `/projected_map` grows from OctoMap's accumulated 3D evidence.
+For the OctoMap first run in this document, set `Fixed Frame` to `base_link`, then add `PointCloud2` on `/camera/head/points`, `Map` on `/projected_map` with update topic `/projected_map_updates`, `MarkerArray` on `/occupied_cells_vis_array`, and `TF`. You should see the point cloud rotate with `head_camera_link` during head pan sweeps, while `/projected_map` grows from OctoMap's accumulated 3D evidence.
 
 If the map starts but the head does not pan, check the robot-brain head pose and motion gate:
 
@@ -606,7 +612,7 @@ The `robot_brain_agent` terminal should log motion/action errors if it rejects a
 - `real_ros_bridge` publishing `/camera/head/*`, `/camera/head/points`, `/scan`, camera pan/pitch topics, and forwarding `/cmd_vel` during Nav2 navigation.
 - RGB-D visual odometry publishing `/odom` and `odom -> base_link`.
 - Nav2 accepting `compute_path_to_pose` and `navigate_to_pose`.
-- `/projected_map` receiving the OctoMap 2D projection and the UI using it as the occupancy map.
+- `/projected_map` and `/projected_map_updates` receiving the OctoMap 2D projection and the UI using it as the occupancy map.
 - UI showing:
   - current robot pose
   - partial occupancy map

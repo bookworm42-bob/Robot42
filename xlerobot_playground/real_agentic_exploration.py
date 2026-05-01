@@ -48,6 +48,11 @@ def build_parser() -> argparse.ArgumentParser:
         default="fused_scan",
     )
     parser.add_argument("--ros-map-topic", default="/map")
+    parser.add_argument(
+        "--ros-map-updates-topic",
+        default=None,
+        help="OccupancyGridUpdate topic paired with --ros-map-topic. Defaults to '<ros-map-topic>_updates'.",
+    )
     parser.add_argument("--ros-scan-topic", default="/scan")
     parser.add_argument("--ros-point-cloud-topic", default="/camera/head/points")
     parser.add_argument("--ros-rgb-topic", default="/camera/head/image_raw")
@@ -201,6 +206,7 @@ def translated_args(args: argparse.Namespace) -> list[str]:
     optional_pairs = [
         ("--max-control-steps", args.max_control_steps),
         ("--max-episode-steps", args.max_episode_steps),
+        ("--ros-map-updates-topic", args.ros_map_updates_topic),
         ("--llm-base-url", args.llm_base_url),
         ("--llm-api-key", args.llm_api_key),
         ("--llm-reasoning-effort", args.llm_reasoning_effort),

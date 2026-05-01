@@ -121,6 +121,7 @@ class SimExplorationConfig:
     nav2_mode: str = "simulated"
     ros_navigation_map_source: str = "fused_scan"
     ros_map_topic: str = "/map"
+    ros_map_updates_topic: str | None = None
     ros_scan_topic: str = "/scan"
     ros_point_cloud_topic: str = "/camera/head/points"
     ros_rgb_topic: str = "/camera/head/image_raw"
@@ -2913,6 +2914,7 @@ class RosExplorationSession:
             self.runtime = RosExplorationRuntime(
                 RosRuntimeConfig(
                     map_topic=config.ros_map_topic,
+                    map_updates_topic=config.ros_map_updates_topic,
                     scan_topic=config.ros_scan_topic,
                     point_cloud_topic=config.ros_point_cloud_topic,
                     rgb_topic=config.ros_rgb_topic,
@@ -4678,6 +4680,11 @@ def build_parser() -> argparse.ArgumentParser:
         default="fused_scan",
     )
     parser.add_argument("--ros-map-topic", default="/map")
+    parser.add_argument(
+        "--ros-map-updates-topic",
+        default=None,
+        help="OccupancyGridUpdate topic paired with --ros-map-topic. Defaults to '<ros-map-topic>_updates'.",
+    )
     parser.add_argument("--ros-scan-topic", default="/scan")
     parser.add_argument("--ros-point-cloud-topic", default="/camera/head/points")
     parser.add_argument("--ros-rgb-topic", default="/camera/head/image_raw")
@@ -4804,6 +4811,7 @@ def main(argv: list[str] | None = None) -> int:
             nav2_recovery_enabled=args.nav2_recovery_enabled,
             ros_navigation_map_source=args.ros_navigation_map_source,
             ros_map_topic=args.ros_map_topic,
+            ros_map_updates_topic=args.ros_map_updates_topic,
             ros_scan_topic=args.ros_scan_topic,
             ros_point_cloud_topic=args.ros_point_cloud_topic,
             ros_rgb_topic=args.ros_rgb_topic,
