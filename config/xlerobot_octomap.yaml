@@ -8,18 +8,18 @@ octomap_server:
     resolution: 0.08
 
     # Keep this near the reliable Gemini 2 indoor range while validating.
-    sensor_model.max_range: 8.0
+    sensor_model.max_range: 5.0
 
     # Input cloud crop before insertion. Use z in the fixed frame.
-    pointcloud_min_z: 0.10
-    pointcloud_max_z: 1.60
+    pointcloud_min_z: 0.12
+    pointcloud_max_z: 1.50
 
     # Height band used for the projected 2D map. The 3D octree still stores
     # occupied/free evidence; this controls what becomes navigation-relevant.
-    occupancy_min_z: 0.18
+    occupancy_min_z: 0.12
     occupancy_max_z: 1.50
 
-    filter_ground_plane: false
+    filter_ground_plane: true
     ground_filter.distance: 0.08
     ground_filter.angle: 0.20
     ground_filter.plane_distance: 0.12
@@ -27,7 +27,7 @@ octomap_server:
     filter_speckles: true
     publish_free_space: true
     latch: true
-    incremental_2D_projection: true
+    incremental_2D_projection: false
     compress_map: true
 
     sensor_model.hit: 0.65
