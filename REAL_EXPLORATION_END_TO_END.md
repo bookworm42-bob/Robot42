@@ -563,6 +563,14 @@ ros2 topic hz /projected_map
 
 During the initial scan, the robot base should stay still while the head pans through the positive sweep first, returns to center, pans through the negative sweep second, and returns to center. The UI should move from an empty/not-started map to the OctoMap `/projected_map` occupancy view with candidate frontiers. `/scan` remains available for Nav2 local obstacle checks and debugging, but the UI map for this run comes from `/projected_map`.
 
+If RViz shows the map rotating with the camera, or only the last camera direction appears to stick, first check the map frame:
+
+```bash
+ros2 topic echo /projected_map --once | grep -E 'frame_id|width|height|resolution'
+```
+
+For this stationary first run, `/projected_map` must say `frame_id: base_link`. If it says `head_camera_link`, OctoMap is accumulating in the moving camera frame instead of the fixed robot frame, so each pan angle overwrites the useful interpretation of the previous one. Restart OctoMap with `config/xlerobot_octomap.yaml` loaded and `frame_id: base_link`.
+
 Optional RViz validation:
 
 ```bash

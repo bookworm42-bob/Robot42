@@ -338,6 +338,7 @@ class RosExplorationRuntime(Node):
         self.tf_broadcaster = TransformBroadcaster(self)
         self.latest_map: RosOccupancyMap | None = None
         self.latest_map_stamp_s: float = 0.0
+        self.latest_map_header_frame_id: str = ""
         self.latest_scan: LaserScan | None = None
         self.latest_scan_stats: dict[str, Any] | None = None
         self.latest_point_cloud_stats: dict[str, Any] | None = None
@@ -380,6 +381,7 @@ class RosExplorationRuntime(Node):
             data=tuple(int(item) for item in message.data),
         )
         self.latest_map_stamp_s = time.time()
+        self.latest_map_header_frame_id = str(message.header.frame_id)
 
     def _on_scan(self, message: LaserScan) -> None:
         self.latest_scan = message
@@ -564,6 +566,32 @@ class RosExplorationRuntime(Node):
         deadline = time.time() + duration_s
         while time.time() < deadline:
             rclpy.spin_once(self, timeout_sec=0.05)
+
+    def wait_for_map_update(self, *, after_stamp_s: float, timeout_s: float = 2.0) -> bool:
+        deadline = time.time() + max(float(timeout_s), 0.0)
+        while time.time() < deadline:
+            rclpy.spin_once(self, timeout_sec=0.05)
+            if self.latest_map is not None and self.latest_map_stamp_s > after_stamp_s:
+                return True
+        return False
+
+    def latest_map_summary(self) -> dict[str, Any] | None:
+        occupancy_map = self.latest_map
+        if occupancy_map is None:
+            return None
+        data = occupancy_map.data
+        return {
+            "frame_id": self.latest_map_header_frame_id,
+            "resolution": round(float(occupancy_map.resolution), 4),
+            "width": int(occupancy_map.width),
+            "height": int(occupancy_map.height),
+            "origin_x": round(float(occupancy_map.origin_x), 3),
+            "origin_y": round(float(occupancy_map.origin_y), 3),
+            "free_cells": sum(1 for item in data if int(item) == 0),
+            "occupied_cells": sum(1 for item in data if int(item) > 50),
+            "unknown_cells": sum(1 for item in data if int(item) < 0),
+            "stamp_age_s": round(max(time.time() - float(self.latest_map_stamp_s), 0.0), 3),
+        }
 
     def hold_stop_until_stable(
         self,
@@ -813,6 +841,7 @@ class RosExplorationRuntime(Node):
         effective_robot_brain_url = robot_brain_url or self.config.robot_brain_url
         if not effective_robot_brain_url:
             raise RuntimeError("Camera-pan scan requires robot_brain_url; use turn_scan_mode='robot_spin' for base rotation.")
+        map_start_stamp_s = float(self.latest_map_stamp_s)
         per_side = max(int(math.ceil(max(sample_count, 2) / 2.0)), 2)
         positive_angles = [
             math.pi * index / float(per_side - 1)
@@ -868,6 +897,12 @@ class RosExplorationRuntime(Node):
                 event["restore_error"] = str(exc)
 
         raw_observations, observation_stop_index = self.drain_scan_observations(observation_start_index)
+        if not self.config.publish_internal_navigation_map:
+            event["external_map_updated_after_scan"] = self.wait_for_map_update(
+                after_stamp_s=map_start_stamp_s,
+                timeout_s=max(float(self.config.turn_scan_settle_s), 2.0),
+            )
+            event["external_map_summary"] = self.latest_map_summary()
         end_pose = self.current_pose()
         event["elapsed_s"] = round(time.time() - start_time, 3)
         event["captured_observation_count"] = len(observations)
@@ -947,6 +982,7 @@ class RosExplorationRuntime(Node):
             "turn_scans": list(self._nav_scan_history),
             "latest_scan": self.latest_scan_stats,
             "latest_point_cloud": self.latest_point_cloud_stats,
+            "latest_map": self.latest_map_summary(),
         }
 
     def record_goal(self, payload: dict[str, Any]) -> None:
