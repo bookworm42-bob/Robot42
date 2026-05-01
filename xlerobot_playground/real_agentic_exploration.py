@@ -53,6 +53,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="OccupancyGridUpdate topic paired with --ros-map-topic. Defaults to '<ros-map-topic>_updates'.",
     )
+    parser.add_argument(
+        "--ros-fuse-external-projected-map-snapshots",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Fuse external /projected_map snapshots captured during camera-pan scans. "
+            "Keep disabled for OctoMap, where /projected_map plus updates already contains accumulated evidence."
+        ),
+    )
     parser.add_argument("--ros-scan-topic", default="/scan")
     parser.add_argument("--ros-point-cloud-topic", default="/camera/head/points")
     parser.add_argument("--ros-rgb-topic", default="/camera/head/image_raw")
@@ -233,6 +242,11 @@ def translated_args(args: argparse.Namespace) -> list[str]:
             "--stop-after-initial-scan",
             "--no-stop-after-initial-scan",
             args.stop_after_initial_scan,
+        ),
+        (
+            "--ros-fuse-external-projected-map-snapshots",
+            "--no-ros-fuse-external-projected-map-snapshots",
+            args.ros_fuse_external_projected_map_snapshots,
         ),
         ("--nav2-recovery-enabled", "--no-nav2-recovery-enabled", args.nav2_recovery_enabled),
         ("--ros-allow-multiple-action-servers", "--no-ros-allow-multiple-action-servers", args.ros_allow_multiple_action_servers),

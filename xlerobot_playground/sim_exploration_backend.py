@@ -122,6 +122,7 @@ class SimExplorationConfig:
     ros_navigation_map_source: str = "fused_scan"
     ros_map_topic: str = "/map"
     ros_map_updates_topic: str | None = None
+    ros_fuse_external_projected_map_snapshots: bool = False
     ros_scan_topic: str = "/scan"
     ros_point_cloud_topic: str = "/camera/head/points"
     ros_rgb_topic: str = "/camera/head/image_raw"
@@ -2939,6 +2940,7 @@ class RosExplorationSession:
                     publish_internal_navigation_map=config.ros_navigation_map_source
                     in ("fused_scan", "fused_point_cloud"),
                     navigation_map_source=config.ros_navigation_map_source,
+                    fuse_external_projected_map_snapshots=config.ros_fuse_external_projected_map_snapshots,
                 )
             )
         self.scan_known_cells: dict[GridCell, str] = {}
@@ -3414,6 +3416,7 @@ class RosExplorationSession:
     def _current_ros_map(self) -> RosOccupancyMap | None:
         if (
             self.config.ros_navigation_map_source == "external"
+            and self.config.ros_fuse_external_projected_map_snapshots
             and self._latest_fused_projected_map is not None
         ):
             return self._latest_fused_projected_map
@@ -3661,7 +3664,7 @@ class RosExplorationSession:
             should_cancel=self._pause_requested_or_canceled,
         )
         fused_projected_map = event.pop("fused_projected_map", None)
-        if isinstance(fused_projected_map, RosOccupancyMap):
+        if self.config.ros_fuse_external_projected_map_snapshots and isinstance(fused_projected_map, RosOccupancyMap):
             self._latest_fused_projected_map = fused_projected_map
         observations = list(event.pop("observations", []))
         self.guardrail_events.append({"type": "turnaround_scan", "event": event})
@@ -4685,6 +4688,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="OccupancyGridUpdate topic paired with --ros-map-topic. Defaults to '<ros-map-topic>_updates'.",
     )
+    parser.add_argument(
+        "--ros-fuse-external-projected-map-snapshots",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Fuse external /projected_map snapshots captured during camera-pan scans. "
+            "Keep disabled for OctoMap, where /projected_map plus updates already contains accumulated evidence."
+        ),
+    )
     parser.add_argument("--ros-scan-topic", default="/scan")
     parser.add_argument("--ros-point-cloud-topic", default="/camera/head/points")
     parser.add_argument("--ros-rgb-topic", default="/camera/head/image_raw")
@@ -4812,6 +4824,7 @@ def main(argv: list[str] | None = None) -> int:
             ros_navigation_map_source=args.ros_navigation_map_source,
             ros_map_topic=args.ros_map_topic,
             ros_map_updates_topic=args.ros_map_updates_topic,
+            ros_fuse_external_projected_map_snapshots=args.ros_fuse_external_projected_map_snapshots,
             ros_scan_topic=args.ros_scan_topic,
             ros_point_cloud_topic=args.ros_point_cloud_topic,
             ros_rgb_topic=args.ros_rgb_topic,

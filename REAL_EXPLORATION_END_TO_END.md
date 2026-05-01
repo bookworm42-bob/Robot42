@@ -492,7 +492,7 @@ Click `Start Explore` in the UI. The robot should keep its base still, keep pitc
 
 By default this real-exploration command waits for the UI start request before moving the robot or panning the head. Use `--no-wait-for-ui-start` only when you want the 360 degree camera-pan scan to begin immediately after the terminal command starts.
 
-For this first OctoMap validation run, keep `--ros-navigation-map-source external`, `--ros-map-topic /projected_map`, and `--ros-map-updates-topic /projected_map_updates`. Do not use `fused_point_cloud`; that path uses the custom Python point-cloud fusion instead of OctoMap.
+For this first OctoMap validation run, keep `--ros-navigation-map-source external`, `--ros-map-topic /projected_map`, and `--ros-map-updates-topic /projected_map_updates`. Do not use `fused_point_cloud`; that path uses the custom Python point-cloud fusion instead of OctoMap. Also keep the extra projected-map snapshot fusion disabled, which is the default. Only add `--ros-fuse-external-projected-map-snapshots` if you intentionally want the exploration runtime to fuse multiple `/projected_map` snapshots itself.
 
 Robot-spin fallback:
 
@@ -567,7 +567,7 @@ ros2 topic echo /projected_map_updates --once
 ros2 topic hz /projected_map
 ```
 
-During the initial scan, the robot base should stay still while the head pans through the positive sweep first, returns to center, pans through the negative sweep second, and returns to center. The UI should move from an empty/not-started map to the OctoMap `/projected_map` occupancy view with candidate frontiers. `/scan` remains available for Nav2 local obstacle checks and debugging, but the UI map for this run comes from `/projected_map` plus `/projected_map_updates`.
+During the initial scan, the robot base should stay still while the head pans through the positive sweep first, returns to center, pans through the negative sweep second, and returns to center. The UI should move from an empty/not-started map to the OctoMap `/projected_map` occupancy view with candidate frontiers. `/scan` remains available for Nav2 local obstacle checks and debugging, but the UI map for this run comes directly from `/projected_map` plus `/projected_map_updates`, without extra runtime snapshot fusion by default.
 
 If RViz shows the map rotating with the camera, or only the last camera direction appears to stick, first check the map frame:
 

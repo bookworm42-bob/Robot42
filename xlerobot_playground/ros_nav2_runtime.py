@@ -285,6 +285,7 @@ class RosRuntimeConfig:
     allow_multiple_action_servers: bool = False
     publish_internal_navigation_map: bool = True
     navigation_map_source: str = "fused_scan"
+    fuse_external_projected_map_snapshots: bool = False
 
 
 @dataclass(frozen=True)
@@ -1016,6 +1017,7 @@ class RosExplorationRuntime(Node):
         command_events: list[dict[str, Any]] = []
         projected_map_snapshots: list[RosOccupancyMap] = []
         fused_projected_map: RosOccupancyMap | None = None
+        fuse_external_projected_maps = bool(getattr(self.config, "fuse_external_projected_map_snapshots", False))
         try:
             for sweep_name, angles in (("positive", positive_angles), ("negative", negative_angles)):
                 for pan_rad in angles:
@@ -1036,11 +1038,18 @@ class RosExplorationRuntime(Node):
                         observation["camera_pan_rad"] = pan_rad
                         observations.append(observation)
                     if (
-                        not self.config.publish_internal_navigation_map
+                        fuse_external_projected_maps
+                        and not self.config.publish_internal_navigation_map
                         and self.latest_map is not None
                         and self.latest_map_header_frame_id == self.config.map_frame
                     ):
                         projected_map_snapshots.append(self.latest_map)
+                    elif (
+                        not self.config.publish_internal_navigation_map
+                        and self.latest_map is not None
+                        and self.latest_map_header_frame_id == self.config.map_frame
+                    ):
+                        event["external_projected_map_seen"] = True
                 if event.get("scan_stop_reason") == "canceled":
                     break
                 command_events.append(
@@ -1073,20 +1082,31 @@ class RosExplorationRuntime(Node):
             )
             event["external_map_summary"] = self.latest_map_summary()
             if (
-                self.latest_map is not None
+                fuse_external_projected_maps
+                and self.latest_map is not None
                 and self.latest_map_header_frame_id == self.config.map_frame
             ):
                 projected_map_snapshots.append(self.latest_map)
-            fused_projected_map = fuse_projected_maps(projected_map_snapshots)
-            if fused_projected_map is not None:
-                response_map_summary = self._occupancy_map_summary(
-                    fused_projected_map,
-                    frame_id=self.config.map_frame,
-                    stamp_s=time.time(),
-                )
-                event["fused_projected_map_summary"] = response_map_summary
+            elif (
+                self.latest_map is not None
+                and self.latest_map_header_frame_id == self.config.map_frame
+            ):
+                event["external_projected_map_seen"] = True
+            if fuse_external_projected_maps:
+                fused_projected_map = fuse_projected_maps(projected_map_snapshots)
+                if fused_projected_map is not None:
+                    response_map_summary = self._occupancy_map_summary(
+                        fused_projected_map,
+                        frame_id=self.config.map_frame,
+                        stamp_s=time.time(),
+                    )
+                    event["fused_projected_map_summary"] = response_map_summary
+                else:
+                    event["fused_projected_map_summary"] = None
             else:
+                fused_projected_map = None
                 event["fused_projected_map_summary"] = None
+                event["fused_projected_map_enabled"] = False
         end_pose = self.current_pose()
         event["elapsed_s"] = round(time.time() - start_time, 3)
         event["captured_observation_count"] = len(observations)

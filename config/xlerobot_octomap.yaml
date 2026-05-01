@@ -27,6 +27,8 @@ octomap_server:
     filter_speckles: true
     publish_free_space: true
     latch: true
+    # Keep false for the exploration UI: /projected_map should be a full
+    # accumulated projection, while /projected_map_updates carries RViz-style patches.
     incremental_2D_projection: false
     compress_map: true
 
