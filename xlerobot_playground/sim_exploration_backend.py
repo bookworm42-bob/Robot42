@@ -467,7 +467,7 @@ class Nav2NavigationModule:
     def compute_path(self, goal: Nav2GoalRequest, *, record: bool = True) -> Nav2PlanResult:
         raise NotImplementedError
 
-    def navigate_to_pose(self, goal: Nav2GoalRequest) -> Nav2NavigateResult:
+    def navigate_to_pose(self, goal: Nav2GoalRequest, *, ignore_pause_cancel: bool = False) -> Nav2NavigateResult:
         raise NotImplementedError
 
     def recover(self, goal: Nav2GoalRequest, *, reason: str) -> dict[str, Any]:
@@ -576,7 +576,7 @@ class SimulatedNav2NavigationModule(Nav2NavigationModule):
             self._plan_history.append(result.to_dict())
         return result
 
-    def navigate_to_pose(self, goal: Nav2GoalRequest) -> Nav2NavigateResult:
+    def navigate_to_pose(self, goal: Nav2GoalRequest, *, ignore_pause_cancel: bool = False) -> Nav2NavigateResult:
         self._goal_history.append(goal.to_dict())
         plan = self.compute_path(goal, record=True)
         recovery_events: list[dict[str, Any]] = []
@@ -785,7 +785,7 @@ class RosNav2NavigationModule(Nav2NavigationModule):
             self._plan_history.append(result.to_dict())
         return result
 
-    def navigate_to_pose(self, goal: Nav2GoalRequest) -> Nav2NavigateResult:
+    def navigate_to_pose(self, goal: Nav2GoalRequest, *, ignore_pause_cancel: bool = False) -> Nav2NavigateResult:
         self._goal_history.append(goal.to_dict())
         plan = self.compute_path(goal, record=True)
         if plan.status != "succeeded":
@@ -806,7 +806,7 @@ class RosNav2NavigationModule(Nav2NavigationModule):
             outcome, feedback_samples = self.runtime.navigate_to_pose(
                 goal_pose=validation.normalized_pose or goal.target_pose,
                 behavior_tree=goal.behavior_tree,
-                should_cancel=self._should_cancel,
+                should_cancel=None if ignore_pause_cancel else self._should_cancel,
             )
         except Exception as exc:
             reason = f"ROS Nav2 navigate_to_pose call failed: {exc}"
@@ -3335,6 +3335,57 @@ class RosExplorationSession:
             self._prepare_decision_locked()
             return self.snapshot()
 
+    def navigate_to_manual_waypoint(self, pose_payload: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            try:
+                current_pose = self.runtime.current_pose()
+                target_pose = Pose2D(
+                    float(pose_payload["x"]),
+                    float(pose_payload["y"]),
+                    float(pose_payload.get("yaw", current_pose.yaw if current_pose is not None else 0.0)),
+                )
+            except Exception as exc:
+                return {"status": "rejected", "reason": f"Invalid waypoint pose: {exc}"}
+            goal = self._make_nav2_goal(
+                target_pose,
+                goal_type="manual_waypoint",
+                reason="operator_click_waypoint",
+            )
+            self.status = "manual_waypoint_active"
+            self._push_progress_update(
+                message=f"Sending clicked waypoint ({target_pose.x:.2f}, {target_pose.y:.2f}) to Nav2.",
+                frontier_id=None,
+            )
+            result = self.nav2.navigate_to_pose(goal, ignore_pause_cancel=True)
+            self._consume_nav_result(result)
+            self.status = "manual_waypoint_succeeded" if result.status == "succeeded" else "manual_waypoint_failed"
+            self.guardrail_events.append(
+                {
+                    "type": "manual_waypoint_navigation",
+                    "requested_pose": target_pose.to_dict(),
+                    "nav2_result": result.to_dict(),
+                }
+            )
+            self._push_progress_update(
+                message=f"Clicked waypoint navigation {result.status}: {result.reason}",
+                frontier_id=None,
+            )
+            normalized_pose = None
+            if result.plan and result.plan.status == "succeeded" and result.plan.path_cells:
+                normalized_pose = self._require_effective_map().cell_to_pose(
+                    result.plan.path_cells[-1].x,
+                    result.plan.path_cells[-1].y,
+                    yaw=target_pose.yaw,
+                ).to_dict()
+            return {
+                "status": result.status,
+                "reason": result.reason,
+                "requested_pose": target_pose.to_dict(),
+                "normalized_pose": normalized_pose,
+                "nav2_result": result.to_dict(),
+                "map": self._build_map_payload(),
+            }
+
     def call_semantic_llm(self) -> dict[str, Any]:
         with self._lock:
             self.last_error = (
@@ -4544,8 +4595,14 @@ class _ExplorationStartGate:
 
 
 class _GatedExplorationUIController(LocalExplorationUIController):
-    def __init__(self, backend: ExplorationBackend, start_gate: _ExplorationStartGate) -> None:
-        super().__init__(backend)
+    def __init__(
+        self,
+        backend: ExplorationBackend,
+        start_gate: _ExplorationStartGate,
+        *,
+        waypoint_navigator: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+    ) -> None:
+        super().__init__(backend, waypoint_navigator=waypoint_navigator)
         self.start_gate = start_gate
 
     def start_explore(self, *, area: str, session: str | None = None, source: str = "operator") -> dict[str, Any]:
@@ -4563,6 +4620,24 @@ class ManiSkillExplorationRunner:
         self.config = config
         self.backend = backend
         self.start_gate = start_gate
+        self._active_session: _ApartmentExplorationSession | RosExplorationSession | None = None
+        self._active_session_lock = threading.RLock()
+
+    def navigate_to_waypoint(self, pose: dict[str, Any]) -> dict[str, Any]:
+        with self._active_session_lock:
+            session = self._active_session
+        if session is None:
+            return {
+                "status": "unavailable",
+                "reason": (
+                    "No live exploration session is running. For click waypoint tests, keep the session alive "
+                    "with --pause-for-operator-approval instead of --stop-after-initial-scan."
+                ),
+            }
+        navigate = getattr(session, "navigate_to_manual_waypoint", None)
+        if not callable(navigate):
+            return {"status": "unavailable", "reason": "The active exploration session does not support waypoint navigation."}
+        return navigate(pose)
 
     def run(self) -> dict[str, Any]:
         if self.start_gate is not None:
@@ -4579,6 +4654,8 @@ class ManiSkillExplorationRunner:
             session = RosExplorationSession(self.config, self.backend, str(task["task_id"]))
         else:
             session = _ApartmentExplorationSession(self.config, self.backend, str(task["task_id"]))
+        with self._active_session_lock:
+            self._active_session = session
         try:
             map_payload = session.run()
         except Exception as exc:
@@ -4589,6 +4666,9 @@ class ManiSkillExplorationRunner:
             )
             raise
         finally:
+            with self._active_session_lock:
+                if self._active_session is session:
+                    self._active_session = None
             close = getattr(session, "close", None)
             if callable(close):
                 close()
@@ -4874,9 +4954,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.serve_review_ui:
         if args.wait_for_ui_start:
             start_gate = _ExplorationStartGate(runner.config)
-            controller = _GatedExplorationUIController(backend, start_gate)
+            controller = _GatedExplorationUIController(
+                backend,
+                start_gate,
+                waypoint_navigator=runner.navigate_to_waypoint,
+            )
         else:
-            controller = LocalExplorationUIController(backend)
+            controller = LocalExplorationUIController(
+                backend,
+                waypoint_navigator=runner.navigate_to_waypoint,
+            )
         server = ExplorationReviewServer(
             controller,
             host=args.review_host,

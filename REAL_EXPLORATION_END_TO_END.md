@@ -479,7 +479,7 @@ python -m xlerobot_playground.real_agentic_exploration \
   --ros-manual-spin-angular-speed-rad-s 0.30 \
   --max-decisions 8 \
   --ros-imu-topic /imu/filtered_yaw \
-  --stop-after-initial-scan
+  --pause-for-operator-approval
 ```
 
 Open the UI from your browser:
@@ -488,9 +488,11 @@ Open the UI from your browser:
 http://OFFLOAD_IP:8770
 ```
 
-Click `Start Explore` in the UI. The robot should keep its base still, keep pitch at `30 deg`, pan the head `0 -> +180 -> 0 -> -180 -> 0`, let OctoMap integrate `/camera/head/points`, and then show `/projected_map` plus `/projected_map_updates` as the occupancy map in the UI. Because `--stop-after-initial-scan` is enabled, it should stop after the initial scan instead of sending a Nav2 navigation goal.
+Click `Start Explore` in the UI. The robot should keep its base still, keep pitch at `30 deg`, pan the head `0 -> +180 -> 0 -> -180 -> 0`, let OctoMap integrate `/camera/head/points`, and then show `/projected_map` plus `/projected_map_updates` as the occupancy map in the UI. Because `--pause-for-operator-approval` is enabled, it should pause after the initial scan while keeping the live ROS session available for waypoint testing.
 
 By default this real-exploration command waits for the UI start request before moving the robot or panning the head. Use `--no-wait-for-ui-start` only when you want the 360 degree camera-pan scan to begin immediately after the terminal command starts.
+
+To test map coordinate accuracy, click `Waypoint` in the Map Editing panel, then click a known free-space location in the map. The UI sends that map-frame pose to Nav2. Use this only after the initial scan has completed and the robot is physically clear to move.
 
 For this first OctoMap validation run, keep `--ros-navigation-map-source external`, `--ros-map-topic /projected_map`, and `--ros-map-updates-topic /projected_map_updates`. Do not use `fused_point_cloud`; that path uses the custom Python point-cloud fusion instead of OctoMap. Also keep the extra projected-map snapshot fusion disabled, which is the default. Only add `--ros-fuse-external-projected-map-snapshots` if you intentionally want the exploration runtime to fuse multiple `/projected_map` snapshots itself.
 
