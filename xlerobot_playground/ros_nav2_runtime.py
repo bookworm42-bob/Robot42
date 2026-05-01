@@ -328,6 +328,60 @@ class RosOccupancyMap:
         }
 
 
+def fuse_projected_maps(
+    maps: Iterable[RosOccupancyMap],
+    *,
+    free_weight: float = -0.25,
+    occupied_weight: float = 1.0,
+    free_threshold: float = -0.5,
+    occupied_threshold: float = 0.75,
+) -> RosOccupancyMap | None:
+    snapshots = [item for item in maps if item is not None and item.width > 0 and item.height > 0]
+    if not snapshots:
+        return None
+    resolution = float(snapshots[0].resolution)
+    if resolution <= 0.0:
+        return None
+    min_x = min(int(math.floor(item.origin_x / resolution)) for item in snapshots)
+    min_y = min(int(math.floor(item.origin_y / resolution)) for item in snapshots)
+    max_x = max(int(math.floor(item.origin_x / resolution)) + int(item.width) - 1 for item in snapshots)
+    max_y = max(int(math.floor(item.origin_y / resolution)) + int(item.height) - 1 for item in snapshots)
+    width = max_x - min_x + 1
+    height = max_y - min_y + 1
+    evidence: dict[tuple[int, int], float] = {}
+    for occupancy_map in snapshots:
+        map_origin_cell_x = int(math.floor(float(occupancy_map.origin_x) / resolution))
+        map_origin_cell_y = int(math.floor(float(occupancy_map.origin_y) / resolution))
+        for y in range(int(occupancy_map.height)):
+            for x in range(int(occupancy_map.width)):
+                value = occupancy_map.value(x, y)
+                if value < 0:
+                    continue
+                cell = (map_origin_cell_x + x, map_origin_cell_y + y)
+                if value > 50:
+                    evidence[cell] = max(evidence.get(cell, 0.0) + occupied_weight, occupied_weight)
+                elif value == 0:
+                    evidence[cell] = evidence.get(cell, 0.0) + free_weight
+    data = [-1] * (width * height)
+    for (cell_x, cell_y), score in evidence.items():
+        local_x = cell_x - min_x
+        local_y = cell_y - min_y
+        if not (0 <= local_x < width and 0 <= local_y < height):
+            continue
+        if score >= occupied_threshold:
+            data[local_y * width + local_x] = 100
+        elif score <= free_threshold:
+            data[local_y * width + local_x] = 0
+    return RosOccupancyMap(
+        resolution=resolution,
+        width=width,
+        height=height,
+        origin_x=min_x * resolution,
+        origin_y=min_y * resolution,
+        data=tuple(data),
+    )
+
+
 class RosExplorationRuntime(Node):
     def __init__(self, config: RosRuntimeConfig) -> None:
         require_runtime_dependencies()
@@ -339,6 +393,7 @@ class RosExplorationRuntime(Node):
         self.latest_map: RosOccupancyMap | None = None
         self.latest_map_stamp_s: float = 0.0
         self.latest_map_header_frame_id: str = ""
+        self._last_map_log_s: float = 0.0
         self.latest_scan: LaserScan | None = None
         self.latest_scan_stats: dict[str, Any] | None = None
         self.latest_point_cloud_stats: dict[str, Any] | None = None
@@ -382,6 +437,10 @@ class RosExplorationRuntime(Node):
         )
         self.latest_map_stamp_s = time.time()
         self.latest_map_header_frame_id = str(message.header.frame_id)
+        now = time.time()
+        if now - self._last_map_log_s >= 2.0:
+            self._last_map_log_s = now
+            print(f"[ros_nav2_runtime] received map topic={self.config.map_topic} summary={self.latest_map_summary()}")
 
     def _on_scan(self, message: LaserScan) -> None:
         self.latest_scan = message
@@ -579,9 +638,22 @@ class RosExplorationRuntime(Node):
         occupancy_map = self.latest_map
         if occupancy_map is None:
             return None
+        return self._occupancy_map_summary(
+            occupancy_map,
+            frame_id=self.latest_map_header_frame_id,
+            stamp_s=self.latest_map_stamp_s,
+        )
+
+    def _occupancy_map_summary(
+        self,
+        occupancy_map: RosOccupancyMap,
+        *,
+        frame_id: str,
+        stamp_s: float,
+    ) -> dict[str, Any]:
         data = occupancy_map.data
         return {
-            "frame_id": self.latest_map_header_frame_id,
+            "frame_id": frame_id,
             "resolution": round(float(occupancy_map.resolution), 4),
             "width": int(occupancy_map.width),
             "height": int(occupancy_map.height),
@@ -590,7 +662,7 @@ class RosExplorationRuntime(Node):
             "free_cells": sum(1 for item in data if int(item) == 0),
             "occupied_cells": sum(1 for item in data if int(item) > 50),
             "unknown_cells": sum(1 for item in data if int(item) < 0),
-            "stamp_age_s": round(max(time.time() - float(self.latest_map_stamp_s), 0.0), 3),
+            "stamp_age_s": round(max(time.time() - float(stamp_s), 0.0), 3),
         }
 
     def hold_stop_until_stable(
@@ -853,6 +925,8 @@ class RosExplorationRuntime(Node):
         ]
         observations: list[dict[str, Any]] = []
         command_events: list[dict[str, Any]] = []
+        projected_map_snapshots: list[RosOccupancyMap] = []
+        fused_projected_map: RosOccupancyMap | None = None
         try:
             for sweep_name, angles in (("positive", positive_angles), ("negative", negative_angles)):
                 for pan_rad in angles:
@@ -872,6 +946,12 @@ class RosExplorationRuntime(Node):
                         observation["scan_sweep"] = sweep_name
                         observation["camera_pan_rad"] = pan_rad
                         observations.append(observation)
+                    if (
+                        not self.config.publish_internal_navigation_map
+                        and self.latest_map is not None
+                        and self.latest_map_header_frame_id == self.config.map_frame
+                    ):
+                        projected_map_snapshots.append(self.latest_map)
                 if event.get("scan_stop_reason") == "canceled":
                     break
                 command_events.append(
@@ -903,6 +983,21 @@ class RosExplorationRuntime(Node):
                 timeout_s=max(float(self.config.turn_scan_settle_s), 2.0),
             )
             event["external_map_summary"] = self.latest_map_summary()
+            if (
+                self.latest_map is not None
+                and self.latest_map_header_frame_id == self.config.map_frame
+            ):
+                projected_map_snapshots.append(self.latest_map)
+            fused_projected_map = fuse_projected_maps(projected_map_snapshots)
+            if fused_projected_map is not None:
+                response_map_summary = self._occupancy_map_summary(
+                    fused_projected_map,
+                    frame_id=self.config.map_frame,
+                    stamp_s=time.time(),
+                )
+                event["fused_projected_map_summary"] = response_map_summary
+            else:
+                event["fused_projected_map_summary"] = None
         end_pose = self.current_pose()
         event["elapsed_s"] = round(time.time() - start_time, 3)
         event["captured_observation_count"] = len(observations)
@@ -934,6 +1029,8 @@ class RosExplorationRuntime(Node):
         response = dict(event)
         response["observations"] = observations
         response["observation_stop_index"] = observation_stop_index
+        if not self.config.publish_internal_navigation_map:
+            response["fused_projected_map"] = fused_projected_map
         self._nav_scan_history.append(event)
         return response
 

@@ -2943,6 +2943,7 @@ class RosExplorationSession:
         self.scan_occupancy_evidence: dict[GridCell, float] = {}
         self.scan_range_edge_cells: set[GridCell] = set()
         self.point_cloud_integration_summaries: list[dict[str, Any]] = []
+        self._latest_fused_projected_map: RosOccupancyMap | None = None
         self.point_cloud_fusion_config = PointCloudFusionConfig(
             range_min_m=float(config.point_cloud_range_min_m),
             range_max_m=float(config.point_cloud_range_max_m),
@@ -2962,6 +2963,7 @@ class RosExplorationSession:
             if hasattr(self.runtime, "point_cloud_observation_count")
             else 0
         )
+        self._last_map_payload_log_s = 0.0
         self.nav2 = RosNav2NavigationModule(
             config,
             self.runtime,
@@ -3143,6 +3145,7 @@ class RosExplorationSession:
                 self.scan_map_resolution = float(self.runtime.latest_map.resolution)
             else:
                 self.scan_map_resolution = self.config.occupancy_resolution
+            self._latest_fused_projected_map = None
             self.total_distance_m = 0.0
             self.control_steps = 0
             self.decision_index = 0
@@ -3407,6 +3410,11 @@ class RosExplorationSession:
         }
 
     def _current_ros_map(self) -> RosOccupancyMap | None:
+        if (
+            self.config.ros_navigation_map_source == "external"
+            and self._latest_fused_projected_map is not None
+        ):
+            return self._latest_fused_projected_map
         return self.runtime.latest_map
 
     def _current_map(self) -> RosOccupancyMap | None:
@@ -3650,6 +3658,9 @@ class RosExplorationSession:
             reason=reason,
             should_cancel=self._pause_requested_or_canceled,
         )
+        fused_projected_map = event.pop("fused_projected_map", None)
+        if isinstance(fused_projected_map, RosOccupancyMap):
+            self._latest_fused_projected_map = fused_projected_map
         observations = list(event.pop("observations", []))
         self.guardrail_events.append({"type": "turnaround_scan", "event": event})
         self.runtime.spin_for(0.25)
@@ -4381,7 +4392,7 @@ class RosExplorationSession:
             f"ROS/Nav2 exploration completed with coverage {self._coverage(occupancy_map):.3f}, "
             f"{len(self.frontier_memory.records)} tracked frontiers, and {len(self.decision_log)} decisions."
         )
-        return {
+        payload = {
             "map_id": self.config.session,
             "frame": self.config.ros_map_frame,
             "resolution": float(occupancy_map.resolution),
@@ -4437,6 +4448,42 @@ class RosExplorationSession:
                 },
             },
         }
+        now = time.time()
+        if now - self._last_map_payload_log_s >= 2.0:
+            self._last_map_payload_log_s = now
+            raw_summary = self.runtime.latest_map_summary() if hasattr(self.runtime, "latest_map_summary") else None
+            fused_summary = None
+            if self._latest_fused_projected_map is not None:
+                fused_summary = {
+                    "resolution": round(float(self._latest_fused_projected_map.resolution), 4),
+                    "width": int(self._latest_fused_projected_map.width),
+                    "height": int(self._latest_fused_projected_map.height),
+                    "free_cells": sum(1 for item in self._latest_fused_projected_map.data if int(item) == 0),
+                    "occupied_cells": sum(1 for item in self._latest_fused_projected_map.data if int(item) > 50),
+                    "unknown_cells": sum(1 for item in self._latest_fused_projected_map.data if int(item) < 0),
+                    "bounds": self._latest_fused_projected_map.bounds(),
+                }
+            free_cells = 0
+            occupied_cells = 0
+            unknown_cells = 0
+            for y in range(occupancy_map.height):
+                for x in range(occupancy_map.width):
+                    value = occupancy_map.value(x, y)
+                    if value == 0:
+                        free_cells += 1
+                    elif value > 50:
+                        occupied_cells += 1
+                    elif value < 0:
+                        unknown_cells += 1
+            print(
+                "[ros_exploration_session] UI map payload "
+                f"source_topic={self.config.ros_map_topic} raw_summary={raw_summary} "
+                f"fused_projected_summary={fused_summary} "
+                f"payload_cells={len(occupancy_cells)} free={free_cells} "
+                f"occupied={occupied_cells} unknown={unknown_cells} "
+                f"coverage={payload['coverage']} bounds={payload['occupancy']['bounds']}"
+            )
+        return payload
 
     def _make_nav2_goal(self, pose: Pose2D, *, goal_type: str, reason: str) -> Nav2GoalRequest:
         self.nav2_goal_counter += 1
@@ -4702,7 +4749,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     backend = ExplorationBackend(
         ExplorationBackendConfig(
-            mode="sim",
+            mode="ros" if args.nav2_mode == "ros" else "sim",
             persist_path=args.persist_path,
             restore_persisted_state=args.restore_persisted_state,
             occupancy_resolution=args.occupancy_resolution,

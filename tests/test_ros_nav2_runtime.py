@@ -7,7 +7,9 @@ import unittest
 from xlerobot_agent.exploration import Pose2D
 from xlerobot_playground.ros_nav2_runtime import (
     RosExplorationRuntime,
+    RosOccupancyMap,
     compute_turn_command,
+    fuse_projected_maps,
     remaining_turn_delta_rad,
 )
 
@@ -50,11 +52,16 @@ class RosNav2RuntimeTests(unittest.TestCase):
                     camera_pan_settle_s=0.0,
                     turn_scan_settle_s=0.0,
                     server_timeout_s=1.0,
+                    publish_internal_navigation_map=False,
+                    map_frame="base_link",
                 )
                 self.commands: list[float] = []
                 self.hold_count = 0
                 self.scan_observations = [{"pose": Pose2D(0.0, 0.0, 99.0)} for _ in range(99)]
                 self._nav_scan_history = []
+                self.latest_map = None
+                self.latest_map_stamp_s = 0.0
+                self.latest_map_header_frame_id = "base_link"
 
             def current_pose(self) -> Pose2D:
                 return Pose2D(1.0, 2.0, 0.25)
@@ -80,6 +87,15 @@ class RosNav2RuntimeTests(unittest.TestCase):
             def drain_scan_observations(self, since_index: int):
                 return list(self.scan_observations[since_index:]), len(self.scan_observations)
 
+            def wait_for_map_update(self, *, after_stamp_s: float, timeout_s: float = 2.0) -> bool:
+                return False
+
+            def latest_map_summary(self):
+                return None
+
+            def _occupancy_map_summary(self, occupancy_map, *, frame_id: str, stamp_s: float):
+                return {"frame_id": frame_id, "width": occupancy_map.width, "height": occupancy_map.height}
+
         runtime = FakeRuntime()
 
         result = RosExplorationRuntime._perform_camera_pan_scan(
@@ -102,6 +118,54 @@ class RosNav2RuntimeTests(unittest.TestCase):
         self.assertEqual(result["observation_stop_index"], 99)
         self.assertEqual(result["raw_observation_count"], 89)
         self.assertEqual(result["scan_stop_reason"], "completed")
+
+    def test_fuse_projected_maps_preserves_occupied_over_free(self) -> None:
+        first = RosOccupancyMap(
+            resolution=1.0,
+            width=2,
+            height=1,
+            origin_x=0.0,
+            origin_y=0.0,
+            data=(100, -1),
+        )
+        second = RosOccupancyMap(
+            resolution=1.0,
+            width=2,
+            height=1,
+            origin_x=0.0,
+            origin_y=0.0,
+            data=(0, 0),
+        )
+
+        fused = fuse_projected_maps([first, second])
+
+        self.assertIsNotNone(fused)
+        assert fused is not None
+        self.assertEqual(fused.data, (100, -1))
+
+    def test_fuse_projected_maps_accumulates_repeated_free_observations(self) -> None:
+        first = RosOccupancyMap(
+            resolution=1.0,
+            width=1,
+            height=1,
+            origin_x=0.0,
+            origin_y=0.0,
+            data=(0,),
+        )
+        second = RosOccupancyMap(
+            resolution=1.0,
+            width=1,
+            height=1,
+            origin_x=0.0,
+            origin_y=0.0,
+            data=(0,),
+        )
+
+        fused = fuse_projected_maps([first, second])
+
+        self.assertIsNotNone(fused)
+        assert fused is not None
+        self.assertEqual(fused.data, (0,))
 
     def test_camera_pan_scan_pose_keeps_tf_head_yaw(self) -> None:
         class FakeRuntime:
