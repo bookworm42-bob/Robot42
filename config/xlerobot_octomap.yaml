@@ -1,9 +1,8 @@
 octomap_server:
   ros__parameters:
-    # Stationary first-pass validation uses base_link so the projected map can be
-    # consumed directly by the exploration UI without requiring odom/map TF.
-    # Switch this to odom/map once OctoMap is used while the base drives.
-    frame_id: base_link
+    # Navigation runs use map so /projected_map can feed Nav2's global costmap.
+    # TF must provide map -> odom -> base_link before starting OctoMap.
+    frame_id: map
     base_frame_id: base_link
     resolution: 0.08
 
