@@ -498,8 +498,8 @@ python -m xlerobot_playground.real_agentic_exploration \
   --ros-turn-scan-mode camera_pan \
   --robot-brain-url "http://${ROBOT_BRAIN_IP}:8765" \
   --camera-pan-action-key head_motor_1.pos \
-  --camera-pan-settle-s 0.5 \
-  --camera-pan-sample-count 24 \
+  --camera-pan-settle-s 2.5 \
+  --camera-pan-sample-count 12 \
   --ros-manual-spin-angular-speed-rad-s 0.30 \
   --max-decisions 8 \
   --ros-imu-topic /imu/filtered_yaw \
