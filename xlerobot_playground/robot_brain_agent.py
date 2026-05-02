@@ -265,6 +265,9 @@ class RobotBrainAgent:
         self._camera_pitch_rad = float(config.initial_camera_pitch_rad)
         self._camera_pan_rad = float(config.initial_camera_pan_rad)
         self._camera_pose_updated_s = time.time()
+        self._camera_motion_axis: str | None = None
+        self._camera_motion_started_s: float | None = None
+        self._camera_motion_until_s: float | None = None
 
     def velocity(self, *, linear_m_s: float, angular_rad_s: float) -> dict[str, Any]:
         commanded_angular_rad_s = float(angular_rad_s) * float(self.config.base_angular_action_sign)
@@ -316,12 +319,20 @@ class RobotBrainAgent:
 
     def camera_state(self) -> dict[str, Any]:
         with self._camera_state_lock:
+            now_s = time.time()
+            moving = self._camera_motion_axis is not None or (
+                self._camera_motion_until_s is not None and now_s < self._camera_motion_until_s
+            )
             return {
                 "pitch_rad": self._camera_pitch_rad,
                 "pitch_deg": self._camera_pitch_rad * 180.0 / math.pi,
                 "pan_rad": self._camera_pan_rad,
                 "pan_deg": self._camera_pan_rad * 180.0 / math.pi,
                 "updated_s": self._camera_pose_updated_s,
+                "moving": moving,
+                "motion_axis": self._camera_motion_axis if moving else None,
+                "motion_started_s": self._camera_motion_started_s,
+                "motion_until_s": self._camera_motion_until_s,
             }
 
     def update_camera_state(
@@ -329,6 +340,9 @@ class RobotBrainAgent:
         *,
         pitch_rad: float | None = None,
         pan_rad: float | None = None,
+        moving: bool | None = None,
+        motion_axis: str | None = None,
+        motion_until_s: float | None = None,
     ) -> dict[str, Any]:
         with self._camera_state_lock:
             if pitch_rad is not None:
@@ -336,12 +350,27 @@ class RobotBrainAgent:
             if pan_rad is not None:
                 self._camera_pan_rad = float(pan_rad)
             self._camera_pose_updated_s = time.time()
+            if moving is not None:
+                if moving:
+                    self._camera_motion_axis = motion_axis
+                    self._camera_motion_started_s = self._camera_pose_updated_s
+                    self._camera_motion_until_s = motion_until_s
+                else:
+                    self._camera_motion_axis = None
+                    self._camera_motion_until_s = None
             return {
                 "pitch_rad": self._camera_pitch_rad,
                 "pitch_deg": self._camera_pitch_rad * 180.0 / math.pi,
                 "pan_rad": self._camera_pan_rad,
                 "pan_deg": self._camera_pan_rad * 180.0 / math.pi,
                 "updated_s": self._camera_pose_updated_s,
+                "moving": bool(
+                    self._camera_motion_axis is not None
+                    or (self._camera_motion_until_s is not None and time.time() < self._camera_motion_until_s)
+                ),
+                "motion_axis": self._camera_motion_axis,
+                "motion_started_s": self._camera_motion_started_s,
+                "motion_until_s": self._camera_motion_until_s,
             }
 
     def pitch_camera(
@@ -382,11 +411,22 @@ class RobotBrainAgent:
             )
         )
         action = {resolved_action_key: action_value}
-        with self._motion_lock:
-            self.runtime.connect()
-            sent = self.runtime.robot.send_action(action)
-            time.sleep(max(0.0, self.config.camera_pitch_settle_s if settle_s is None else float(settle_s)))
-        state = self.update_camera_state(pitch_rad=pitch_rad)
+        settle_duration_s = max(0.0, self.config.camera_pitch_settle_s if settle_s is None else float(settle_s))
+        self.update_camera_state(
+            pitch_rad=pitch_rad,
+            moving=True,
+            motion_axis="pitch",
+            motion_until_s=time.time() + settle_duration_s,
+        )
+        try:
+            with self._motion_lock:
+                self.runtime.connect()
+                sent = self.runtime.robot.send_action(action)
+                time.sleep(settle_duration_s)
+        except Exception:
+            self.update_camera_state(moving=False)
+            raise
+        state = self.update_camera_state(pitch_rad=pitch_rad, moving=False)
         return {
             "succeeded": True,
             "message": "Camera pitch command sent and state updated.",
@@ -431,11 +471,22 @@ class RobotBrainAgent:
             self.config.camera_pan_action_sign
         )
         action = {resolved_action_key: action_value}
-        with self._motion_lock:
-            self.runtime.connect()
-            sent = self.runtime.robot.send_action(action)
-            time.sleep(max(0.0, self.config.camera_pan_settle_s if settle_s is None else float(settle_s)))
-        state = self.update_camera_state(pan_rad=pan_rad)
+        settle_duration_s = max(0.0, self.config.camera_pan_settle_s if settle_s is None else float(settle_s))
+        self.update_camera_state(
+            pan_rad=pan_rad,
+            moving=True,
+            motion_axis="pan",
+            motion_until_s=time.time() + settle_duration_s,
+        )
+        try:
+            with self._motion_lock:
+                self.runtime.connect()
+                sent = self.runtime.robot.send_action(action)
+                time.sleep(settle_duration_s)
+        except Exception:
+            self.update_camera_state(moving=False)
+            raise
+        state = self.update_camera_state(pan_rad=pan_rad, moving=False)
         return {
             "succeeded": True,
             "message": "Camera pan command sent and state updated.",

@@ -92,6 +92,9 @@ class RealRosBridgeConfig:
     odom_frame: str = "odom"
     head_camera_frame: str = "head_camera_link"
     head_points_topic: str = "/camera/head/points"
+    head_points_mode: str = "continuous"
+    head_points_settled_delay_s: float = 0.20
+    head_points_stale_tolerance_s: float = 0.10
     head_laser_frame: str = "head_laser"
     camera_x_m: float = 0.0
     camera_y_m: float = 0.0
@@ -630,7 +633,11 @@ class RealXLeRobotRosBridge(Node):
         self.camera_pan_publisher = self.create_publisher(Float32, config.camera_pan_topic, 10)
         self._camera_pitch_rad = float(config.camera_pitch_rad)
         self._camera_pan_rad = 0.0
+        self._camera_pose_updated_s: float | None = None
+        self._camera_pose_received_s: float | None = None
+        self._camera_pose_moving = False
         self._last_camera_pose_poll_s = 0.0
+        self._last_head_points_skip_reason = ""
         if config.publish_head_camera:
             self.head_rgb_publisher = self.create_publisher(Image, "/camera/head/image_raw", 10)
             self.head_depth_publisher = self.create_publisher(Image, "/camera/head/depth/image_raw", 10)
@@ -695,6 +702,10 @@ class RealXLeRobotRosBridge(Node):
                     self._camera_pitch_rad = float(state["pitch_rad"])
                 if "pan_rad" in state:
                     self._camera_pan_rad = float(state["pan_rad"])
+                if "updated_s" in state:
+                    self._camera_pose_updated_s = float(state["updated_s"])
+                self._camera_pose_moving = bool(state.get("moving", False))
+                self._camera_pose_received_s = now_s
             except Exception as exc:
                 self.get_logger().warning(f"Failed to fetch camera head pose: {_format_runtime_error(exc)}")
         pitch_msg = Float32()
@@ -1056,6 +1067,8 @@ class RealXLeRobotRosBridge(Node):
     def _publish_head_points(self, *, frame: RgbdFrame, stamp: Any) -> None:
         if self.head_points_publisher is None:
             return
+        if not self._head_points_publish_allowed(frame):
+            return
         if (
             frame.point_cloud_format != POINT_CLOUD_FORMAT_XYZ_FLOAT32
             or frame.point_cloud_points is None
@@ -1079,6 +1092,46 @@ class RealXLeRobotRosBridge(Node):
         msg.data = _orbbec_optical_xyz_to_ros_camera_link(frame.point_cloud_points, count=msg.width)
         msg.is_dense = False
         self.head_points_publisher.publish(msg)
+
+    def _head_points_publish_allowed(self, frame: RgbdFrame) -> bool:
+        if self.config.head_points_mode == "continuous":
+            return True
+        if self.config.head_points_mode != "settled":
+            return True
+        if self._camera_pose_moving:
+            self._log_head_points_skip_once("head moving")
+            return False
+        pose_updated_s = self._camera_pose_updated_s
+        if pose_updated_s is None:
+            self._log_head_points_skip_once("camera pose not ready")
+            return False
+        pose_received_s = self._camera_pose_received_s
+        if pose_received_s is None:
+            self._log_head_points_skip_once("camera pose not ready")
+            return False
+        age_s = time.monotonic() - pose_received_s
+        if age_s < max(float(self.config.head_points_settled_delay_s), 0.0):
+            self._log_head_points_skip_once("waiting for settled pose/frame")
+            return False
+        frame_timestamp_s = float(frame.timestamp_s)
+        stale_tolerance_s = max(float(self.config.head_points_stale_tolerance_s), 0.0)
+        if frame_timestamp_s + stale_tolerance_s < pose_updated_s:
+            self._log_head_points_skip_once("discarding pre-settle point cloud")
+            return False
+        if self._last_head_points_skip_reason:
+            self.get_logger().info(
+                "Resuming settled /camera/head/points publication "
+                f"pan_deg={math.degrees(self._camera_pan_rad):.1f} "
+                f"pitch_deg={math.degrees(self._camera_pitch_rad):.1f}"
+            )
+            self._last_head_points_skip_reason = ""
+        return True
+
+    def _log_head_points_skip_once(self, reason: str) -> None:
+        if reason == self._last_head_points_skip_reason:
+            return
+        self._last_head_points_skip_reason = reason
+        self.get_logger().info(f"Suppressing /camera/head/points in settled mode: {reason}.")
 
     def close(self) -> None:
         try:
@@ -1218,6 +1271,27 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--odom-frame", default="odom")
     parser.add_argument("--head-camera-frame", default="head_camera_link")
     parser.add_argument("--head-points-topic", default="/camera/head/points")
+    parser.add_argument(
+        "--head-points-mode",
+        choices=("continuous", "settled"),
+        default="continuous",
+        help=(
+            "Use `continuous` for RViz/debug streaming. Use `settled` for OctoMap camera-pan scans: "
+            "PointCloud2 is suppressed while the head is moving and only resumes after the pose settles."
+        ),
+    )
+    parser.add_argument(
+        "--head-points-settled-delay-s",
+        type=float,
+        default=0.20,
+        help="Extra delay after robot_brain reports a settled head pose before publishing PointCloud2 in settled mode.",
+    )
+    parser.add_argument(
+        "--head-points-stale-tolerance-s",
+        type=float,
+        default=0.10,
+        help="Accept PointCloud2 frames this many seconds older than the settled camera pose timestamp.",
+    )
     parser.add_argument("--head-laser-frame", default="head_laser")
     parser.add_argument("--camera-x-m", type=float, default=0.0)
     parser.add_argument("--camera-y-m", type=float, default=0.0)
@@ -1282,6 +1356,9 @@ def config_from_args(args: argparse.Namespace) -> RealRosBridgeConfig:
         odom_frame=args.odom_frame,
         head_camera_frame=args.head_camera_frame,
         head_points_topic=args.head_points_topic,
+        head_points_mode=args.head_points_mode,
+        head_points_settled_delay_s=args.head_points_settled_delay_s,
+        head_points_stale_tolerance_s=args.head_points_stale_tolerance_s,
         head_laser_frame=args.head_laser_frame,
         camera_x_m=args.camera_x_m,
         camera_y_m=args.camera_y_m,
