@@ -143,6 +143,8 @@ class SimExplorationConfig:
     robot_brain_url: str | None = "http://127.0.0.1:8765"
     camera_pan_action_key: str = "head_motor_1.pos"
     camera_pan_settle_s: float = 0.5
+    camera_pan_step_deg: float = 60.0
+    camera_pan_compute_s: float = 2.0
     camera_pan_sample_count: int = 12
     point_cloud_range_min_m: float = 0.25
     point_cloud_range_max_m: float = 4.0
@@ -2925,6 +2927,8 @@ class RosExplorationSession:
                 robot_brain_url=config.robot_brain_url,
                 camera_pan_action_key=config.camera_pan_action_key,
                 camera_pan_settle_s=config.camera_pan_settle_s,
+                camera_pan_step_deg=config.camera_pan_step_deg,
+                camera_pan_compute_s=config.camera_pan_compute_s,
                 camera_pan_sample_count=config.camera_pan_sample_count,
             )
         else:
@@ -2955,6 +2959,8 @@ class RosExplorationSession:
                     robot_brain_url=config.robot_brain_url,
                     camera_pan_action_key=config.camera_pan_action_key,
                     camera_pan_settle_s=config.camera_pan_settle_s,
+                    camera_pan_step_deg=config.camera_pan_step_deg,
+                    camera_pan_compute_s=config.camera_pan_compute_s,
                     camera_pan_sample_count=config.camera_pan_sample_count,
                     allow_multiple_action_servers=config.ros_allow_multiple_action_servers,
                     publish_internal_navigation_map=config.ros_navigation_map_source
@@ -4875,6 +4881,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--robot-brain-url", default="http://127.0.0.1:8765")
     parser.add_argument("--camera-pan-action-key", default="head_motor_1.pos")
     parser.add_argument("--camera-pan-settle-s", type=float, default=0.5)
+    parser.add_argument("--camera-pan-step-deg", type=float, default=60.0)
+    parser.add_argument("--camera-pan-compute-s", type=float, default=2.0)
     parser.add_argument("--camera-pan-sample-count", type=int, default=12)
     parser.add_argument("--point-cloud-range-min-m", type=float, default=0.25)
     parser.add_argument("--point-cloud-range-max-m", type=float, default=4.0)
@@ -5003,6 +5011,8 @@ def main(argv: list[str] | None = None) -> int:
             robot_brain_url=args.robot_brain_url,
             camera_pan_action_key=args.camera_pan_action_key,
             camera_pan_settle_s=args.camera_pan_settle_s,
+            camera_pan_step_deg=args.camera_pan_step_deg,
+            camera_pan_compute_s=args.camera_pan_compute_s,
             camera_pan_sample_count=args.camera_pan_sample_count,
             point_cloud_range_min_m=args.point_cloud_range_min_m,
             point_cloud_range_max_m=args.point_cloud_range_max_m,

@@ -80,6 +80,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--robot-brain-url", default="http://127.0.0.1:8765")
     parser.add_argument("--camera-pan-action-key", default="head_motor_1.pos")
     parser.add_argument("--camera-pan-settle-s", type=float, default=0.5)
+    parser.add_argument("--camera-pan-step-deg", type=float, default=60.0)
+    parser.add_argument("--camera-pan-compute-s", type=float, default=2.0)
     parser.add_argument("--camera-pan-sample-count", type=int, default=12)
     parser.add_argument("--point-cloud-range-min-m", type=float, default=0.25)
     parser.add_argument("--point-cloud-range-max-m", type=float, default=4.0)
@@ -179,6 +181,10 @@ def translated_args(args: argparse.Namespace) -> list[str]:
         args.camera_pan_action_key,
         "--camera-pan-settle-s",
         str(args.camera_pan_settle_s),
+        "--camera-pan-step-deg",
+        str(args.camera_pan_step_deg),
+        "--camera-pan-compute-s",
+        str(args.camera_pan_compute_s),
         "--camera-pan-sample-count",
         str(args.camera_pan_sample_count),
         "--point-cloud-range-min-m",

@@ -494,7 +494,7 @@ python -m xlerobot_playground.real_agentic_exploration \
   --ros-navigation-map-source external \
   --ros-map-topic /projected_map \
   --ros-map-updates-topic /projected_map_updates \
-  --ros-map-frame base_link \
+  --ros-map-frame map \
   --ros-scan-topic /scan \
   --ros-point-cloud-topic /camera/head/points \
   --ros-ready-timeout-s 30 \
@@ -502,8 +502,9 @@ python -m xlerobot_playground.real_agentic_exploration \
   --ros-turn-scan-mode camera_pan \
   --robot-brain-url "http://${ROBOT_BRAIN_IP}:8765" \
   --camera-pan-action-key head_motor_1.pos \
-  --camera-pan-settle-s 2.5 \
-  --camera-pan-sample-count 12 \
+  --camera-pan-settle-s 1.5 \
+  --camera-pan-step-deg 60 \
+  --camera-pan-compute-s 2.0 \
   --ros-manual-spin-angular-speed-rad-s 0.30 \
   --max-decisions 8 \
   --ros-imu-topic /imu/filtered_yaw \
@@ -516,7 +517,7 @@ Open the UI from your browser:
 http://OFFLOAD_IP:8770
 ```
 
-Click `Start Explore` in the UI. The robot should keep its base still, keep pitch at `30 deg`, pan the head `0 -> +180 -> 0 -> -180 -> 0`, let OctoMap integrate `/camera/head/points`, and then show `/projected_map` plus `/projected_map_updates` as the occupancy map in the UI. Because `--pause-for-operator-approval` is enabled, it should pause after the initial scan while keeping the live ROS session available for waypoint testing.
+Click `Start Explore` in the UI. The robot should keep its base still, keep pitch at `30 deg`, pan the head in 60 degree stops (`0 -> 60 -> 120 -> 180 -> 0 -> -60 -> -120`), wait `1.5s` for the motor at each stop, wait for a fresh `/camera/head/points` sample, then give OctoMap `2.0s` of compute time before the next pan move. It should then show `/projected_map` plus `/projected_map_updates` as the occupancy map in the UI. Because `--pause-for-operator-approval` is enabled, it should pause after the initial scan while keeping the live ROS session available for waypoint testing.
 
 By default this real-exploration command waits for the UI start request before moving the robot or panning the head. Use `--no-wait-for-ui-start` only when you want the 360 degree camera-pan scan to begin immediately after the terminal command starts.
 
@@ -549,7 +550,7 @@ python -m xlerobot_playground.real_agentic_exploration \
   --ros-navigation-map-source external \
   --ros-map-topic /projected_map \
   --ros-map-updates-topic /projected_map_updates \
-  --ros-map-frame base_link \
+  --ros-map-frame map \
   --ros-scan-topic /scan \
   --ros-point-cloud-topic /camera/head/points \
   --ros-ready-timeout-s 30 \
@@ -557,8 +558,9 @@ python -m xlerobot_playground.real_agentic_exploration \
   --ros-turn-scan-mode camera_pan \
   --robot-brain-url "http://${ROBOT_BRAIN_IP}:8765" \
   --camera-pan-action-key head_motor_1.pos \
-  --camera-pan-settle-s 0.5 \
-  --camera-pan-sample-count 12 \
+  --camera-pan-settle-s 1.5 \
+  --camera-pan-step-deg 60 \
+  --camera-pan-compute-s 2.0 \
   --ros-manual-spin-angular-speed-rad-s 0.30 \
   --max-decisions 8
 ```

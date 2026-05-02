@@ -107,6 +107,8 @@ class RemoteRosExplorationRuntime:
         robot_brain_url: str | None = "http://127.0.0.1:8765",
         camera_pan_action_key: str = "head_motor_1.pos",
         camera_pan_settle_s: float = 0.5,
+        camera_pan_step_deg: float = 60.0,
+        camera_pan_compute_s: float = 2.0,
         camera_pan_sample_count: int = 12,
     ) -> None:
         self.base_url = base_url.rstrip("/")
@@ -115,6 +117,8 @@ class RemoteRosExplorationRuntime:
         self.robot_brain_url = robot_brain_url
         self.camera_pan_action_key = camera_pan_action_key
         self.camera_pan_settle_s = camera_pan_settle_s
+        self.camera_pan_step_deg = camera_pan_step_deg
+        self.camera_pan_compute_s = camera_pan_compute_s
         self.camera_pan_sample_count = camera_pan_sample_count
         self.latest_map: RosOccupancyMap | None = None
         self.latest_map_stamp_s: float = 0.0
@@ -174,6 +178,8 @@ class RemoteRosExplorationRuntime:
                 "robot_brain_url": self.robot_brain_url,
                 "camera_pan_action_key": self.camera_pan_action_key,
                 "camera_pan_settle_s": self.camera_pan_settle_s,
+                "camera_pan_step_deg": self.camera_pan_step_deg,
+                "camera_pan_compute_s": self.camera_pan_compute_s,
                 "camera_pan_sample_count": self.camera_pan_sample_count,
             },
             timeout_s=max(self.timeout_s, 300.0),
@@ -368,6 +374,8 @@ class RosNav2AdapterServer:
                             robot_brain_url=payload.get("robot_brain_url"),
                             camera_pan_action_key=payload.get("camera_pan_action_key"),
                             camera_pan_settle_s=payload.get("camera_pan_settle_s"),
+                            camera_pan_step_deg=payload.get("camera_pan_step_deg"),
+                            camera_pan_compute_s=payload.get("camera_pan_compute_s"),
                             camera_pan_sample_count=payload.get("camera_pan_sample_count"),
                         )
                         self._send_json(

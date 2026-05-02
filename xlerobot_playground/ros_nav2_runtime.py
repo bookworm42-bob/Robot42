@@ -282,6 +282,8 @@ class RosRuntimeConfig:
     robot_brain_url: str | None = "http://127.0.0.1:8765"
     camera_pan_action_key: str = "head_motor_1.pos"
     camera_pan_settle_s: float = 0.5
+    camera_pan_step_deg: float = 60.0
+    camera_pan_compute_s: float = 2.0
     camera_pan_sample_count: int = 12
     allow_multiple_action_servers: bool = False
     publish_internal_navigation_map: bool = True
@@ -926,6 +928,8 @@ class RosExplorationRuntime(Node):
         robot_brain_url: str | None = None,
         camera_pan_action_key: str | None = None,
         camera_pan_settle_s: float | None = None,
+        camera_pan_step_deg: float | None = None,
+        camera_pan_compute_s: float | None = None,
         camera_pan_sample_count: int | None = None,
     ) -> dict[str, Any]:
         start_time = time.time()
@@ -933,11 +937,17 @@ class RosExplorationRuntime(Node):
         observation_start_index = len(self.scan_observations)
         mode = str(turn_scan_mode or self.config.turn_scan_mode)
         sample_count = max(int(camera_pan_sample_count or self.config.camera_pan_sample_count), 2)
+        configured_pan_step_deg = float(getattr(self.config, "camera_pan_step_deg", 60.0))
+        configured_pan_compute_s = float(getattr(self.config, "camera_pan_compute_s", 2.0))
+        pan_step_deg = float(configured_pan_step_deg if camera_pan_step_deg is None else camera_pan_step_deg)
+        pan_compute_s = float(configured_pan_compute_s if camera_pan_compute_s is None else camera_pan_compute_s)
         event = {
             "reason": reason,
             "mode": mode,
             "target_yaw_rad": round(self.config.turn_scan_radians, 3),
             "sample_count": sample_count,
+            "camera_pan_step_deg": round(pan_step_deg, 3),
+            "camera_pan_compute_s": round(max(pan_compute_s, 0.0), 3),
         }
         if mode == "camera_pan":
             return self._perform_camera_pan_scan(
@@ -951,6 +961,8 @@ class RosExplorationRuntime(Node):
                 robot_brain_url=robot_brain_url,
                 camera_pan_action_key=camera_pan_action_key,
                 camera_pan_settle_s=camera_pan_settle_s,
+                camera_pan_step_deg=pan_step_deg,
+                camera_pan_compute_s=pan_compute_s,
             )
         if mode != "robot_spin":
             raise ValueError(f"Unsupported turn scan mode: {mode!r}")
@@ -1012,68 +1024,83 @@ class RosExplorationRuntime(Node):
         robot_brain_url: str | None = None,
         camera_pan_action_key: str | None = None,
         camera_pan_settle_s: float | None = None,
+        camera_pan_step_deg: float | None = None,
+        camera_pan_compute_s: float | None = None,
     ) -> dict[str, Any]:
         effective_robot_brain_url = robot_brain_url or self.config.robot_brain_url
         if not effective_robot_brain_url:
             raise RuntimeError("Camera-pan scan requires robot_brain_url; use turn_scan_mode='robot_spin' for base rotation.")
         map_start_stamp_s = float(self.latest_map_stamp_s)
-        per_side = max(int(math.ceil(max(sample_count, 2) / 2.0)), 2)
-        positive_angles = [
-            math.pi * index / float(per_side - 1)
-            for index in range(per_side)
-        ]
-        negative_angles = [
-            -math.pi * index / float(per_side - 1)
-            for index in range(per_side)
-        ]
+        configured_pan_step_deg = float(getattr(self.config, "camera_pan_step_deg", 60.0))
+        configured_pan_compute_s = float(getattr(self.config, "camera_pan_compute_s", 2.0))
+        pan_step_deg = abs(float(configured_pan_step_deg if camera_pan_step_deg is None else camera_pan_step_deg))
+        if pan_step_deg <= 0.0:
+            pan_step_deg = 60.0
+        pan_compute_s = max(float(configured_pan_compute_s if camera_pan_compute_s is None else camera_pan_compute_s), 0.0)
+        positive_deg: list[float] = []
+        angle_deg = 0.0
+        while angle_deg < 180.0:
+            positive_deg.append(angle_deg)
+            angle_deg += pan_step_deg
+        positive_deg.append(180.0)
+        negative_deg: list[float] = [0.0]
+        angle_deg = -pan_step_deg
+        while angle_deg > -180.0:
+            negative_deg.append(angle_deg)
+            angle_deg -= pan_step_deg
+        scan_angles = [math.radians(item) for item in positive_deg + negative_deg]
         observations: list[dict[str, Any]] = []
         command_events: list[dict[str, Any]] = []
+        settled_sample_events: list[dict[str, Any]] = []
         projected_map_snapshots: list[RosOccupancyMap] = []
         fused_projected_map: RosOccupancyMap | None = None
         fuse_external_projected_maps = bool(getattr(self.config, "fuse_external_projected_map_snapshots", False))
         try:
-            for sweep_name, angles in (("positive", positive_angles), ("negative", negative_angles)):
-                for pan_rad in angles:
-                    if should_cancel is not None and should_cancel():
-                        event["scan_stop_reason"] = "canceled"
-                        break
-                    command_events.append(
-                        self._command_camera_pan(
-                            pan_rad,
-                            robot_brain_url=effective_robot_brain_url,
-                            action_key=camera_pan_action_key,
-                            settle_s=camera_pan_settle_s,
-                        )
-                    )
-                    observation = self._capture_settled_scan_observation()
-                    if observation is not None:
-                        observation["scan_sweep"] = sweep_name
-                        observation["camera_pan_rad"] = pan_rad
-                        observations.append(observation)
-                    if (
-                        fuse_external_projected_maps
-                        and not self.config.publish_internal_navigation_map
-                        and self.latest_map is not None
-                        and self.latest_map_header_frame_id == self.config.map_frame
-                    ):
-                        projected_map_snapshots.append(self.latest_map)
-                    elif (
-                        not self.config.publish_internal_navigation_map
-                        and self.latest_map is not None
-                        and self.latest_map_header_frame_id == self.config.map_frame
-                    ):
-                        event["external_projected_map_seen"] = True
-                if event.get("scan_stop_reason") == "canceled":
+            for pan_rad in scan_angles:
+                if should_cancel is not None and should_cancel():
+                    event["scan_stop_reason"] = "canceled"
                     break
+                point_cloud_start_index = len(self.point_cloud_observations)
+                map_before_command_s = float(self.latest_map_stamp_s)
                 command_events.append(
                     self._command_camera_pan(
-                        0.0,
+                        pan_rad,
                         robot_brain_url=effective_robot_brain_url,
                         action_key=camera_pan_action_key,
                         settle_s=camera_pan_settle_s,
                     )
                 )
-                self.hold_stop_until_stable(duration_s=max(float(self.config.turn_scan_settle_s), 0.1))
+                point_cloud_observation = self._wait_for_next_point_cloud_observation(
+                    point_cloud_start_index,
+                    timeout_s=max(pan_compute_s + 2.0, 3.0),
+                )
+                self.spin_for(pan_compute_s)
+                map_updated = self.latest_map_stamp_s > map_before_command_s
+                settled_sample_events.append(
+                    {
+                        "pan_deg": round(math.degrees(pan_rad), 1),
+                        "fresh_point_cloud": point_cloud_observation is not None,
+                        "map_updated": bool(map_updated),
+                        "compute_s": round(pan_compute_s, 3),
+                    }
+                )
+                observation = self._capture_settled_scan_observation(settle_s=0.0)
+                if observation is not None:
+                    observation["camera_pan_rad"] = pan_rad
+                    observations.append(observation)
+                if (
+                    fuse_external_projected_maps
+                    and not self.config.publish_internal_navigation_map
+                    and self.latest_map is not None
+                    and self.latest_map_header_frame_id == self.config.map_frame
+                ):
+                    projected_map_snapshots.append(self.latest_map)
+                elif (
+                    not self.config.publish_internal_navigation_map
+                    and self.latest_map is not None
+                    and self.latest_map_header_frame_id == self.config.map_frame
+                ):
+                    event["external_projected_map_seen"] = True
         finally:
             try:
                 command_events.append(
@@ -1125,6 +1152,8 @@ class RosExplorationRuntime(Node):
         event["captured_observation_count"] = len(observations)
         event["raw_observation_count"] = len(raw_observations)
         event["camera_pan_command_count"] = len(command_events)
+        event["camera_pan_settled_sample_count"] = len(settled_sample_events)
+        event["camera_pan_settled_samples"] = settled_sample_events
         event["camera_pan_commanded_deg"] = [
             round(math.degrees(float(item.get("pan_rad", 0.0))), 1)
             for item in command_events
@@ -1341,10 +1370,10 @@ class RosExplorationRuntime(Node):
             "spin_timeout_s": round(timeout_s, 3),
         }
 
-    def _capture_settled_scan_observation(self) -> dict[str, Any] | None:
+    def _capture_settled_scan_observation(self, *, settle_s: float | None = None) -> dict[str, Any] | None:
         reference_frame = self.config.odom_frame if self.config.publish_internal_navigation_map else self.config.map_frame
         capture_start = len(self.scan_observations)
-        self.hold_stop_until_stable(duration_s=self.config.turn_scan_settle_s)
+        self.hold_stop_until_stable(duration_s=self.config.turn_scan_settle_s if settle_s is None else settle_s)
         observation = self._wait_for_next_scan_observation(capture_start)
         if observation is not None:
             return observation
@@ -1360,6 +1389,19 @@ class RosExplorationRuntime(Node):
             self._spin_once(timeout_sec=0.05)
             if len(self.scan_observations) > after_index:
                 return dict(self.scan_observations[-1])
+        return None
+
+    def _wait_for_next_point_cloud_observation(
+        self,
+        after_index: int,
+        *,
+        timeout_s: float = 3.0,
+    ) -> dict[str, Any] | None:
+        deadline = time.time() + max(float(timeout_s), 0.0)
+        while time.time() < deadline:
+            self._spin_once(timeout_sec=0.05)
+            if len(self.point_cloud_observations) > after_index:
+                return dict(self.point_cloud_observations[-1])
         return None
 
     def _action_servers(self, action_name: str) -> list[str]:

@@ -52,6 +52,8 @@ class RosNav2RuntimeTests(unittest.TestCase):
                     robot_brain_url="http://brain.local:8765",
                     camera_pan_action_key="head_motor_1.pos",
                     camera_pan_settle_s=0.0,
+                    camera_pan_step_deg=60.0,
+                    camera_pan_compute_s=0.0,
                     turn_scan_settle_s=0.0,
                     server_timeout_s=1.0,
                     publish_internal_navigation_map=False,
@@ -60,6 +62,7 @@ class RosNav2RuntimeTests(unittest.TestCase):
                 self.commands: list[float] = []
                 self.hold_count = 0
                 self.scan_observations = [{"pose": Pose2D(0.0, 0.0, 99.0)} for _ in range(99)]
+                self.point_cloud_observations = []
                 self._nav_scan_history = []
                 self.latest_map = None
                 self.latest_map_stamp_s = 0.0
@@ -72,7 +75,7 @@ class RosNav2RuntimeTests(unittest.TestCase):
                 self.commands.append(pan_rad)
                 return {"pan_rad": pan_rad}
 
-            def _capture_settled_scan_observation(self):
+            def _capture_settled_scan_observation(self, **_kwargs):
                 return {
                     "pose": Pose2D(1.0, 2.0, self.commands[-1]),
                     "ranges": (1.0,),
@@ -85,6 +88,12 @@ class RosNav2RuntimeTests(unittest.TestCase):
             def hold_stop_until_stable(self, *, duration_s: float):
                 self.hold_count += 1
                 return {"stable": True, "duration_s": duration_s}
+
+            def spin_for(self, duration_s: float):
+                return None
+
+            def _wait_for_next_point_cloud_observation(self, after_index: int, *, timeout_s: float = 3.0):
+                return None
 
             def drain_scan_observations(self, since_index: int):
                 return list(self.scan_observations[since_index:]), len(self.scan_observations)
@@ -111,12 +120,21 @@ class RosNav2RuntimeTests(unittest.TestCase):
             event={"reason": "test", "mode": "camera_pan", "sample_count": 6},
         )
 
-        expected = [0.0, math.pi / 2.0, math.pi, 0.0, 0.0, -math.pi / 2.0, -math.pi, 0.0, 0.0]
+        expected = [
+            0.0,
+            math.radians(60.0),
+            math.radians(120.0),
+            math.pi,
+            0.0,
+            math.radians(-60.0),
+            math.radians(-120.0),
+            0.0,
+        ]
         self.assertEqual(len(runtime.commands), len(expected))
         for actual, expected_value in zip(runtime.commands, expected):
             self.assertAlmostEqual(actual, expected_value)
-        self.assertEqual(len(result["observations"]), 6)
-        self.assertEqual([item["scan_sweep"] for item in result["observations"]], ["positive"] * 3 + ["negative"] * 3)
+        self.assertEqual(len(result["observations"]), 7)
+        self.assertEqual(result["camera_pan_settled_sample_count"], 7)
         self.assertEqual(result["observation_stop_index"], 99)
         self.assertEqual(result["raw_observation_count"], 89)
         self.assertEqual(result["scan_stop_reason"], "completed")
