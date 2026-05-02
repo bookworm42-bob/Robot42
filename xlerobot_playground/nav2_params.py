@@ -103,6 +103,10 @@ def patch_nav2_params(
     rotate_to_goal_scale: float = 8.0,
     rotate_to_goal_slowing_factor: float = 3.0,
     transform_tolerance_s: float = 0.5,
+    progress_required_movement_radius: float = 0.05,
+    progress_movement_time_allowance_s: float = 25.0,
+    xy_goal_tolerance_m: float = 0.18,
+    yaw_goal_tolerance_rad: float = 3.14,
 ) -> dict[str, Any]:
     params = deepcopy(base_params)
 
@@ -247,6 +251,14 @@ def patch_nav2_params(
     controller = node_params("controller_server")
     controller["odom_topic"] = "/odom"
     controller["transform_tolerance"] = transform_tolerance_s
+    progress_checker = controller.setdefault("progress_checker", {})
+    progress_checker["plugin"] = progress_checker.get("plugin", "nav2_controller::SimpleProgressChecker")
+    progress_checker["required_movement_radius"] = progress_required_movement_radius
+    progress_checker["movement_time_allowance"] = progress_movement_time_allowance_s
+    goal_checker = controller.setdefault("general_goal_checker", {})
+    goal_checker["plugin"] = goal_checker.get("plugin", "nav2_controller::SimpleGoalChecker")
+    goal_checker["xy_goal_tolerance"] = xy_goal_tolerance_m
+    goal_checker["yaw_goal_tolerance"] = yaw_goal_tolerance_rad
     follow_path = controller.get("FollowPath")
     if isinstance(follow_path, dict):
         follow_path["max_vel_x"] = max_linear_velocity

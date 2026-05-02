@@ -67,6 +67,7 @@ class RobotBrainAgentTests(unittest.TestCase):
         self.assertEqual(config.camera_log_every, 30)
         self.assertEqual(config.camera_pan_action_key, "head_motor_1.pos")
         self.assertEqual(config.camera_pan_action_sign, 1.0)
+        self.assertEqual(config.base_angular_action_sign, 1.0)
 
     def test_parser_accepts_debug_motion(self) -> None:
         args = build_parser().parse_args(["--debug-motion"])
@@ -89,6 +90,15 @@ class RobotBrainAgentTests(unittest.TestCase):
         self.assertTrue(response["succeeded"])
         self.assertEqual(runtime.velocity_calls, [(0.02, 0.08)])
         self.assertEqual(response["metadata"], {"sent": True})
+
+    def test_agent_can_flip_base_angular_action_sign(self) -> None:
+        runtime = FakeRuntime()
+        agent = RobotBrainAgent(RobotBrainAgentConfig(base_angular_action_sign=-1.0), runtime=runtime)
+
+        response = agent.velocity(linear_m_s=0.0, angular_rad_s=0.08)
+
+        self.assertTrue(response["succeeded"])
+        self.assertEqual(runtime.velocity_calls, [(0.0, -0.08)])
 
     def test_agent_commands_camera_pitch_and_updates_state(self) -> None:
         runtime = FakeRuntime()

@@ -86,6 +86,7 @@ python -m xlerobot_playground.robot_brain_agent \
   --port2 /dev/tty.usbmodem5B140332271 \
   --max-linear-m-s 0.03 \
   --max-angular-rad-s 0.30 \
+  --base-angular-action-sign 1 \
   --camera-pan-action-key head_motor_1.pos \
   --camera-pan-action-units deg \
   --camera-pan-action-sign -1 \
@@ -100,6 +101,8 @@ python -m xlerobot_playground.robot_brain_agent \
 ```
 
 `head_motor_1.pos` is the default horizontal head pan motor command. Keep `--allow-motion-commands` enabled here; camera-pan exploration scans use the same safe hardware command gate as wheel motion.
+
+Keep `--base-angular-action-sign 1` if positive ROS `/cmd_vel.angular.z` turns the robot left/counter-clockwise in RViz/map coordinates. If a positive angular command physically turns the robot right, restart only `robot_brain_agent` with `--base-angular-action-sign -1`.
 
 Keep `--use-degrees` enabled for camera-pan scans. The XLeRobot head motors use degree units only in degree mode; without it, `head_motor_1.pos` is interpreted in normalized `-100..100` units while the scan pipeline would believe the camera reached `-180..180` degrees.
 
@@ -426,7 +429,12 @@ python -m xlerobot_playground.real_nav2_config \
   --max-linear-velocity 0.03 \
   --max-angular-velocity 0.10 \
   --local-costmap-width 2 \
-  --local-costmap-height 2
+  --local-costmap-height 2 \
+  --transform-tolerance-s 0.5 \
+  --progress-required-movement-radius 0.05 \
+  --progress-movement-time-allowance-s 25.0 \
+  --xy-goal-tolerance-m 0.18 \
+  --yaw-goal-tolerance-rad 3.14
 ```
 
 ### Terminal OC-5: Nav2

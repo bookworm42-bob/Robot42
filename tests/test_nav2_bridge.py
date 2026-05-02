@@ -186,6 +186,22 @@ class Nav2BridgeTests(unittest.TestCase):
             patched["controller_server"]["ros__parameters"]["FollowPath"]["RotateToGoal.scale"],
             8.0,
         )
+        self.assertEqual(
+            patched["controller_server"]["ros__parameters"]["progress_checker"]["required_movement_radius"],
+            0.05,
+        )
+        self.assertEqual(
+            patched["controller_server"]["ros__parameters"]["progress_checker"]["movement_time_allowance"],
+            25.0,
+        )
+        self.assertEqual(
+            patched["controller_server"]["ros__parameters"]["general_goal_checker"]["xy_goal_tolerance"],
+            0.18,
+        )
+        self.assertEqual(
+            patched["controller_server"]["ros__parameters"]["general_goal_checker"]["yaw_goal_tolerance"],
+            3.14,
+        )
 
     def test_slam_toolbox_params_use_standard_frames(self) -> None:
         params = render_slam_toolbox_params()

@@ -45,6 +45,7 @@ class RobotBrainAgentConfig:
     allow_motion_commands: bool = False
     max_linear_m_s: float = 0.05
     max_angular_rad_s: float = 0.20
+    base_angular_action_sign: float = 1.0
     debug_motion: bool = False
     calibration_prompt_response: str | None = ""
     orbbec_output_dir: Path = Path("artifacts/orbbec_rgbd")
@@ -266,12 +267,18 @@ class RobotBrainAgent:
         self._camera_pose_updated_s = time.time()
 
     def velocity(self, *, linear_m_s: float, angular_rad_s: float) -> dict[str, Any]:
+        commanded_angular_rad_s = float(angular_rad_s) * float(self.config.base_angular_action_sign)
         if self.config.debug_motion:
-            print(f"[robot_brain_agent] /cmd_vel requested linear={linear_m_s} angular={angular_rad_s}", flush=True)
+            print(
+                "[robot_brain_agent] /cmd_vel requested "
+                f"linear={linear_m_s} angular={angular_rad_s} "
+                f"sent_angular={commanded_angular_rad_s}",
+                flush=True,
+            )
         with self._motion_lock:
             if self.config.debug_motion:
                 print("[robot_brain_agent] /cmd_vel acquired motion lock", flush=True)
-            result = self.runtime.drive_velocity(linear_m_s=linear_m_s, angular_rad_s=angular_rad_s)
+            result = self.runtime.drive_velocity(linear_m_s=linear_m_s, angular_rad_s=commanded_angular_rad_s)
         if self.config.debug_motion:
             print(f"[robot_brain_agent] /cmd_vel done succeeded={result.succeeded}", flush=True)
         return {
@@ -779,6 +786,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--allow-motion-commands", action="store_true")
     parser.add_argument("--max-linear-m-s", type=float, default=0.05)
     parser.add_argument("--max-angular-rad-s", type=float, default=0.20)
+    parser.add_argument(
+        "--base-angular-action-sign",
+        type=float,
+        choices=(-1.0, 1.0),
+        default=1.0,
+        help=(
+            "Multiply requested base angular velocity before sending theta.vel to hardware. "
+            "Use -1 if positive ROS/angular commands physically rotate right instead of left."
+        ),
+    )
     parser.add_argument("--debug-motion", action="store_true")
     parser.add_argument(
         "--calibration-prompt-response",
@@ -863,6 +880,7 @@ def config_from_args(args: argparse.Namespace) -> RobotBrainAgentConfig:
         allow_motion_commands=args.allow_motion_commands,
         max_linear_m_s=args.max_linear_m_s,
         max_angular_rad_s=args.max_angular_rad_s,
+        base_angular_action_sign=args.base_angular_action_sign,
         debug_motion=args.debug_motion,
         calibration_prompt_response=None if args.interactive_calibration else args.calibration_prompt_response,
         orbbec_output_dir=Path(args.orbbec_output_dir),

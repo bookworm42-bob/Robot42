@@ -29,6 +29,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--local-costmap-width", type=int, default=2)
     parser.add_argument("--local-costmap-height", type=int, default=2)
     parser.add_argument("--transform-tolerance-s", type=float, default=0.5)
+    parser.add_argument("--progress-required-movement-radius", type=float, default=0.05)
+    parser.add_argument("--progress-movement-time-allowance-s", type=float, default=25.0)
+    parser.add_argument("--xy-goal-tolerance-m", type=float, default=0.18)
+    parser.add_argument("--yaw-goal-tolerance-rad", type=float, default=3.14)
     return parser
 
 
@@ -76,6 +80,10 @@ def main(argv: list[str] | None = None) -> int:
         local_costmap_width=args.local_costmap_width,
         local_costmap_height=args.local_costmap_height,
         transform_tolerance_s=args.transform_tolerance_s,
+        progress_required_movement_radius=args.progress_required_movement_radius,
+        progress_movement_time_allowance_s=args.progress_movement_time_allowance_s,
+        xy_goal_tolerance_m=args.xy_goal_tolerance_m,
+        yaw_goal_tolerance_rad=args.yaw_goal_tolerance_rad,
         inflation_radius=0.0,
     )
     nav2_path = output_dir / args.nav2_output
