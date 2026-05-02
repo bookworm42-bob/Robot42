@@ -42,6 +42,7 @@ try:
     )
     from rclpy.time import Time as RosTime
     from sensor_msgs.msg import Image, Imu, LaserScan, PointCloud2
+    from std_msgs.msg import Bool
     from tf2_ros import Buffer, TransformBroadcaster, TransformListener
     from tf2_ros import ConnectivityException, ExtrapolationException, LookupException
 except Exception as exc:  # pragma: no cover - runtime guard.
@@ -68,6 +69,7 @@ except Exception as exc:  # pragma: no cover - runtime guard.
     Imu = None
     LaserScan = None
     PointCloud2 = None
+    Bool = None
     Buffer = None
     TransformBroadcaster = None
     TransformListener = None
@@ -264,6 +266,7 @@ class RosRuntimeConfig:
     map_updates_topic: str | None = None
     scan_topic: str = "/scan"
     point_cloud_topic: str = "/camera/head/points"
+    point_cloud_update_map_enabled_topic: str = "/camera/head/points/update_map_enabled"
     rgb_topic: str = "/camera/head/image_raw"
     imu_topic: str = "/imu/filtered_yaw"
     cmd_vel_topic: str = "/cmd_vel"
@@ -470,6 +473,11 @@ class RosExplorationRuntime(Node):
         self._nav_plan_history: list[dict[str, Any]] = []
         self._nav_scan_history: list[dict[str, Any]] = []
         self._cmd_vel_pub = self.create_publisher(Twist, config.cmd_vel_topic, 10)
+        self._point_cloud_update_map_enabled_pub = self.create_publisher(
+            Bool,
+            config.point_cloud_update_map_enabled_topic,
+            10,
+        )
         map_qos = QoSProfile(depth=1)
         map_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
         map_qos.reliability = ReliabilityPolicy.RELIABLE
@@ -810,6 +818,12 @@ class RosExplorationRuntime(Node):
 
     def point_cloud_observation_count(self) -> int:
         return len(self.point_cloud_observations)
+
+    def set_point_cloud_map_updates_enabled(self, enabled: bool) -> None:
+        message = Bool()
+        message.data = bool(enabled)
+        self._point_cloud_update_map_enabled_pub.publish(message)
+        self._spin_once(timeout_sec=0.0)
 
     def drain_scan_observations(self, since_index: int) -> tuple[list[dict[str, Any]], int]:
         self.spin_for(0.05)

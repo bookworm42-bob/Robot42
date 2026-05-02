@@ -824,12 +824,16 @@ class RosNav2NavigationModule(Nav2NavigationModule):
             )
         validation = self.validate_goal(goal)
         try:
-            outcome, feedback_samples = self.runtime.navigate_to_pose(
-                goal_pose=validation.normalized_pose or goal.target_pose,
-                behavior_tree=goal.behavior_tree,
-                should_cancel=None if ignore_pause_cancel else self._should_cancel,
-                feedback_callback=feedback_callback,
-            )
+            self.runtime.set_point_cloud_map_updates_enabled(False)
+            try:
+                outcome, feedback_samples = self.runtime.navigate_to_pose(
+                    goal_pose=validation.normalized_pose or goal.target_pose,
+                    behavior_tree=goal.behavior_tree,
+                    should_cancel=None if ignore_pause_cancel else self._should_cancel,
+                    feedback_callback=feedback_callback,
+                )
+            finally:
+                self.runtime.set_point_cloud_map_updates_enabled(True)
         except Exception as exc:
             reason = f"ROS Nav2 navigate_to_pose call failed: {exc}"
             recovery_events: list[dict[str, Any]] = []

@@ -238,6 +238,8 @@ For OctoMap camera-pan scans, keep `--head-points-mode settled`. In this mode th
 
 Keep `--no-head-points-update-map-while-base-moving` for waypoint/Nav2 tests. This temporarily freezes OctoMap input while `/cmd_vel` is moving the base. It prevents base-motion TF/odometry lag from corrupting the already-built map; later live mapping can switch to `--head-points-update-map-while-base-moving` once base pose tracking is validated during motion.
 
+The exploration runtime also pauses `/camera/head/points` for the full duration of each Nav2 waypoint goal through `/camera/head/points/update_map_enabled`. This pauses only the PointCloud2 feed into OctoMap; `/odom`, TF, `/cmd_vel`, images, and IMU stay live so Nav2 and the UI can still track robot motion.
+
 `--camera-z-m 1.05` is the current effective camera height relative to `base_link`, validated in RViz by checking that the PointCloud2 floor remains flat against the ground grid at both `pitch_deg: 0` and `pitch_deg: 30`.
 
 Keep `--no-laser-fill-no-return` for real Orbbec mapping. Missing/invalid depth should stay unknown; treating it as max-range free space creates false fan-shaped clear areas. The point-cloud occupancy mapper is intentionally conservative: it adds free space only along rays to valid points and does not clear through missing depth.

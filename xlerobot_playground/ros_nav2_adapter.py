@@ -355,10 +355,14 @@ class RosNav2AdapterServer:
                         goal_pose = pose_from_payload(payload.get("goal_pose"))
                         if goal_pose is None:
                             raise ValueError("goal_pose is required")
-                        outcome, feedback_samples = outer.runtime.navigate_to_pose(
-                            goal_pose=goal_pose,
-                            behavior_tree=str(payload.get("behavior_tree", "")),
-                        )
+                        outer.runtime.set_point_cloud_map_updates_enabled(False)
+                        try:
+                            outcome, feedback_samples = outer.runtime.navigate_to_pose(
+                                goal_pose=goal_pose,
+                                behavior_tree=str(payload.get("behavior_tree", "")),
+                            )
+                        finally:
+                            outer.runtime.set_point_cloud_map_updates_enabled(True)
                         self._send_json(
                             {
                                 "outcome": {"status": int(getattr(outcome, "status", 0))},

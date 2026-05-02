@@ -38,7 +38,7 @@ try:
     from nav_msgs.msg import Odometry
     from rclpy.node import Node
     from sensor_msgs.msg import CameraInfo, Image, Imu, LaserScan, PointCloud2, PointField
-    from std_msgs.msg import Float32
+    from std_msgs.msg import Bool, Float32
     from tf2_ros import TransformBroadcaster
 except Exception as exc:  # pragma: no cover - exercised as a runtime guard.
     IMPORT_ERROR = exc
@@ -56,6 +56,7 @@ except Exception as exc:  # pragma: no cover - exercised as a runtime guard.
     LaserScan = None
     PointCloud2 = None
     PointField = None
+    Bool = None
     Float32 = None
     TransformBroadcaster = None
 
@@ -95,6 +96,7 @@ class RealRosBridgeConfig:
     head_points_mode: str = "continuous"
     head_points_settled_delay_s: float = 0.20
     head_points_stale_tolerance_s: float = 0.10
+    head_points_update_map_enabled_topic: str = "/camera/head/points/update_map_enabled"
     head_points_update_map_while_base_moving: bool = False
     head_laser_frame: str = "head_laser"
     camera_x_m: float = 0.0
@@ -639,12 +641,19 @@ class RealXLeRobotRosBridge(Node):
         self._camera_pose_moving = False
         self._last_camera_pose_poll_s = 0.0
         self._base_motion_active = False
+        self._head_points_update_map_enabled = True
         self._last_head_points_skip_reason = ""
         if config.publish_head_camera:
             self.head_rgb_publisher = self.create_publisher(Image, "/camera/head/image_raw", 10)
             self.head_depth_publisher = self.create_publisher(Image, "/camera/head/depth/image_raw", 10)
             self.head_camera_info_publisher = self.create_publisher(CameraInfo, "/camera/head/camera_info", 10)
             self.head_points_publisher = self.create_publisher(PointCloud2, config.head_points_topic, 10)
+            self.create_subscription(
+                Bool,
+                config.head_points_update_map_enabled_topic,
+                self._on_head_points_update_map_enabled,
+                10,
+            )
         self.timer = self.create_timer(
             1.0 / max(config.publish_rate_hz, 1e-6),
             self.step,
@@ -721,6 +730,14 @@ class RealXLeRobotRosBridge(Node):
     def _update_base_motion_state(self, *, linear: float, angular: float, now_s: float) -> None:
         _ = now_s
         self._base_motion_active = abs(float(linear)) > 1e-5 or abs(float(angular)) > 1e-5
+
+    def _on_head_points_update_map_enabled(self, message: Any) -> None:
+        enabled = bool(message.data)
+        if enabled == self._head_points_update_map_enabled:
+            return
+        self._head_points_update_map_enabled = enabled
+        state = "enabled" if enabled else "disabled"
+        self.get_logger().info(f"PointCloud2 map updates {state} by {self.config.head_points_update_map_enabled_topic}.")
 
     def _start_imu_stream_thread(self, websocket_url: str) -> None:
         self._imu_stream_thread = threading.Thread(
@@ -1101,6 +1118,9 @@ class RealXLeRobotRosBridge(Node):
         self.head_points_publisher.publish(msg)
 
     def _head_points_publish_allowed(self, frame: RgbdFrame) -> bool:
+        if not self._head_points_update_map_enabled:
+            self._log_head_points_skip_once("map updates disabled")
+            return False
         if self._base_motion_active and not self.config.head_points_update_map_while_base_moving:
             self._log_head_points_skip_once("base moving")
             return False
@@ -1303,6 +1323,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Accept PointCloud2 frames this many seconds older than the settled camera pose timestamp.",
     )
     parser.add_argument(
+        "--head-points-update-map-enabled-topic",
+        default="/camera/head/points/update_map_enabled",
+        help=(
+            "std_msgs/Bool topic controlling whether /camera/head/points is published into the map pipeline. "
+            "False pauses only PointCloud2 publication; odom, TF, images, IMU, and cmd_vel remain live."
+        ),
+    )
+    parser.add_argument(
         "--head-points-update-map-while-base-moving",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -1379,6 +1407,7 @@ def config_from_args(args: argparse.Namespace) -> RealRosBridgeConfig:
         head_points_mode=args.head_points_mode,
         head_points_settled_delay_s=args.head_points_settled_delay_s,
         head_points_stale_tolerance_s=args.head_points_stale_tolerance_s,
+        head_points_update_map_enabled_topic=args.head_points_update_map_enabled_topic,
         head_points_update_map_while_base_moving=args.head_points_update_map_while_base_moving,
         head_laser_frame=args.head_laser_frame,
         camera_x_m=args.camera_x_m,
