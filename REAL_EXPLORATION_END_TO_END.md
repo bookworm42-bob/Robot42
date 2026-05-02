@@ -218,6 +218,7 @@ python -m xlerobot_playground.real_ros_bridge \
   --head-points-topic /camera/head/points \
   --head-points-mode settled \
   --head-points-settled-delay-s 0.20 \
+  --no-head-points-update-map-while-base-moving \
   --cmd-vel-timeout-s 0.5 \
   --max-linear-m-s 0.03 \
   --max-angular-rad-s 0.30 \
@@ -234,6 +235,8 @@ python -m xlerobot_playground.real_ros_bridge \
 This publishes camera images, `/camera/head/points`, depth-derived `/scan`, `/imu`, camera pan/pitch topics, camera transforms, and forwards ROS `/cmd_vel` to the robot brain.
 
 For OctoMap camera-pan scans, keep `--head-points-mode settled`. In this mode the bridge suppresses `/camera/head/points` while the head is moving and only resumes after robot brain reports the target head pose as settled, so OctoMap integrates stable snapshots instead of smearing point clouds during pan motion.
+
+Keep `--no-head-points-update-map-while-base-moving` for waypoint/Nav2 tests. This temporarily freezes OctoMap input while `/cmd_vel` is moving the base. It prevents base-motion TF/odometry lag from corrupting the already-built map; later live mapping can switch to `--head-points-update-map-while-base-moving` once base pose tracking is validated during motion.
 
 `--camera-z-m 1.05` is the current effective camera height relative to `base_link`, validated in RViz by checking that the PointCloud2 floor remains flat against the ground grid at both `pitch_deg: 0` and `pitch_deg: 30`.
 

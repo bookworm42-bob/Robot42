@@ -95,6 +95,7 @@ class RealRosBridgeConfig:
     head_points_mode: str = "continuous"
     head_points_settled_delay_s: float = 0.20
     head_points_stale_tolerance_s: float = 0.10
+    head_points_update_map_while_base_moving: bool = False
     head_laser_frame: str = "head_laser"
     camera_x_m: float = 0.0
     camera_y_m: float = 0.0
@@ -637,6 +638,7 @@ class RealXLeRobotRosBridge(Node):
         self._camera_pose_received_s: float | None = None
         self._camera_pose_moving = False
         self._last_camera_pose_poll_s = 0.0
+        self._base_motion_active = False
         self._last_head_points_skip_reason = ""
         if config.publish_head_camera:
             self.head_rgb_publisher = self.create_publisher(Image, "/camera/head/image_raw", 10)
@@ -683,6 +685,7 @@ class RealXLeRobotRosBridge(Node):
         self._last_step_stamp = now
         self._poll_camera_pose(now_s=now)
         linear, angular = self._active_velocity()
+        self._update_base_motion_state(linear=linear, angular=angular, now_s=now)
         motion_sent = self._drive_or_stop(linear=linear, angular=angular)
         if motion_sent:
             self._integrate_commanded_odom(linear=linear, angular=angular, dt=dt)
@@ -714,6 +717,10 @@ class RealXLeRobotRosBridge(Node):
         pan_msg = Float32()
         pan_msg.data = float(self._camera_pan_rad)
         self.camera_pan_publisher.publish(pan_msg)
+
+    def _update_base_motion_state(self, *, linear: float, angular: float, now_s: float) -> None:
+        _ = now_s
+        self._base_motion_active = abs(float(linear)) > 1e-5 or abs(float(angular)) > 1e-5
 
     def _start_imu_stream_thread(self, websocket_url: str) -> None:
         self._imu_stream_thread = threading.Thread(
@@ -1094,6 +1101,9 @@ class RealXLeRobotRosBridge(Node):
         self.head_points_publisher.publish(msg)
 
     def _head_points_publish_allowed(self, frame: RgbdFrame) -> bool:
+        if self._base_motion_active and not self.config.head_points_update_map_while_base_moving:
+            self._log_head_points_skip_once("base moving")
+            return False
         if self.config.head_points_mode == "continuous":
             return True
         if self.config.head_points_mode != "settled":
@@ -1292,6 +1302,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.10,
         help="Accept PointCloud2 frames this many seconds older than the settled camera pose timestamp.",
     )
+    parser.add_argument(
+        "--head-points-update-map-while-base-moving",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Allow /camera/head/points publication while nonzero /cmd_vel is active. "
+            "Default false keeps OctoMap from integrating point clouds during base motion "
+            "while live motion mapping is still experimental."
+        ),
+    )
     parser.add_argument("--head-laser-frame", default="head_laser")
     parser.add_argument("--camera-x-m", type=float, default=0.0)
     parser.add_argument("--camera-y-m", type=float, default=0.0)
@@ -1359,6 +1379,7 @@ def config_from_args(args: argparse.Namespace) -> RealRosBridgeConfig:
         head_points_mode=args.head_points_mode,
         head_points_settled_delay_s=args.head_points_settled_delay_s,
         head_points_stale_tolerance_s=args.head_points_stale_tolerance_s,
+        head_points_update_map_while_base_moving=args.head_points_update_map_while_base_moving,
         head_laser_frame=args.head_laser_frame,
         camera_x_m=args.camera_x_m,
         camera_y_m=args.camera_y_m,
