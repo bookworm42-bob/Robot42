@@ -102,6 +102,7 @@ def patch_nav2_params(
     goal_align_scale: float = 12.0,
     rotate_to_goal_scale: float = 8.0,
     rotate_to_goal_slowing_factor: float = 3.0,
+    transform_tolerance_s: float = 0.5,
 ) -> dict[str, Any]:
     params = deepcopy(base_params)
 
@@ -157,6 +158,7 @@ def patch_nav2_params(
         root["global_frame"] = global_frame
         root["robot_base_frame"] = base_frame
         root["use_sim_time"] = use_sim_time
+        root["transform_tolerance"] = transform_tolerance_s
         if footprint:
             root["footprint"] = deepcopy(footprint)
             root.pop("robot_radius", None)
@@ -182,6 +184,7 @@ def patch_nav2_params(
             static_layer["subscribe_to_updates"] = True
             static_layer["map_subscribe_transient_local"] = False
             static_layer["enabled"] = True
+            static_layer["transform_tolerance"] = transform_tolerance_s
         if inflation_radius <= 0.0 and "inflation_layer" in plugins:
             plugins = [plugin for plugin in plugins if plugin != "inflation_layer"]
             root["plugins"] = plugins
@@ -235,6 +238,7 @@ def patch_nav2_params(
     behavior = node_params("behavior_server")
     behavior["global_frame"] = odom_frame
     behavior["robot_base_frame"] = base_frame
+    behavior["transform_tolerance"] = transform_tolerance_s
     if "max_rotational_vel" in behavior:
         behavior["max_rotational_vel"] = max_angular_velocity
     if "min_rotational_vel" in behavior:
@@ -242,6 +246,7 @@ def patch_nav2_params(
 
     controller = node_params("controller_server")
     controller["odom_topic"] = "/odom"
+    controller["transform_tolerance"] = transform_tolerance_s
     follow_path = controller.get("FollowPath")
     if isinstance(follow_path, dict):
         follow_path["max_vel_x"] = max_linear_velocity

@@ -1430,7 +1430,10 @@ class RosExplorationRuntime(Node):
     def _build_pose(self, pose: Pose2D) -> PoseStamped:
         stamped = PoseStamped()
         stamped.header.frame_id = self.config.map_frame
-        stamped.header.stamp = self.get_clock().now().to_msg()
+        # A zero stamp asks TF/Nav2 to use the latest available transform. This
+        # avoids aborting goals when the goal stamp is a few milliseconds newer
+        # than the newest odom/base transform in the TF cache.
+        stamped.header.stamp = RosTime().to_msg()
         stamped.pose.position.x = float(pose.x)
         stamped.pose.position.y = float(pose.y)
         stamped.pose.position.z = 0.0

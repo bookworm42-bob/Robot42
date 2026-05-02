@@ -28,6 +28,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-angular-velocity", type=float, default=0.10)
     parser.add_argument("--local-costmap-width", type=int, default=2)
     parser.add_argument("--local-costmap-height", type=int, default=2)
+    parser.add_argument("--transform-tolerance-s", type=float, default=0.5)
     return parser
 
 
@@ -74,6 +75,7 @@ def main(argv: list[str] | None = None) -> int:
         max_angular_velocity=args.max_angular_velocity,
         local_costmap_width=args.local_costmap_width,
         local_costmap_height=args.local_costmap_height,
+        transform_tolerance_s=args.transform_tolerance_s,
         inflation_radius=0.0,
     )
     nav2_path = output_dir / args.nav2_output
