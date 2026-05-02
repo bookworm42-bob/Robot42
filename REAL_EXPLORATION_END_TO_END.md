@@ -300,15 +300,25 @@ source /home/alin/Robot42/.venv-maniskill/bin/activate
 ros2 launch /home/alin/Robot42/launch/xlerobot_octomap.launch.py
 ```
 
-The default `config/xlerobot_octomap.yaml` is set up for the first stationary validation pass:
+The default `config/xlerobot_octomap.yaml` is set up for Nav2 waypoint validation:
 
 ```text
-frame_id: base_link
+frame_id: map
 base_frame_id: base_link
 resolution: 0.08
 ```
 
-Use `base_link` while the robot base is staying still for the initial 360 degree camera-pan scan. Later, once the robot is moving through the map, switch OctoMap to a stable world frame such as `odom` or `map`.
+Before starting OctoMap, TF must provide:
+
+```text
+map -> odom -> base_link -> head_camera_link
+```
+
+For the first validation pass, if visual odometry already publishes `odom -> base_link`, bootstrap the map frame with:
+
+```bash
+ros2 run tf2_ros static_transform_publisher 0 0 0 0 0 0 map odom
+```
 
 Expected topics:
 
@@ -332,7 +342,7 @@ Expected output topics include:
 
 In RViz:
 
-- set `Fixed Frame` to `base_link` for stationary validation
+- set `Fixed Frame` to `map` for Nav2 validation
 - add `TF`
 - add `PointCloud2` on `/camera/head/points`
 - add `MarkerArray` on `/occupied_cells_vis_array`
@@ -408,6 +418,7 @@ python -m xlerobot_playground.real_nav2_config \
   --base-nav2-params /opt/ros/humble/share/nav2_bringup/params/nav2_params.yaml \
   --output-dir /home/alin/Robot42/artifacts/nav2 \
   --scan-topic /scan \
+  --global-map-topic /projected_map \
   --map-frame map \
   --odom-frame odom \
   --base-frame base_link \
@@ -577,7 +588,7 @@ If RViz shows the map rotating with the camera, or only the last camera directio
 ros2 topic echo /projected_map --once | grep -E 'frame_id|width|height|resolution'
 ```
 
-For this stationary first run, `/projected_map` must say `frame_id: base_link`. If it says `head_camera_link`, OctoMap is accumulating in the moving camera frame instead of the fixed robot frame, so each pan angle overwrites the useful interpretation of the previous one. Restart OctoMap with `config/xlerobot_octomap.yaml` loaded and `frame_id: base_link`.
+For Nav2 waypoint tests, `/projected_map` must say `frame_id: map`. If it says `head_camera_link`, OctoMap is accumulating in the moving camera frame instead of the fixed world frame, so each pan angle overwrites the useful interpretation of the previous one. If it says `base_link`, the UI can display the stationary scan, but Nav2's global costmap will not consume it correctly as a global map. Restart OctoMap with `config/xlerobot_octomap.yaml` loaded and `frame_id: map`.
 
 Optional RViz validation:
 
@@ -585,7 +596,7 @@ Optional RViz validation:
 rviz2
 ```
 
-For the OctoMap first run in this document, set `Fixed Frame` to `base_link`, then add `PointCloud2` on `/camera/head/points`, `Map` on `/projected_map` with update topic `/projected_map_updates`, `MarkerArray` on `/occupied_cells_vis_array`, and `TF`. You should see the point cloud rotate with `head_camera_link` during head pan sweeps, while `/projected_map` grows from OctoMap's accumulated 3D evidence.
+For the OctoMap/Nav2 run in this document, set `Fixed Frame` to `map`, then add `PointCloud2` on `/camera/head/points`, `Map` on `/projected_map` with update topic `/projected_map_updates`, `Map` on `/global_costmap/costmap`, `Map` on `/local_costmap/costmap`, `MarkerArray` on `/occupied_cells_vis_array`, and `TF`. You should see the point cloud transform through `head_camera_link` during head pan sweeps, while `/projected_map` grows from OctoMap's accumulated 3D evidence and `/global_costmap/costmap` receives that projected map through Nav2's static layer.
 
 If the map starts but the head does not pan, check the robot-brain head pose and motion gate:
 

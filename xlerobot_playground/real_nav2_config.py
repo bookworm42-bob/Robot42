@@ -16,6 +16,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--slam-output", default="xlerobot_slam_toolbox.yaml")
     parser.add_argument("--nav2-output", default="xlerobot_nav2_params.yaml")
     parser.add_argument("--scan-topic", default="/scan")
+    parser.add_argument("--global-map-topic", default="/projected_map")
     parser.add_argument("--map-frame", default="map")
     parser.add_argument("--odom-frame", default="odom")
     parser.add_argument("--base-frame", default="base_link")
@@ -62,6 +63,7 @@ def main(argv: list[str] | None = None) -> int:
         base_nav2,
         use_sim_time=False,
         scan_topic=args.scan_topic,
+        global_map_topic=args.global_map_topic,
         map_frame=args.map_frame,
         odom_frame=args.odom_frame,
         base_frame=args.base_frame,

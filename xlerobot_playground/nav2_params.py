@@ -82,6 +82,7 @@ def patch_nav2_params(
     odom_frame: str = "odom",
     base_frame: str = "base_link",
     scan_topic: str = "/scan",
+    global_map_topic: str = "/projected_map",
     robot_radius: float = 0.24,
     footprint: str | None = None,
     footprint_padding: float = 0.0,
@@ -170,9 +171,17 @@ def patch_nav2_params(
         plugins = list(root.get("plugins", []))
         if costmap_name == "global_costmap":
             plugins = [plugin for plugin in plugins if plugin not in {"obstacle_layer", "voxel_layer"}]
+            if "static_layer" not in plugins:
+                plugins.insert(0, "static_layer")
             root["plugins"] = plugins
             root.pop("obstacle_layer", None)
             root.pop("voxel_layer", None)
+            static_layer = root.setdefault("static_layer", {})
+            static_layer["plugin"] = "nav2_costmap_2d::StaticLayer"
+            static_layer["map_topic"] = global_map_topic
+            static_layer["subscribe_to_updates"] = True
+            static_layer["map_subscribe_transient_local"] = False
+            static_layer["enabled"] = True
         if inflation_radius <= 0.0 and "inflation_layer" in plugins:
             plugins = [plugin for plugin in plugins if plugin != "inflation_layer"]
             root["plugins"] = plugins
