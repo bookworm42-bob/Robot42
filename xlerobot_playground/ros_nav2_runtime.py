@@ -287,6 +287,7 @@ class RosRuntimeConfig:
     publish_internal_navigation_map: bool = True
     navigation_map_source: str = "fused_scan"
     fuse_external_projected_map_snapshots: bool = False
+    log_map_summaries: bool = False
 
 
 @dataclass(frozen=True)
@@ -513,7 +514,7 @@ class RosExplorationRuntime(Node):
         self.latest_map_stamp_s = time.time()
         self.latest_map_header_frame_id = str(message.header.frame_id)
         now = time.time()
-        if now - self._last_map_log_s >= 2.0:
+        if self.config.log_map_summaries and now - self._last_map_log_s >= 2.0:
             self._last_map_log_s = now
             print(f"[ros_nav2_runtime] received map topic={self.config.map_topic} summary={self.latest_map_summary()}")
 
@@ -533,7 +534,7 @@ class RosExplorationRuntime(Node):
         if header_frame_id:
             self.latest_map_header_frame_id = header_frame_id
         now = time.time()
-        if now - self._last_map_update_log_s >= 2.0:
+        if self.config.log_map_summaries and now - self._last_map_update_log_s >= 2.0:
             self._last_map_update_log_s = now
             print(
                 "[ros_nav2_runtime] applied map update "

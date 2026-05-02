@@ -3346,6 +3346,11 @@ class RosExplorationSession:
                 )
             except Exception as exc:
                 return {"status": "rejected", "reason": f"Invalid waypoint pose: {exc}"}
+            print(
+                "[real_exploration] manual waypoint requested "
+                f"x={target_pose.x:.3f} y={target_pose.y:.3f} yaw={target_pose.yaw:.3f}",
+                flush=True,
+            )
             goal = self._make_nav2_goal(
                 target_pose,
                 goal_type="manual_waypoint",
@@ -3359,6 +3364,11 @@ class RosExplorationSession:
             result = self.nav2.navigate_to_pose(goal, ignore_pause_cancel=True)
             self._consume_nav_result(result)
             self.status = "manual_waypoint_succeeded" if result.status == "succeeded" else "manual_waypoint_failed"
+            print(
+                "[real_exploration] manual waypoint result "
+                f"status={result.status} reason={result.reason}",
+                flush=True,
+            )
             self.guardrail_events.append(
                 {
                     "type": "manual_waypoint_navigation",

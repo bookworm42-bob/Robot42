@@ -649,7 +649,8 @@ HTML_PAGE = """<!doctype html>
         ['Approved', map && map.approved ? 'yes' : 'no'],
         ['Regions', map ? (map.regions || []).length : 0],
         ['Coverage', map ? String(map.coverage || 0) : '0'],
-        ['Task', task ? (task.tool_id + ' ' + task.state) : 'idle']
+        ['Task', task ? (task.tool_id + ' ' + task.state) : 'idle'],
+        ['Paused', task && task.paused ? 'yes' : 'no']
       ];
       if (map && map.automatic_semantic_waypoints) {
         items.splice(4, 0, ['Automatic Semantic Places', ((map.semantic_memory || {}).named_places || []).length]);
@@ -863,6 +864,9 @@ HTML_PAGE = """<!doctype html>
             .then((response) => {
               lastManualWaypoint = response.normalized_pose || response.requested_pose || lastManualWaypoint;
               renderMap(currentState);
+              if (response.status && response.status !== 'succeeded') {
+                alert((response.status || 'failed') + ': ' + (response.reason || 'Waypoint navigation did not start.'));
+              }
               return refresh();
             })
             .catch((error) => {
