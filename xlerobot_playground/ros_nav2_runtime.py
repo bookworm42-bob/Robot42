@@ -6,6 +6,7 @@ from io import BytesIO
 import json
 import math
 import subprocess
+import threading
 import time
 from typing import Any, Callable, Iterable
 from urllib import error, request
@@ -441,6 +442,7 @@ class RosExplorationRuntime(Node):
         require_runtime_dependencies()
         super().__init__("xlerobot_ros_exploration_runtime")
         self.config = config
+        self._spin_lock = threading.RLock()
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self, spin_thread=False)
         self.tf_broadcaster = TransformBroadcaster(self)
@@ -490,6 +492,14 @@ class RosExplorationRuntime(Node):
         self._published_navigation_map: RosOccupancyMap | None = None
         self._map_to_odom = Pose2D(0.0, 0.0, 0.0)
         self._publish_timer = self.create_timer(0.2, self._publish_internal_navigation_state)
+
+    def _spin_once(self, *, timeout_sec: float) -> None:
+        with self._spin_lock:
+            rclpy.spin_once(self, timeout_sec=timeout_sec)
+
+    def _spin_until_future_complete(self, future: Any) -> None:
+        with self._spin_lock:
+            rclpy.spin_until_future_complete(self, future)
 
     def _on_map(self, message: OccupancyGrid) -> None:
         self.latest_map = RosOccupancyMap(
@@ -663,7 +673,7 @@ class RosExplorationRuntime(Node):
     def spin_until_ready(self, *, timeout_s: float | None = None) -> None:
         deadline = time.time() + (timeout_s if timeout_s is not None else self.config.ready_timeout_s)
         while time.time() < deadline:
-            rclpy.spin_once(self, timeout_sec=0.1)
+            self._spin_once(timeout_sec=0.1)
             if self.config.publish_internal_navigation_map:
                 if self.current_pose_in_frame(self.config.odom_frame) is not None:
                     return
@@ -714,12 +724,12 @@ class RosExplorationRuntime(Node):
     def spin_for(self, duration_s: float) -> None:
         deadline = time.time() + duration_s
         while time.time() < deadline:
-            rclpy.spin_once(self, timeout_sec=0.05)
+            self._spin_once(timeout_sec=0.05)
 
     def wait_for_map_update(self, *, after_stamp_s: float, timeout_s: float = 2.0) -> bool:
         deadline = time.time() + max(float(timeout_s), 0.0)
         while time.time() < deadline:
-            rclpy.spin_once(self, timeout_sec=0.05)
+            self._spin_once(timeout_sec=0.05)
             if self.latest_map is not None and self.latest_map_stamp_s > after_stamp_s:
                 return True
         return False
@@ -768,7 +778,7 @@ class RosExplorationRuntime(Node):
         observed_yaw_delta = 0.0
         while time.time() < deadline:
             self._cmd_vel_pub.publish(Twist())
-            rclpy.spin_once(self, timeout_sec=0.05)
+            self._spin_once(timeout_sec=0.05)
             feedback_frame, current_yaw = self._current_turn_feedback()
             if current_yaw is None or previous_yaw is None:
                 time.sleep(0.05)
@@ -831,12 +841,12 @@ class RosExplorationRuntime(Node):
             request.planner_id = planner_id
         request.use_start = False
         future = self._compute_path_client.send_goal_async(request)
-        rclpy.spin_until_future_complete(self, future)
+        self._spin_until_future_complete(future)
         goal_handle = future.result()
         if goal_handle is None or not goal_handle.accepted:
             raise RuntimeError("Nav2 rejected the ComputePathToPose goal.")
         result_future = goal_handle.get_result_async()
-        rclpy.spin_until_future_complete(self, result_future)
+        self._spin_until_future_complete(result_future)
         outcome = result_future.result()
         path = getattr(getattr(outcome, "result", None), "path", None)
         poses: list[Pose2D] = []
@@ -889,18 +899,18 @@ class RosExplorationRuntime(Node):
         if behavior_tree:
             request.behavior_tree = behavior_tree
         future = self._navigate_to_pose_client.send_goal_async(request, feedback_callback=_feedback)
-        rclpy.spin_until_future_complete(self, future)
+        self._spin_until_future_complete(future)
         goal_handle = future.result()
         if goal_handle is None or not goal_handle.accepted:
             raise RuntimeError("Nav2 rejected the NavigateToPose goal.")
         result_future = goal_handle.get_result_async()
         cancel_requested = False
         while not result_future.done():
-            rclpy.spin_once(self, timeout_sec=0.1)
+            self._spin_once(timeout_sec=0.1)
             if should_cancel is not None and should_cancel() and not cancel_requested:
                 cancel_requested = True
                 cancel_future = goal_handle.cancel_goal_async()
-                rclpy.spin_until_future_complete(self, cancel_future)
+                self._spin_until_future_complete(cancel_future)
         outcome = result_future.result()
         return outcome, feedback_samples
 
@@ -1287,7 +1297,7 @@ class RosExplorationRuntime(Node):
                 stop_reason = "target_yaw_reached"
                 break
             self._cmd_vel_pub.publish(twist)
-            rclpy.spin_once(self, timeout_sec=0.0)
+            self._spin_once(timeout_sec=0.0)
             feedback_frame, current_yaw = self._current_turn_feedback()
             if current_yaw is not None and start_yaw is not None:
                 relative_yaw = math.atan2(
@@ -1344,7 +1354,7 @@ class RosExplorationRuntime(Node):
     def _wait_for_next_scan_observation(self, after_index: int, *, timeout_s: float = 2.0) -> dict[str, Any] | None:
         deadline = time.time() + timeout_s
         while time.time() < deadline:
-            rclpy.spin_once(self, timeout_sec=0.05)
+            self._spin_once(timeout_sec=0.05)
             if len(self.scan_observations) > after_index:
                 return dict(self.scan_observations[-1])
         return None
@@ -1403,7 +1413,7 @@ class RosExplorationRuntime(Node):
             return
         servers: list[str] = []
         for _attempt in range(10):
-            rclpy.spin_once(self, timeout_sec=0.05)
+            self._spin_once(timeout_sec=0.05)
             servers = self._action_servers(action_name)
             if len(servers) > 1:
                 break
