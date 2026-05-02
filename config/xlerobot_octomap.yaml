@@ -10,12 +10,12 @@ octomap_server:
     sensor_model.max_range: 5.0
 
     # Input cloud crop before insertion. Use z in the fixed frame.
-    pointcloud_min_z: 0.08
+    pointcloud_min_z: 0.12
     pointcloud_max_z: 1.50
 
     # Height band used for the projected 2D map. The 3D octree still stores
     # occupied/free evidence; this controls what becomes navigation-relevant.
-    occupancy_min_z: 0.18
+    occupancy_min_z: 0.22
     occupancy_max_z: 1.50
 
     filter_ground_plane: false
