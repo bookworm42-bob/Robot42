@@ -393,6 +393,9 @@ python -m xlerobot_playground.rgbd_visual_odometry \
   --camera-info-topic /camera/head/camera_info \
   --imu-topic /imu/filtered_yaw \
   --odom-topic /odom \
+  --camera-pan-topic /camera/head/pan_rad \
+  --freeze-during-head-motion \
+  --head-motion-freeze-settle-s 0.75 \
   --imu-frame-convention base_link \
   --imu-bias-calibration-s 0.0 \
   --publish-rate-hz 30 \
@@ -400,6 +403,8 @@ python -m xlerobot_playground.rgbd_visual_odometry \
 ```
 
 This consumes RGB-D for translation and the filtered yaw IMU topic for authoritative yaw. Accelerometer double integration is not used for odometry position. The `--min-translation-update-m 0.01` threshold accumulates tiny RGB-D frame-to-frame motion until there is at least 1 cm of accepted translation, which prevents sub-millimeter noisy updates from dominating the pose.
+
+Keep `--freeze-during-head-motion` enabled for stationary camera-pan mapping. While the head pan is away from center, RGB-D visual odometry keeps `odom -> base_link` fixed and only the bridge updates `base_link -> head_camera_link`. This prevents the camera gyro/head motion from being double-counted as robot-base yaw during OctoMap's 360 degree scan.
 
 Quick checks:
 
