@@ -25,7 +25,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--robot-length-m", type=float, default=0.3913)
     parser.add_argument("--robot-width-m", type=float, default=0.459)
     parser.add_argument("--max-linear-velocity", type=float, default=0.03)
-    parser.add_argument("--max-angular-velocity", type=float, default=0.10)
+    parser.add_argument("--max-angular-velocity", type=float, default=0.18)
     parser.add_argument("--local-costmap-width", type=int, default=2)
     parser.add_argument("--local-costmap-height", type=int, default=2)
     parser.add_argument("--transform-tolerance-s", type=float, default=0.5)

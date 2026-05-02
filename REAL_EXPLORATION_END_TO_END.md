@@ -427,7 +427,7 @@ python -m xlerobot_playground.real_nav2_config \
   --base-frame base_link \
   --max-laser-range 4.0 \
   --max-linear-velocity 0.03 \
-  --max-angular-velocity 0.10 \
+  --max-angular-velocity 0.18 \
   --local-costmap-width 2 \
   --local-costmap-height 2 \
   --transform-tolerance-s 0.5 \

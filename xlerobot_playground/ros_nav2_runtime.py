@@ -874,6 +874,7 @@ class RosExplorationRuntime(Node):
         goal_pose: Pose2D,
         behavior_tree: str = "",
         should_cancel: Callable[[], bool] | None = None,
+        feedback_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> Any:
         if not self._navigate_to_pose_client.wait_for_server(timeout_sec=self.config.server_timeout_s):
             raise RuntimeError("`navigate_to_pose` action server did not appear in time.")
@@ -883,17 +884,18 @@ class RosExplorationRuntime(Node):
         def _feedback(message: Any) -> None:
             feedback = getattr(message, "feedback", None)
             current_pose = self.current_pose()
-            feedback_samples.append(
-                {
-                    "navigation_time_s": _duration_to_seconds(getattr(feedback, "navigation_time", None)),
-                    "estimated_time_remaining_s": _duration_to_seconds(
-                        getattr(feedback, "estimated_time_remaining", None)
-                    ),
-                    "distance_remaining_m": float(getattr(feedback, "distance_remaining", 0.0)),
-                    "number_of_recoveries": int(getattr(feedback, "number_of_recoveries", 0)),
-                    "current_pose": None if current_pose is None else current_pose.to_dict(),
-                }
-            )
+            sample = {
+                "navigation_time_s": _duration_to_seconds(getattr(feedback, "navigation_time", None)),
+                "estimated_time_remaining_s": _duration_to_seconds(
+                    getattr(feedback, "estimated_time_remaining", None)
+                ),
+                "distance_remaining_m": float(getattr(feedback, "distance_remaining", 0.0)),
+                "number_of_recoveries": int(getattr(feedback, "number_of_recoveries", 0)),
+                "current_pose": None if current_pose is None else current_pose.to_dict(),
+            }
+            feedback_samples.append(sample)
+            if feedback_callback is not None:
+                feedback_callback(sample)
 
         request = NavigateToPose.Goal()
         request.pose = self._build_pose(goal_pose)

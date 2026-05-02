@@ -822,7 +822,7 @@ HTML_PAGE = """<!doctype html>
           <text x="${p.x + 12}" y="${p.y + 4}" font-size="12" fill="#1d4ed8" font-weight="700">waypoint</text>
         `;
       })() : '';
-      const robotPose = (map.trajectory || []).slice(-1)[0] || null;
+      const robotPose = map.robot_pose || (map.trajectory || []).slice(-1)[0] || null;
       const robot = robotPose ? project(robotPose) : null;
       const headingLength = (map.occupancy?.resolution || 0.5) * 2.5;
       const robotHeading = robotPose ? project({
@@ -857,7 +857,7 @@ HTML_PAGE = """<!doctype html>
         event.preventDefault();
         if (mapEditMode === 'waypoint') {
           const world = worldFromMapEvent(map, event);
-          const robotPose = (map.trajectory || []).slice(-1)[0] || {};
+          const robotPose = map.robot_pose || (map.trajectory || []).slice(-1)[0] || {};
           lastManualWaypoint = {x: world.x, y: world.y, yaw: Number(robotPose.yaw || 0)};
           renderMap(currentState);
           postJson('/api/nav/waypoint', {pose: lastManualWaypoint})

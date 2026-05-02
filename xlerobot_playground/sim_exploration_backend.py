@@ -467,7 +467,13 @@ class Nav2NavigationModule:
     def compute_path(self, goal: Nav2GoalRequest, *, record: bool = True) -> Nav2PlanResult:
         raise NotImplementedError
 
-    def navigate_to_pose(self, goal: Nav2GoalRequest, *, ignore_pause_cancel: bool = False) -> Nav2NavigateResult:
+    def navigate_to_pose(
+        self,
+        goal: Nav2GoalRequest,
+        *,
+        ignore_pause_cancel: bool = False,
+        feedback_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> Nav2NavigateResult:
         raise NotImplementedError
 
     def recover(self, goal: Nav2GoalRequest, *, reason: str) -> dict[str, Any]:
@@ -576,7 +582,13 @@ class SimulatedNav2NavigationModule(Nav2NavigationModule):
             self._plan_history.append(result.to_dict())
         return result
 
-    def navigate_to_pose(self, goal: Nav2GoalRequest, *, ignore_pause_cancel: bool = False) -> Nav2NavigateResult:
+    def navigate_to_pose(
+        self,
+        goal: Nav2GoalRequest,
+        *,
+        ignore_pause_cancel: bool = False,
+        feedback_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> Nav2NavigateResult:
         self._goal_history.append(goal.to_dict())
         plan = self.compute_path(goal, record=True)
         recovery_events: list[dict[str, Any]] = []
@@ -641,14 +653,15 @@ class SimulatedNav2NavigationModule(Nav2NavigationModule):
             self._on_motion_step(previous, nxt, goal, index, len(path_cells))
             travelled_distance_m += self.scenario.resolution
             remaining_distance_m = max((len(path_cells) - index - 1), 0) * self.scenario.resolution
-            feedback_samples.append(
-                {
-                    "step_index": index,
-                    "remaining_distance_m": round(remaining_distance_m, 3),
-                    "current_pose": nxt.center_pose(self.scenario.resolution).to_dict(),
-                    "status": "moving",
-                }
-            )
+            sample = {
+                "step_index": index,
+                "remaining_distance_m": round(remaining_distance_m, 3),
+                "current_pose": nxt.center_pose(self.scenario.resolution).to_dict(),
+                "status": "moving",
+            }
+            feedback_samples.append(sample)
+            if feedback_callback is not None:
+                feedback_callback(sample)
 
         reached_pose = path_cells[-1].center_pose(self.scenario.resolution, yaw=goal.target_pose.yaw)
         return Nav2NavigateResult(
@@ -785,7 +798,13 @@ class RosNav2NavigationModule(Nav2NavigationModule):
             self._plan_history.append(result.to_dict())
         return result
 
-    def navigate_to_pose(self, goal: Nav2GoalRequest, *, ignore_pause_cancel: bool = False) -> Nav2NavigateResult:
+    def navigate_to_pose(
+        self,
+        goal: Nav2GoalRequest,
+        *,
+        ignore_pause_cancel: bool = False,
+        feedback_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> Nav2NavigateResult:
         self._goal_history.append(goal.to_dict())
         plan = self.compute_path(goal, record=True)
         if plan.status != "succeeded":
@@ -807,6 +826,7 @@ class RosNav2NavigationModule(Nav2NavigationModule):
                 goal_pose=validation.normalized_pose or goal.target_pose,
                 behavior_tree=goal.behavior_tree,
                 should_cancel=None if ignore_pause_cancel else self._should_cancel,
+                feedback_callback=feedback_callback,
             )
         except Exception as exc:
             reason = f"ROS Nav2 navigate_to_pose call failed: {exc}"
@@ -2968,6 +2988,7 @@ class RosExplorationSession:
             else 0
         )
         self._last_map_payload_log_s = 0.0
+        self._last_live_pose_publish_s = 0.0
         self.nav2 = RosNav2NavigationModule(
             config,
             self.runtime,
@@ -3053,7 +3074,10 @@ class RosExplorationSession:
                         goal_type="return_waypoint",
                         reason=f"return_waypoint::{waypoint['waypoint_id']}",
                     )
-                    return_result = self.nav2.navigate_to_pose(return_goal)
+                    return_result = self.nav2.navigate_to_pose(
+                        return_goal,
+                        feedback_callback=self._publish_navigation_feedback,
+                    )
                     self._consume_nav_result(return_result)
                     if return_result.status != "succeeded":
                         self.guardrail_events.append(
@@ -3082,7 +3106,10 @@ class RosExplorationSession:
                 goal_type="frontier",
                 reason=f"frontier::{record.frontier_id}",
             )
-            nav_result = self.nav2.navigate_to_pose(frontier_goal)
+            nav_result = self.nav2.navigate_to_pose(
+                frontier_goal,
+                feedback_callback=self._publish_navigation_feedback,
+            )
             self._consume_nav_result(nav_result)
             if nav_result.status != "succeeded":
                 _mark_frontier_unreachable_as_visited(self.frontier_memory, record.frontier_id, nav_result.reason)
@@ -3248,7 +3275,10 @@ class RosExplorationSession:
                         goal_type="return_waypoint",
                         reason=f"return_waypoint::{waypoint['waypoint_id']}",
                     )
-                    return_result = self.nav2.navigate_to_pose(return_goal)
+                    return_result = self.nav2.navigate_to_pose(
+                        return_goal,
+                        feedback_callback=self._publish_navigation_feedback,
+                    )
                     self._consume_nav_result(return_result)
                     if return_result.status != "succeeded":
                         self.guardrail_events.append(
@@ -3275,7 +3305,10 @@ class RosExplorationSession:
                 goal_type="frontier",
                 reason=f"frontier::{record.frontier_id}",
             )
-            nav_result = self.nav2.navigate_to_pose(frontier_goal)
+            nav_result = self.nav2.navigate_to_pose(
+                frontier_goal,
+                feedback_callback=self._publish_navigation_feedback,
+            )
             self._consume_nav_result(nav_result)
             if nav_result.status != "succeeded":
                 _mark_frontier_unreachable_as_visited(self.frontier_memory, record.frontier_id, nav_result.reason)
@@ -3361,7 +3394,11 @@ class RosExplorationSession:
                 message=f"Sending clicked waypoint ({target_pose.x:.2f}, {target_pose.y:.2f}) to Nav2.",
                 frontier_id=None,
             )
-            result = self.nav2.navigate_to_pose(goal, ignore_pause_cancel=True)
+            result = self.nav2.navigate_to_pose(
+                goal,
+                ignore_pause_cancel=True,
+                feedback_callback=self._publish_navigation_feedback,
+            )
             self._consume_nav_result(result)
             self.status = "manual_waypoint_succeeded" if result.status == "succeeded" else "manual_waypoint_failed"
             print(
@@ -4411,6 +4448,35 @@ class RosExplorationSession:
     def _publish_live_map(self, message: str) -> None:
         self._push_progress_update(message=message, frontier_id=self.frontier_memory.active_frontier_id)
 
+    def _live_robot_pose(self) -> Pose2D | None:
+        pose = self.runtime.current_pose()
+        if pose is None and self.config.ros_navigation_map_source in ("fused_scan", "fused_point_cloud"):
+            pose = self.runtime.current_pose_in_frame(self.config.ros_odom_frame)
+        return pose
+
+    def _publish_navigation_feedback(self, sample: dict[str, Any]) -> None:
+        now = time.time()
+        if now - self._last_live_pose_publish_s < 0.35:
+            return
+        self._last_live_pose_publish_s = now
+        pose_payload = sample.get("current_pose")
+        if isinstance(pose_payload, dict):
+            try:
+                pose = Pose2D(
+                    float(pose_payload["x"]),
+                    float(pose_payload["y"]),
+                    float(pose_payload.get("yaw", 0.0)),
+                )
+            except Exception:
+                pose = None
+            if pose is not None:
+                self._update_pose_history(pose)
+        distance_remaining = sample.get("distance_remaining_m")
+        message = "Nav2 waypoint active."
+        if distance_remaining is not None:
+            message = f"Nav2 waypoint active, {float(distance_remaining):.2f} m remaining."
+        self._push_progress_update(message=message, frontier_id=self.frontier_memory.active_frontier_id)
+
     def _consume_nav_result(self, result: Nav2NavigateResult) -> None:
         if result.reached_pose is not None:
             self._update_pose_history(result.reached_pose)
@@ -4429,6 +4495,7 @@ class RosExplorationSession:
 
     def _build_map_payload(self) -> dict[str, Any]:
         occupancy_map = self._require_effective_map()
+        live_robot_pose = self._live_robot_pose()
         semantic_memory = self.semantic_observer.snapshot() if self.config.automatic_semantic_waypoints else {}
         occupancy_cells = []
         for y in range(occupancy_map.height):
@@ -4468,6 +4535,7 @@ class RosExplorationSession:
             "created_at": time.time(),
             "source": self.config.source,
             "mode": "ros_nav2_agentic",
+            "robot_pose": None if live_robot_pose is None else live_robot_pose.to_dict(),
             "trajectory": self.trajectory,
             "keyframes": self.keyframes,
             "regions": [],
