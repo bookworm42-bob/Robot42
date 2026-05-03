@@ -107,6 +107,7 @@ def patch_nav2_params(
     progress_movement_time_allowance_s: float = 25.0,
     xy_goal_tolerance_m: float = 0.18,
     yaw_goal_tolerance_rad: float = 3.14,
+    enable_local_scan_obstacles: bool = False,
 ) -> dict[str, Any]:
     params = deepcopy(base_params)
 
@@ -189,6 +190,21 @@ def patch_nav2_params(
             static_layer["map_subscribe_transient_local"] = False
             static_layer["enabled"] = True
             static_layer["transform_tolerance"] = transform_tolerance_s
+        else:
+            if not enable_local_scan_obstacles:
+                plugins = [plugin for plugin in plugins if plugin not in {"obstacle_layer", "voxel_layer"}]
+                if "static_layer" not in plugins:
+                    plugins.insert(0, "static_layer")
+                root["plugins"] = plugins
+                root.pop("obstacle_layer", None)
+                root.pop("voxel_layer", None)
+                static_layer = root.setdefault("static_layer", {})
+                static_layer["plugin"] = "nav2_costmap_2d::StaticLayer"
+                static_layer["map_topic"] = global_map_topic
+                static_layer["subscribe_to_updates"] = True
+                static_layer["map_subscribe_transient_local"] = False
+                static_layer["enabled"] = True
+                static_layer["transform_tolerance"] = transform_tolerance_s
         if inflation_radius <= 0.0 and "inflation_layer" in plugins:
             plugins = [plugin for plugin in plugins if plugin != "inflation_layer"]
             root["plugins"] = plugins
